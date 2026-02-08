@@ -1,0 +1,72 @@
+name: Publish Package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Set version from tag
+        run: npm version ${GITHUB_REF#refs/tags/v} --no-git-tag-version
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build package
+        run: bun build ./index.ts --outdir ./dist --target node
+
+      - name: Create dist package.json
+        run: |
+          # Get version from package.json
+          VERSION=$(node -p "require('./package.json').version")
+
+          # Create package.json for dist with lowercase name for npm
+          cat > dist/package.json << EOF
+          {
+            "name": "@valentinkolb/sync",
+            "version": "$VERSION",
+            "description": "Distributed synchronization primitives for Bun and TypeScript",
+            "main": "index.js",
+            "module": "index.js",
+            "types": "index.d.ts",
+            "type": "module",
+            "exports": {
+              ".": {
+                "import": "./index.js",
+                "types": "./index.d.ts"
+              }
+            },
+            "peerDependencies": {
+              "zod": "^3"
+            },
+            "keywords": ["bun", "redis", "ratelimit", "mutex", "jobs", "queue", "distributed"],
+            "author": "Valentin Kolb",
+            "license": "MIT",
+            "repository": {
+              "type": "git",
+              "url": "git+https://github.com/ValentinKolb/sync.git"
+            }
+          }
+          EOF
+
+      - name: Generate type declarations
+        run: bunx tsc --declaration --emitDeclarationOnly --outDir dist
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        working-directory: ./dist

@@ -1,0 +1,7 @@
+services:
+  valkey:
+    image: docker.io/valkey/valkey:8-alpine
+    container_name: sync_test_valkey
+    command: valkey-server --save "" --appendonly no
+    ports:
+      - "6399:6379"
