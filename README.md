@@ -2,7 +2,7 @@
 
 Distributed synchronization primitives for Bun and TypeScript. Built on Redis for horizontal scaling.
 
-**Zero external dependencies** - uses only Bun's native Redis client (`Bun.redis`) and Zod for schema validation.
+**Minimal dependencies** - uses only Bun's native Redis client (`Bun.redis`) and Zod for schema validation.
 
 ## Features
 
