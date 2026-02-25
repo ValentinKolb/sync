@@ -1,1193 +1,508 @@
-import { test, expect, beforeEach } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
 import { z } from "zod";
-import { jobs, ValidationError, DuplicateJobError, type Job } from "../index";
+import { job } from "../index";
 
-const testSchema = z.object({
-  message: z.string(),
-});
+const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 
-// Clean up Redis before each test
 beforeEach(async () => {
-  const keys = await redis.send("KEYS", ["jobs:test:*"]);
+  const keys = await redis.send("KEYS", ["sync:job:*"]);
   if (Array.isArray(keys) && keys.length > 0) {
     await redis.send("DEL", keys as string[]);
   }
 });
 
-test("send creates a job with correct properties", async () => {
-  const q = jobs.create({
-    name: "test:send",
-    schema: testSchema,
-    prefix: "jobs:test",
+test("submit + join completes a job", async () => {
+  const sendOrderMail = job({
+    id: uid("job-complete"),
+    schema: z.object({ value: z.number() }),
+    process: async ({ input }) => input.value * 2,
   });
 
-  const job = await q.send({ message: "hello" });
+  const id = await sendOrderMail.submit({ input: { value: 2 } });
+  const terminal = await sendOrderMail.join({ id, timeoutMs: 5_000 });
 
-  expect(job.id).toBeDefined();
-  expect(job.data.message).toBe("hello");
-  expect(job.status).toBe("waiting");
-  expect(job.attempts).toBe(0);
-  expect(job.maxRetries).toBe(0);
-  expect(job.timeout).toBe(30000);
-  expect(job.createdAt).toBeGreaterThan(0);
+  expect(terminal.status).toBe("completed");
+  expect(terminal.result).toBe(4);
 });
 
-test("send validates data against schema", async () => {
-  const q = jobs.create({
-    name: "test:validate",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
+test("retry then complete", async () => {
+  let calls = 0;
 
-  try {
-    // @ts-expect-error - intentionally invalid
-    await q.send({ invalid: "data" });
-    expect(true).toBe(false); // Should not reach
-  } catch (e) {
-    expect(e).toBeInstanceOf(ValidationError);
-  }
-});
-
-test("send with delay creates delayed job", async () => {
-  const q = jobs.create({
-    name: "test:delay",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const job = await q.send({ message: "delayed" }, { delay: 5000 });
-
-  expect(job.status).toBe("delayed");
-  expect(job.scheduledAt).toBeGreaterThan(Date.now());
-});
-
-test("send with at creates scheduled job", async () => {
-  const q = jobs.create({
-    name: "test:at",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const scheduledTime = Date.now() + 10000;
-  const job = await q.send({ message: "scheduled" }, { at: scheduledTime });
-
-  expect(job.status).toBe("delayed");
-  expect(job.scheduledAt).toBe(scheduledTime);
-});
-
-test("send with interval creates periodic job", async () => {
-  const q = jobs.create({
-    name: "test:interval",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const job = await q.send({ message: "periodic" }, { interval: 60000 });
-
-  expect(job.status).toBe("delayed"); // Starts delayed
-  expect(job.interval).toBe(60000);
-  expect(job.scheduledAt).toBeGreaterThan(Date.now());
-});
-
-test("send with interval and startImmediately creates immediate periodic job", async () => {
-  const q = jobs.create({
-    name: "test:interval-immediate",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const job = await q.send({ message: "periodic" }, { interval: 60000, startImmediately: true });
-
-  expect(job.status).toBe("waiting"); // Starts immediately
-  expect(job.interval).toBe(60000);
-});
-
-test("send with retries sets maxRetries", async () => {
-  const q = jobs.create({
-    name: "test:retries",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const job = await q.send({ message: "retry" }, { retries: 3 });
-
-  expect(job.maxRetries).toBe(3);
-});
-
-test("send with timeout sets timeout", async () => {
-  const q = jobs.create({
-    name: "test:timeout",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const job = await q.send({ message: "timeout" }, { timeout: 60000 });
-
-  expect(job.timeout).toBe(60000);
-});
-
-test("process executes handler for jobs", async () => {
-  const q = jobs.create({
-    name: "test:process",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const processed: string[] = [];
-
-  await q.send({ message: "job1" });
-  await q.send({ message: "job2" });
-
-  const stop = q.process(
-    async (job) => {
-      processed.push(job.data.message);
+  const worker = job({
+    id: uid("job-retry"),
+    schema: z.object({}),
+    process: async () => {
+      calls += 1;
+      if (calls < 2) throw new Error("first failure");
+      return "ok";
     },
-    { pollInterval: 50 },
-  );
-
-  // Wait for processing
-  await Bun.sleep(200);
-  stop();
-
-  expect(processed).toContain("job1");
-  expect(processed).toContain("job2");
-});
-
-test("process calls onSuccess on successful job", async () => {
-  const q = jobs.create({
-    name: "test:onsuccess",
-    schema: testSchema,
-    prefix: "jobs:test",
   });
 
-  let successCalled = false;
-  let successJobId = "";
-
-  await q.send({ message: "success" });
-
-  const stop = q.process(
-    async () => {
-      // Success
-    },
-    {
-      pollInterval: 50,
-      onSuccess: (job) => {
-        successCalled = true;
-        successJobId = job.id;
-      },
-    },
-  );
-
-  await Bun.sleep(200);
-  stop();
-
-  expect(successCalled).toBe(true);
-  expect(successJobId).toBeDefined();
-});
-
-test("process retries failed jobs", async () => {
-  const q = jobs.create({
-    name: "test:retry",
-    schema: testSchema,
-    prefix: "jobs:test",
+  const id = await worker.submit({
+    input: {},
+    maxAttempts: 2,
+    backoff: { kind: "fixed", baseMs: 50 },
   });
 
-  let attempts = 0;
+  const terminal = await worker.join({ id, timeoutMs: 8_000 });
 
-  await q.send({ message: "retry" }, { retries: 2 });
-
-  const stop = q.process(
-    async () => {
-      attempts++;
-      if (attempts < 3) {
-        throw new Error("fail");
-      }
-    },
-    { pollInterval: 50 },
-  );
-
-  await Bun.sleep(500);
-  stop();
-
-  expect(attempts).toBe(3); // 1 initial + 2 retries
+  expect(terminal.status).toBe("completed");
+  expect(terminal.result).toBe("ok");
+  expect(calls).toBe(2);
 });
 
-test("process calls onError when job permanently fails", async () => {
-  const q = jobs.create({
-    name: "test:onerror",
-    schema: testSchema,
-    prefix: "jobs:test",
+test("cancel marks job as cancelled", async () => {
+  const worker = job({
+    id: uid("job-cancel"),
+    schema: z.object({ id: z.string() }),
+    process: async () => {
+      await Bun.sleep(100);
+      return "done";
+    },
   });
 
-  let errorCalled = false;
-  let errorMessage = "";
+  const id = await worker.submit({
+    input: { id: "a" },
+    delayMs: 200,
+  });
 
-  await q.send({ message: "fail" }, { retries: 0 });
+  await worker.cancel({ id, reason: "user-request" });
 
-  const stop = q.process(
-    async () => {
-      throw new Error("permanent failure");
-    },
-    {
-      pollInterval: 50,
-      onError: (job, error) => {
-        errorCalled = true;
-        errorMessage = error.message;
-      },
-    },
-  );
-
-  await Bun.sleep(200);
-  stop();
-
-  expect(errorCalled).toBe(true);
-  expect(errorMessage).toBe("permanent failure");
+  const terminal = await worker.join({ id, timeoutMs: 5_000 });
+  expect(terminal.status).toBe("cancelled");
 });
 
-test("process calls onFinally after every attempt", async () => {
-  const q = jobs.create({
-    name: "test:onfinally",
-    schema: testSchema,
-    prefix: "jobs:test",
+test("events expose topic reader/live API", async () => {
+  const worker = job({
+    id: uid("job-events"),
+    schema: z.object({ value: z.number() }),
+    process: async ({ input }) => input.value + 1,
   });
 
-  let finallyCalls = 0;
+  const id = await worker.submit({ input: { value: 5 } });
+  const terminal = await worker.join({ id, timeoutMs: 5_000 });
+  expect(terminal.status).toBe("completed");
 
-  await q.send({ message: "finally" }, { retries: 1 });
+  const events = worker.events(id);
+  const reader = events.reader("orchestrator");
 
-  const stop = q.process(
-    async () => {
-      throw new Error("fail");
-    },
-    {
-      pollInterval: 50,
-      onFinally: () => {
-        finallyCalls++;
-      },
-    },
-  );
-
-  await Bun.sleep(300);
-  stop();
-
-  expect(finallyCalls).toBe(2); // 1 initial + 1 retry
-});
-
-test("delayed jobs are promoted when ready", async () => {
-  const q = jobs.create({
-    name: "test:promote",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  let processed = false;
-
-  await q.send({ message: "delayed" }, { delay: 100 });
-
-  const stop = q.process(
-    async () => {
-      processed = true;
-    },
-    { pollInterval: 50 },
-  );
-
-  // Should not be processed yet
-  await Bun.sleep(50);
-  expect(processed).toBe(false);
-
-  // Should be processed after delay
-  await Bun.sleep(200);
-  expect(processed).toBe(true);
-
-  stop();
-});
-
-test("interval jobs are rescheduled after completion", async () => {
-  const q = jobs.create({
-    name: "test:interval-reschedule",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  let processCount = 0;
-
-  await q.send({ message: "interval" }, { interval: 100, startImmediately: true });
-
-  const stop = q.process(
-    async () => {
-      processCount++;
-    },
-    { pollInterval: 50 },
-  );
-
-  await Bun.sleep(350);
-  stop();
-
-  expect(processCount).toBeGreaterThanOrEqual(2);
-});
-
-test("interval jobs are rescheduled after failure", async () => {
-  const q = jobs.create({
-    name: "test:interval-fail",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  let processCount = 0;
-  let errorCount = 0;
-
-  await q.send({ message: "interval-fail" }, { interval: 100, startImmediately: true, retries: 0 });
-
-  const stop = q.process(
-    async () => {
-      processCount++;
-      throw new Error("always fail");
-    },
-    {
-      pollInterval: 50,
-      onError: () => {
-        errorCount++;
-      },
-    },
-  );
-
-  await Bun.sleep(350);
-  stop();
-
-  expect(processCount).toBeGreaterThanOrEqual(2);
-  expect(errorCount).toBeGreaterThanOrEqual(2);
-});
-
-test("concurrent processing with multiple workers", async () => {
-  const q = jobs.create({
-    name: "test:concurrent",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const processed: string[] = [];
-  const startTimes: number[] = [];
-
-  // Send 5 jobs
-  for (let i = 0; i < 5; i++) {
-    await q.send({ message: `job${i}` });
+  const types: string[] = [];
+  for await (const event of reader.stream({ wait: false })) {
+    types.push(event.data.type);
+    await event.commit();
   }
 
-  const stop = q.process(
-    async (job) => {
-      startTimes.push(Date.now());
-      await Bun.sleep(100); // Simulate work
-      processed.push(job.data.message);
+  expect(types.includes("submitted")).toBe(true);
+  expect(types.includes("started")).toBe(true);
+  expect(types.includes("completed")).toBe(true);
+  expect(typeof events.live).toBe("function");
+});
+
+test("submit deduplicates by key", async () => {
+  const worker = job({
+    id: uid("job-dedup"),
+    schema: z.object({ value: z.number() }),
+    process: async ({ input }) => input.value,
+  });
+
+  const a = await worker.submit({ input: { value: 1 }, key: "same-key" });
+  const b = await worker.submit({ input: { value: 1 }, key: "same-key" });
+
+  expect(a).toBe(b);
+  const terminal = await worker.join({ id: a, timeoutMs: 5_000 });
+  expect(terminal.status).toBe("completed");
+});
+
+test("join returns timed_out when timeout is reached", async () => {
+  const worker = job({
+    id: uid("job-join-timeout"),
+    schema: z.object({}),
+    process: async () => "ok",
+  });
+
+  const id = await worker.submit({ input: {}, delayMs: 500 });
+  const terminal = await worker.join({ id, timeoutMs: 50 });
+
+  expect(terminal.status).toBe("timed_out");
+  expect(terminal.error?.code).toBe("JOIN_TIMEOUT");
+});
+
+test("job fails permanently after max attempts", async () => {
+  const worker = job({
+    id: uid("job-fail"),
+    schema: z.object({}),
+    process: async () => {
+      throw new Error("boom");
     },
-    { concurrency: 3, pollInterval: 50 },
+  });
+
+  const id = await worker.submit({ input: {}, maxAttempts: 1 });
+  const terminal = await worker.join({ id, timeoutMs: 5_000 });
+
+  expect(terminal.status).toBe("failed");
+  expect(terminal.error?.message).toBe("boom");
+});
+
+test("job reaches timed_out status when lease is exceeded", async () => {
+  const worker = job({
+    id: uid("job-timeout"),
+    schema: z.object({}),
+    process: async () => {
+      await Bun.sleep(120);
+      return "late";
+    },
+  });
+
+  const id = await worker.submit({ input: {}, leaseMs: 40, maxAttempts: 1 });
+  const terminal = await worker.join({ id, timeoutMs: 5_000 });
+
+  expect(terminal.status).toBe("timed_out");
+});
+
+test("parallel submit with same key deduplicates atomically", async () => {
+  const worker = job({
+    id: uid("job-parallel-dedup"),
+    schema: z.object({ v: z.number() }),
+    process: async ({ input }) => input.v,
+  });
+
+  const results = await Promise.all(
+    Array.from({ length: 10 }, () =>
+      worker.submit({ input: { v: 1 }, key: "race-key" }),
+    ),
   );
 
-  await Bun.sleep(500);
-  stop();
+  const unique = new Set(results);
+  expect(unique.size).toBe(1);
 
-  expect(processed.length).toBe(5);
-
-  // Check that some jobs started concurrently (within 50ms of each other)
-  const concurrent = startTimes.filter((t, i) => i > 0 && t - startTimes[i - 1] < 50);
-  expect(concurrent.length).toBeGreaterThan(0);
+  const terminal = await worker.join({ id: results[0], timeoutMs: 5_000 });
+  expect(terminal.status).toBe("completed");
 });
 
-test("job timeout causes hard fail", async () => {
-  const q = jobs.create({
-    name: "test:timeout-fail",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
+test("stop() halts worker processing", async () => {
+  let processed = 0;
 
-  await q.send({ message: "slow" }, { timeout: 100, retries: 0 });
-
-  // Start a processor that will claim the job but not finish it
-  let jobClaimed = false;
-  const stop = q.process(
-    async () => {
-      jobClaimed = true;
-      // Simulate a hanging job - sleep longer than timeout
-      await Bun.sleep(500);
+  const worker = job({
+    id: uid("job-stop"),
+    schema: z.object({}),
+    process: async () => {
+      processed += 1;
+      return "ok";
     },
-    { pollInterval: 50 },
-  );
-
-  // Wait for job to be claimed
-  await Bun.sleep(80);
-  expect(jobClaimed).toBe(true);
-
-  // Stop processor so we can start a new one that will check timeouts
-  stop();
-
-  // Wait for timeout to expire
-  await Bun.sleep(100);
-
-  // Start new processor to trigger timeout check
-  let timeoutDetected = false;
-  const stop2 = q.process(async () => {}, {
-    pollInterval: 50,
   });
 
-  // Wait for timeout check to run
-  await Bun.sleep(150);
-  stop2();
+  const id = await worker.submit({ input: {} });
+  const terminal = await worker.join({ id, timeoutMs: 5_000 });
+  expect(terminal.status).toBe("completed");
+  expect(processed).toBe(1);
 
-  // Verify job was marked as failed
-  const failedCount = await redis.scard("jobs:test:test:timeout-fail:failed");
-  expect(failedCount).toBe(1);
+  worker.stop();
+
+  // After stop, submitting starts the worker again
+  const id2 = await worker.submit({ input: {} });
+  const terminal2 = await worker.join({ id: id2, timeoutMs: 5_000 });
+  expect(terminal2.status).toBe("completed");
+  expect(processed).toBe(2);
+
+  worker.stop();
 });
 
-test("stop function stops processing", async () => {
-  const q = jobs.create({
-    name: "test:stop",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  let processCount = 0;
-
-  const stop = q.process(
-    async () => {
-      processCount++;
-    },
-    { pollInterval: 50 },
-  );
-
-  stop();
-
-  // Send jobs after stop
-  await q.send({ message: "after-stop" });
-
-  await Bun.sleep(200);
-
-  expect(processCount).toBe(0);
-});
-
-// ==========================
-// list() tests
-// ==========================
-
-test("list returns all jobs", async () => {
-  const q = jobs.create({
-    name: "test:list-all",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  await q.send({ message: "one" });
-  await q.send({ message: "two" });
-  await q.send({ message: "three" });
-
-  const result = await q.list();
-
-  expect(result.total).toBe(3);
-  expect(result.jobs.length).toBe(3);
-});
-
-test("list filters by tag", async () => {
-  const q = jobs.create({
-    name: "test:list-tag",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  await q.send({ message: "agent-a-1" }, { tag: "agent:a" });
-  await q.send({ message: "agent-a-2" }, { tag: "agent:a" });
-  await q.send({ message: "agent-b-1" }, { tag: "agent:b" });
-  await q.send({ message: "no-tag" });
-
-  const resultA = await q.list({ tag: "agent:a" });
-  expect(resultA.total).toBe(2);
-  expect(resultA.jobs.every((j) => j.tag === "agent:a")).toBe(true);
-
-  const resultB = await q.list({ tag: "agent:b" });
-  expect(resultB.total).toBe(1);
-  expect(resultB.jobs[0]!.data.message).toBe("agent-b-1");
-
-  const resultAll = await q.list();
-  expect(resultAll.total).toBe(4);
-});
-
-test("list filters by status", async () => {
-  const q = jobs.create({
-    name: "test:list-status",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  await q.send({ message: "immediate" });
-  await q.send({ message: "delayed" }, { delay: 60000 });
-  await q.send({ message: "delayed2" }, { delay: 60000 });
-
-  const waiting = await q.list({ status: "waiting" });
-  expect(waiting.total).toBe(1);
-  expect(waiting.jobs[0]!.data.message).toBe("immediate");
-
-  const delayed = await q.list({ status: "delayed" });
-  expect(delayed.total).toBe(2);
-});
-
-test("list filters by tag and status combined", async () => {
-  const q = jobs.create({
-    name: "test:list-combined",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  await q.send({ message: "a-waiting" }, { tag: "agent:a" });
-  await q.send({ message: "a-delayed" }, { tag: "agent:a", delay: 60000 });
-  await q.send({ message: "b-waiting" }, { tag: "agent:b" });
-
-  const result = await q.list({ tag: "agent:a", status: "delayed" });
-  expect(result.total).toBe(1);
-  expect(result.jobs[0]!.data.message).toBe("a-delayed");
-});
-
-test("list supports pagination", async () => {
-  const q = jobs.create({
-    name: "test:list-page",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  for (let i = 0; i < 5; i++) {
-    await q.send({ message: `msg${i}` });
-  }
-
-  const page1 = await q.list({ offset: 0, limit: 2 });
-  expect(page1.total).toBe(5);
-  expect(page1.jobs.length).toBe(2);
-
-  const page2 = await q.list({ offset: 2, limit: 2 });
-  expect(page2.total).toBe(5);
-  expect(page2.jobs.length).toBe(2);
-
-  const page3 = await q.list({ offset: 4, limit: 2 });
-  expect(page3.total).toBe(5);
-  expect(page3.jobs.length).toBe(1);
-});
-
-test("list returns empty result for unknown tag", async () => {
-  const q = jobs.create({
-    name: "test:list-empty",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  await q.send({ message: "hello" });
-
-  const result = await q.list({ tag: "nonexistent" });
-  expect(result.total).toBe(0);
-  expect(result.jobs.length).toBe(0);
-});
-
-test("send with tag stores tag on job", async () => {
-  const q = jobs.create({
-    name: "test:tag-store",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const job = await q.send({ message: "tagged" }, { tag: "my-tag" });
-
-  expect(job.tag).toBe("my-tag");
-});
-
-// ==========================
-// cancel() tests
-// ==========================
-
-test("cancel removes a waiting job", async () => {
-  const q = jobs.create({
-    name: "test:cancel-waiting",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const job = await q.send({ message: "to-cancel" });
-
-  const cancelled = await q.cancel(job.id);
-  expect(cancelled).toBe(true);
-
-  const result = await q.list();
-  expect(result.total).toBe(0);
-});
-
-test("cancel removes a delayed job", async () => {
-  const q = jobs.create({
-    name: "test:cancel-delayed",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const job = await q.send({ message: "to-cancel" }, { delay: 60000 });
-
-  const cancelled = await q.cancel(job.id);
-  expect(cancelled).toBe(true);
-
-  const result = await q.list();
-  expect(result.total).toBe(0);
-});
-
-test("cancel returns false for nonexistent job", async () => {
-  const q = jobs.create({
-    name: "test:cancel-nonexistent",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const cancelled = await q.cancel("nonexistent-id");
-  expect(cancelled).toBe(false);
-});
-
-test("cancel removes tag index entry", async () => {
-  const q = jobs.create({
-    name: "test:cancel-tag",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const job = await q.send({ message: "tagged" }, { tag: "agent:x" });
-
-  await q.cancel(job.id);
-
-  const result = await q.list({ tag: "agent:x" });
-  expect(result.total).toBe(0);
-});
-
-test("cancel a completed job", async () => {
-  const q = jobs.create({
-    name: "test:cancel-completed",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  await q.send({ message: "will-complete" });
-
-  const stop = q.process(async () => {}, { pollInterval: 50 });
-  await Bun.sleep(200);
-  stop();
-
-  // Job should be completed now
-  const completed = await q.list({ status: "completed" });
-  expect(completed.total).toBe(1);
-
-  const cancelled = await q.cancel(completed.jobs[0]!.id);
-  expect(cancelled).toBe(true);
-
-  const result = await q.list();
-  expect(result.total).toBe(0);
-});
-
-test("cancel a failed job", async () => {
-  const q = jobs.create({
-    name: "test:cancel-failed",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  await q.send({ message: "will-fail" }, { retries: 0 });
-
-  const stop = q.process(
-    async () => {
-      throw new Error("fail");
-    },
-    { pollInterval: 50 },
-  );
-  await Bun.sleep(200);
-  stop();
-
-  const failed = await q.list({ status: "failed" });
-  expect(failed.total).toBe(1);
-
-  const cancelled = await q.cancel(failed.jobs[0]!.id);
-  expect(cancelled).toBe(true);
-
-  const result = await q.list();
-  expect(result.total).toBe(0);
-});
-
-test("cancel a delayed interval job", async () => {
-  const q = jobs.create({
-    name: "test:cancel-interval",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const job = await q.send({ message: "periodic" }, { interval: 60000 });
-  expect(job.status).toBe("delayed");
-
-  const cancelled = await q.cancel(job.id);
-  expect(cancelled).toBe(true);
-
-  const result = await q.list();
-  expect(result.total).toBe(0);
-});
-
-test("list shows completed and failed jobs after processing", async () => {
-  const q = jobs.create({
-    name: "test:list-after-process",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  await q.send({ message: "will-succeed" });
-  await q.send({ message: "will-fail" }, { retries: 0 });
-
-  let count = 0;
-  const stop = q.process(
-    async (job) => {
-      count++;
-      if (job.data.message === "will-fail") {
-        throw new Error("fail");
-      }
-    },
-    { pollInterval: 50 },
-  );
-
-  await Bun.sleep(300);
-  stop();
-
-  const completed = await q.list({ status: "completed" });
-  expect(completed.total).toBe(1);
-  expect(completed.jobs[0]!.data.message).toBe("will-succeed");
-
-  const failed = await q.list({ status: "failed" });
-  expect(failed.total).toBe(1);
-  expect(failed.jobs[0]!.data.message).toBe("will-fail");
-});
-
-test("tag is preserved after job completes", async () => {
-  const q = jobs.create({
-    name: "test:tag-after-complete",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  await q.send({ message: "tagged-job" }, { tag: "agent:z" });
-
-  const stop = q.process(async () => {}, { pollInterval: 50 });
-  await Bun.sleep(200);
-  stop();
-
-  const result = await q.list({ tag: "agent:z" });
-  expect(result.total).toBe(1);
-  expect(result.jobs[0]!.status).toBe("completed");
-  expect(result.jobs[0]!.tag).toBe("agent:z");
-});
-
-test("tag is preserved after job fails", async () => {
-  const q = jobs.create({
-    name: "test:tag-after-fail",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  await q.send({ message: "tagged-fail" }, { tag: "agent:fail", retries: 0 });
-
-  const stop = q.process(
-    async () => {
-      throw new Error("fail");
-    },
-    { pollInterval: 50 },
-  );
-  await Bun.sleep(200);
-  stop();
-
-  const result = await q.list({ tag: "agent:fail" });
-  expect(result.total).toBe(1);
-  expect(result.jobs[0]!.status).toBe("failed");
-  expect(result.jobs[0]!.tag).toBe("agent:fail");
-});
-
-// ==========================
-// Recovery tests
-// ==========================
-
-test("recovery re-queues stuck active jobs with retries left", async () => {
-  const q = jobs.create({
-    name: "test:recovery-retry",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  // Manually simulate a stuck active job
-  const job: Job<{ message: string }> = {
-    id: "stuck-1",
-    data: { message: "stuck" },
-    status: "active",
-    attempts: 1,
-    maxRetries: 3,
-    timeout: 100,
-    createdAt: Date.now() - 1000,
-    startedAt: Date.now() - 500, // started 500ms ago, timeout is 100ms
-  };
-
-  await redis.hset("jobs:test:test:recovery-retry:data", "stuck-1", JSON.stringify(job));
-  await redis.lpush("jobs:test:test:recovery-retry:active", "stuck-1");
-
-  // Starting process() triggers recovery
-  let processed = false;
-  const stop = q.process(
-    async (j) => {
-      if (j.id === "stuck-1") processed = true;
-    },
-    { pollInterval: 50 },
-  );
-
-  await Bun.sleep(300);
-  stop();
-
-  expect(processed).toBe(true);
-});
-
-test("recovery marks stuck active jobs as failed when no retries left", async () => {
-  const q = jobs.create({
-    name: "test:recovery-fail",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  // Simulate stuck job with no retries left
-  const job: Job<{ message: string }> = {
-    id: "stuck-2",
-    data: { message: "stuck" },
-    status: "active",
-    attempts: 1,
-    maxRetries: 0,
-    timeout: 100,
-    createdAt: Date.now() - 1000,
-    startedAt: Date.now() - 500,
-  };
-
-  await redis.hset("jobs:test:test:recovery-fail:data", "stuck-2", JSON.stringify(job));
-  await redis.lpush("jobs:test:test:recovery-fail:active", "stuck-2");
-
-  const stop = q.process(async () => {}, { pollInterval: 50 });
-  await Bun.sleep(200);
-  stop();
-
-  const result = await q.list({ status: "failed" });
-  expect(result.total).toBe(1);
-  expect(result.jobs[0]!.id).toBe("stuck-2");
-});
-
-test("recovery reschedules stuck active interval jobs", async () => {
-  const q = jobs.create({
-    name: "test:recovery-interval",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  // Simulate stuck interval job with no retries left
-  const job: Job<{ message: string }> = {
-    id: "stuck-3",
-    data: { message: "interval-stuck" },
-    status: "active",
-    attempts: 1,
-    maxRetries: 0,
-    timeout: 100,
-    interval: 60000,
-    createdAt: Date.now() - 1000,
-    startedAt: Date.now() - 500,
-  };
-
-  await redis.hset("jobs:test:test:recovery-interval:data", "stuck-3", JSON.stringify(job));
-  await redis.lpush("jobs:test:test:recovery-interval:active", "stuck-3");
-
-  const stop = q.process(async () => {}, { pollInterval: 50 });
-  await Bun.sleep(200);
-  stop();
-
-  // Should be rescheduled as delayed, not failed
-  const delayed = await q.list({ status: "delayed" });
-  expect(delayed.total).toBe(1);
-  expect(delayed.jobs[0]!.id).toBe("stuck-3");
-
-  const failed = await q.list({ status: "failed" });
-  expect(failed.total).toBe(0);
-});
-
-// ==========================
-// Graceful Shutdown tests
-// ==========================
-
-test("graceful shutdown waits for active jobs to finish", async () => {
-  const q = jobs.create({
-    name: "test:graceful",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  let jobFinished = false;
-
-  await q.send({ message: "slow-job" });
-
-  const stop = q.process(
-    async () => {
+test("ctx.signal is aborted on timeout", async () => {
+  let signalAborted = false;
+
+  const worker = job({
+    id: uid("job-signal"),
+    schema: z.object({}),
+    process: async ({ ctx }) => {
+      ctx.signal.addEventListener("abort", () => {
+        signalAborted = true;
+      });
       await Bun.sleep(200);
-      jobFinished = true;
+      return "late";
     },
-    { pollInterval: 50 },
-  );
-
-  // Wait for job to be claimed
-  await Bun.sleep(50);
-
-  // Graceful stop — should wait for active job
-  await stop();
-
-  expect(jobFinished).toBe(true);
-});
-
-test("graceful shutdown resolves immediately when no active jobs", async () => {
-  const q = jobs.create({
-    name: "test:graceful-idle",
-    schema: testSchema,
-    prefix: "jobs:test",
   });
 
-  const stop = q.process(async () => {}, { pollInterval: 50 });
+  const id = await worker.submit({ input: {}, leaseMs: 40, maxAttempts: 1 });
+  const terminal = await worker.join({ id, timeoutMs: 5_000 });
 
-  const start = Date.now();
-  await stop();
-  const elapsed = Date.now() - start;
-
-  // Should resolve very quickly (no active jobs to wait for)
-  expect(elapsed).toBeLessThan(100);
+  expect(terminal.status).toBe("timed_out");
+  // Give abort handler time to fire
+  await Bun.sleep(20);
+  expect(signalAborted).toBe(true);
 });
 
-// ==========================
-// Backoff tests
-// ==========================
+test("ctx.signal is aborted on error", async () => {
+  let signalAborted = false;
 
-test("retry with backoff delays retries exponentially", async () => {
-  const q = jobs.create({
-    name: "test:backoff",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const attemptTimes: number[] = [];
-
-  // backoff: 100ms → retries at ~100ms, ~200ms
-  await q.send({ message: "backoff" }, { retries: 2, backoff: 100 });
-
-  const stop = q.process(
-    async () => {
-      attemptTimes.push(Date.now());
-      if (attemptTimes.length < 3) {
-        throw new Error("fail");
-      }
+  const worker = job({
+    id: uid("job-signal-err"),
+    schema: z.object({}),
+    process: async ({ ctx }) => {
+      ctx.signal.addEventListener("abort", () => {
+        signalAborted = true;
+      });
+      throw new Error("boom");
     },
-    { pollInterval: 50 },
-  );
-
-  await Bun.sleep(1000);
-  await stop();
-
-  expect(attemptTimes.length).toBe(3);
-
-  // First retry should be delayed by ~100ms (backoff * 2^0)
-  const delay1 = attemptTimes[1]! - attemptTimes[0]!;
-  expect(delay1).toBeGreaterThanOrEqual(80); // some tolerance
-
-  // Second retry should be delayed by ~200ms (backoff * 2^1)
-  const delay2 = attemptTimes[2]! - attemptTimes[1]!;
-  expect(delay2).toBeGreaterThanOrEqual(160);
-});
-
-test("retry without backoff retries immediately", async () => {
-  const q = jobs.create({
-    name: "test:no-backoff",
-    schema: testSchema,
-    prefix: "jobs:test",
   });
 
-  const attemptTimes: number[] = [];
+  const id = await worker.submit({ input: {}, maxAttempts: 1 });
+  const terminal = await worker.join({ id, timeoutMs: 5_000 });
 
-  await q.send({ message: "no-backoff" }, { retries: 1 });
+  expect(terminal.status).toBe("failed");
+  await Bun.sleep(20);
+  expect(signalAborted).toBe(true);
+});
 
-  const stop = q.process(
-    async () => {
-      attemptTimes.push(Date.now());
-      if (attemptTimes.length < 2) {
-        throw new Error("fail");
-      }
+test("state TTL is isolated per job", async () => {
+  const worker = job({
+    id: uid("job-ttl-isolation"),
+    schema: z.object({ v: z.number() }),
+    process: async ({ input }) => input.v,
+  });
+
+  const id1 = await worker.submit({ input: { v: 1 } });
+  const id2 = await worker.submit({ input: { v: 2 } });
+
+  const t1 = await worker.join({ id: id1, timeoutMs: 5_000 });
+  const t2 = await worker.join({ id: id2, timeoutMs: 5_000 });
+  expect(t1.status).toBe("completed");
+  expect(t2.status).toBe("completed");
+
+  // Both states exist as independent Redis keys
+  const raw1 = await redis.get(`sync:job:${worker.id}:state:${id1}`);
+  const raw2 = await redis.get(`sync:job:${worker.id}:state:${id2}`);
+  expect(raw1).not.toBeNull();
+  expect(raw2).not.toBeNull();
+
+  // Each key has its own TTL
+  const ttl1 = await redis.send("PTTL", [`sync:job:${worker.id}:state:${id1}`]);
+  const ttl2 = await redis.send("PTTL", [`sync:job:${worker.id}:state:${id2}`]);
+  expect(Number(ttl1)).toBeGreaterThan(0);
+  expect(Number(ttl2)).toBeGreaterThan(0);
+});
+
+test("cancel during running job is detected by worker", async () => {
+  let started = false;
+
+  const worker = job({
+    id: uid("job-cancel-running"),
+    schema: z.object({}),
+    process: async () => {
+      started = true;
+      await Bun.sleep(300);
+      return "done";
     },
-    { pollInterval: 50 },
-  );
-
-  await Bun.sleep(300);
-  await stop();
-
-  expect(attemptTimes.length).toBe(2);
-
-  // Should retry very quickly (within one poll cycle)
-  const delay = attemptTimes[1]! - attemptTimes[0]!;
-  expect(delay).toBeLessThan(150);
-});
-
-test("invalid job payload is marked failed", async () => {
-  const q = jobs.create({
-    name: "test:invalid-payload",
-    schema: testSchema,
-    prefix: "jobs:test",
   });
 
-  const jobId = "invalid-1";
-  await redis.hset("jobs:test:test:invalid-payload:data", jobId, "not-json");
-  await redis.lpush("jobs:test:test:invalid-payload:waiting", jobId);
+  const id = await worker.submit({ input: {}, leaseMs: 5_000 });
 
-  const stop = q.process(async () => {}, { pollInterval: 50 });
-  await Bun.sleep(200);
-  await stop();
+  // Wait for the process to start
+  while (!started) await Bun.sleep(10);
 
-  const failedCount = await redis.scard("jobs:test:test:invalid-payload:failed");
-  expect(failedCount).toBe(1);
+  await worker.cancel({ id, reason: "mid-flight" });
+  const terminal = await worker.join({ id, timeoutMs: 5_000 });
+  expect(terminal.status).toBe("cancelled");
+});
 
-  const stored = await redis.hget("jobs:test:test:invalid-payload:data", jobId);
-  expect(stored).not.toBeNull();
+test("cancel on already-completed job is a no-op", async () => {
+  const worker = job({
+    id: uid("job-cancel-noop"),
+    schema: z.object({}),
+    process: async () => "done",
+  });
 
-  const job = JSON.parse(stored!) as Job<{ message: string }>;
-  expect(job.status).toBe("failed");
-  expect(job.invalidData).toBe(true);
+  const id = await worker.submit({ input: {} });
+  const terminal = await worker.join({ id, timeoutMs: 5_000 });
+  expect(terminal.status).toBe("completed");
+
+  // Cancel after completion should not change the state
+  await worker.cancel({ id, reason: "too late" });
+
+  const raw = await redis.get(`sync:job:${worker.id}:state:${id}`);
+  const state = JSON.parse(raw!);
+  expect(state.status).toBe("completed");
+});
+
+test("multiple concurrent joins on same job all resolve", async () => {
+  const worker = job({
+    id: uid("job-multi-join"),
+    schema: z.object({}),
+    process: async () => {
+      await Bun.sleep(50);
+      return "result";
+    },
+  });
+
+  const id = await worker.submit({ input: {} });
+
+  const [t1, t2, t3] = await Promise.all([
+    worker.join({ id, timeoutMs: 5_000 }),
+    worker.join({ id, timeoutMs: 5_000 }),
+    worker.join({ id, timeoutMs: 5_000 }),
+  ]);
+
+  expect(t1.status).toBe("completed");
+  expect(t2.status).toBe("completed");
+  expect(t3.status).toBe("completed");
+  expect(t1.result).toBe("result");
+});
+
+test("exponential backoff emits retry events with increasing nextAt", async () => {
+  const worker = job({
+    id: uid("job-exp-backoff"),
+    schema: z.object({}),
+    process: async () => {
+      throw new Error("retry me");
+    },
+  });
+
+  const id = await worker.submit({
+    input: {},
+    maxAttempts: 3,
+    backoff: { kind: "exp", baseMs: 100 },
+  });
+
+  const terminal = await worker.join({ id, timeoutMs: 15_000 });
+  expect(terminal.status).toBe("failed");
+
+  // Read retry events and check that nextAt gaps increase
+  const events = worker.events(id);
+  const reader = events.reader("backoff-check");
+  const retryDeltas: number[] = [];
+
+  for await (const event of reader.stream({ wait: false })) {
+    if (event.data.type === "retry") {
+      retryDeltas.push(event.data.nextAt - event.data.ts);
+    }
+    await event.commit();
+  }
+
+  // Should have 2 retry events (attempts 1 and 2 fail, attempt 3 fails terminally)
+  expect(retryDeltas.length).toBe(2);
+  // First retry: baseMs * 2^0 = 100, second retry: baseMs * 2^1 = 200
+  expect(retryDeltas[0]).toBeGreaterThanOrEqual(80); // ~100ms with some slack
+  expect(retryDeltas[1]).toBeGreaterThanOrEqual(160); // ~200ms with some slack
+  expect(retryDeltas[1]).toBeGreaterThan(retryDeltas[0]);
+});
+
+test("cancel emits cancelled event", async () => {
+  const worker = job({
+    id: uid("job-cancel-event"),
+    schema: z.object({}),
+    process: async () => "ok",
+  });
+
+  const id = await worker.submit({ input: {}, delayMs: 200 });
+  await worker.cancel({ id, reason: "manual" });
+
+  const events = worker.events(id);
+  const reader = events.reader("cancel-reader");
+  const types: string[] = [];
+
+  for await (const event of reader.stream({ wait: false })) {
+    types.push(event.data.type);
+    await event.commit();
+  }
+
+  expect(types.includes("cancelled")).toBe(true);
 });
 
 // ==========================
-// Deduplication tests
+// Race condition tests
 // ==========================
 
-test("duplicate key throws DuplicateJobError", async () => {
-  const q = jobs.create({
-    name: "test:dedup",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
+test("cancel racing with completed write — final state is consistent", async () => {
+  // This test characterizes the race between cancel() and the worker
+  // writing "completed" state. We run multiple iterations to provoke
+  // the timing-dependent interleaving.
+  for (let attempt = 0; attempt < 20; attempt++) {
+    let processCompleted = false;
 
-  await q.send({ message: "first" }, { key: "unique-1" });
+    const worker = job({
+      id: uid("job-cancel-race"),
+      schema: z.object({}),
+      process: async () => {
+        await Bun.sleep(20);
+        processCompleted = true;
+        return "done";
+      },
+    });
 
-  try {
-    await q.send({ message: "duplicate" }, { key: "unique-1" });
-    expect(true).toBe(false); // Should not reach
-  } catch (e) {
-    expect(e).toBeInstanceOf(DuplicateJobError);
-    expect((e as DuplicateJobError).key).toBe("unique-1");
+    const id = await worker.submit({ input: {}, leaseMs: 5_000 });
+
+    // Wait until the process is likely completing
+    while (!processCompleted) await Bun.sleep(5);
+
+    // Race: cancel right as the worker is finishing
+    await worker.cancel({ id, reason: "race" });
+
+    const terminal = await worker.join({ id, timeoutMs: 5_000 });
+
+    // The state should be one of the two — never something else
+    expect(["completed", "cancelled"]).toContain(terminal.status);
+
+    // Verify Redis state matches what join reported
+    const raw = await redis.get(`sync:job:${worker.id}:state:${id}`);
+    expect(raw).not.toBeNull();
+    const state = JSON.parse(raw!);
+    expect(state.status).toBe(terminal.status);
+
+    worker.stop();
   }
 });
 
-test("different keys allow separate jobs", async () => {
-  const q = jobs.create({
-    name: "test:dedup-diff",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
+test("lease expiry during processing does not cause double execution", async () => {
+  let execCount = 0;
 
-  const job1 = await q.send({ message: "a" }, { key: "key-a" });
-  const job2 = await q.send({ message: "b" }, { key: "key-b" });
-
-  expect(job1.id).not.toBe(job2.id);
-});
-
-test("jobs without key are never deduplicated", async () => {
-  const q = jobs.create({
-    name: "test:dedup-nokey",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  const job1 = await q.send({ message: "same" });
-  const job2 = await q.send({ message: "same" });
-
-  expect(job1.id).not.toBe(job2.id);
-  const result = await q.list();
-  expect(result.total).toBe(2);
-});
-
-test("unique key is released after job completes", async () => {
-  const q = jobs.create({
-    name: "test:dedup-release",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  await q.send({ message: "first" }, { key: "release-key" });
-
-  const stop = q.process(async () => {}, { pollInterval: 50 });
-  await Bun.sleep(200);
-  await stop();
-
-  // Key should be released, can send again
-  const job2 = await q.send({ message: "second" }, { key: "release-key" });
-  expect(job2.id).toBeDefined();
-});
-
-test("unique key is released after job permanently fails", async () => {
-  const q = jobs.create({
-    name: "test:dedup-fail-release",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
-
-  await q.send({ message: "fail" }, { key: "fail-key", retries: 0 });
-
-  const stop = q.process(
-    async () => {
-      throw new Error("fail");
+  const worker = job({
+    id: uid("job-no-double"),
+    schema: z.object({}),
+    process: async () => {
+      execCount += 1;
+      // Sleep less than leaseMs so withTimeout doesn't fire,
+      // but close enough that lease timing could be tight
+      await Bun.sleep(30);
+      return "ok";
     },
-    { pollInterval: 50 },
-  );
-  await Bun.sleep(200);
-  await stop();
-
-  // Key should be released
-  const job2 = await q.send({ message: "retry" }, { key: "fail-key" });
-  expect(job2.id).toBeDefined();
-});
-
-test("unique key is released after cancel", async () => {
-  const q = jobs.create({
-    name: "test:dedup-cancel",
-    schema: testSchema,
-    prefix: "jobs:test",
   });
 
-  const job = await q.send({ message: "cancel-me" }, { key: "cancel-key" });
+  const id = await worker.submit({ input: {}, leaseMs: 80, maxAttempts: 1 });
+  const terminal = await worker.join({ id, timeoutMs: 5_000 });
 
-  await q.cancel(job.id);
-
-  // Key should be released
-  const job2 = await q.send({ message: "new" }, { key: "cancel-key" });
-  expect(job2.id).toBeDefined();
+  expect(terminal.status).toBe("completed");
+  expect(execCount).toBe(1);
 });
 
-test("unique key persists during retries", async () => {
-  const q = jobs.create({
-    name: "test:dedup-retry-persist",
-    schema: testSchema,
-    prefix: "jobs:test",
-  });
+test("multiple rapid submits produce independent jobs", async () => {
+  let count = 0;
 
-  // Use backoff to keep the job in delayed state between retries
-  await q.send({ message: "retry-dedup" }, { key: "retry-key", retries: 3, backoff: 500 });
-
-  const stop = q.process(
-    async () => {
-      throw new Error("fail");
+  const worker = job({
+    id: uid("job-rapid-submit"),
+    schema: z.object({ n: z.number() }),
+    process: async ({ input }) => {
+      count += 1;
+      return input.n * 2;
     },
-    { pollInterval: 50 },
+  });
+
+  // Submit 10 jobs rapidly without idempotency keys
+  const ids = await Promise.all(
+    Array.from({ length: 10 }, (_, i) =>
+      worker.submit({ input: { n: i } }),
+    ),
   );
 
-  // Wait for first attempt to fail — job should be in delayed with backoff
-  await Bun.sleep(150);
+  // All should have unique IDs
+  expect(new Set(ids).size).toBe(10);
 
-  try {
-    await q.send({ message: "dup" }, { key: "retry-key" });
-    expect(true).toBe(false);
-  } catch (e) {
-    expect(e).toBeInstanceOf(DuplicateJobError);
+  // All should complete
+  const results = await Promise.all(
+    ids.map((id) => worker.join({ id, timeoutMs: 10_000 })),
+  );
+
+  for (const r of results) {
+    expect(r.status).toBe("completed");
   }
-
-  await stop();
+  expect(count).toBe(10);
 });

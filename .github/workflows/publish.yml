@@ -1,12 +1,41 @@
-name: Publish Package
+name: CI
 
 on:
   push:
+    branches: ["**"]
     tags:
       - "v*"
+  pull_request:
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      valkey:
+        image: docker.io/valkey/valkey:8-alpine
+        ports:
+          - 6399:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Run tests
+        env:
+          REDIS_URL: redis://localhost:6399
+        run: bun test
+
   publish-npm:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -58,7 +87,7 @@ jobs:
               }
             },
             "peerDependencies": {
-              "zod": "^3"
+              "zod": "^4"
             },
             "keywords": ["bun", "redis", "ratelimit", "mutex", "jobs", "queue", "distributed"],
             "author": "Valentin Kolb",

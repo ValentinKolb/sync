@@ -7,23 +7,36 @@ export {
 } from "./src/ratelimit";
 export { mutex, LockError, type Mutex, type Lock, type MutexConfig } from "./src/mutex";
 export {
-  jobs,
-  JobsError,
-  ValidationError,
-  DuplicateJobError,
-  type Jobs,
-  type Job,
-  type JobsConfig,
-  type SendOptions,
-  type ProcessOptions,
-  type ListOptions,
-  type ListResult,
-} from "./src/jobs";
-export {
   queue,
-  QueueError,
-  QueueValidationError,
   type Queue,
   type QueueConfig,
-  type QueueProcessOptions,
+  type QueueReader,
+  type QueueRecvConfig,
+  type QueueSendConfig,
+  type QueueReceived,
 } from "./src/queue";
+export {
+  topic,
+  type Topic,
+  type TopicConfig,
+  type TopicReader,
+  type TopicRecvConfig,
+  type TopicPubConfig,
+  type TopicDelivery,
+  type TopicLiveConfig,
+  type TopicLiveEvent,
+} from "./src/topic";
+export {
+  job,
+  type JobId,
+  type JobStatus,
+  type JobTerminal,
+  type SubmitOptions,
+  type JoinOptions,
+  type CancelOptions,
+  type JobEvent,
+  type JobEvents,
+  type JobContext,
+  type JobHandle,
+  type JobDefinition,
+} from "./src/job";

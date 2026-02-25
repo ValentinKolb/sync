@@ -1,7 +1,7 @@
 {
   "name": "@valentinkolb/sync",
   "version": "0.1.0",
-  "description": "General purpose sync primitives for TypeScript and Bun (ratelimit, mutex, jobs)",
+  "description": "General purpose sync primitives for TypeScript and Bun (ratelimit, mutex, queue, topic, job)",
   "module": "index.ts",
   "type": "module",
   "exports": {
