@@ -105,7 +105,7 @@ jobs:
           cp LICENSE dist/LICENSE
 
       - name: Generate type declarations
-        run: bunx tsc --declaration --emitDeclarationOnly --outDir dist
+        run: bunx tsc --declaration --emitDeclarationOnly --noEmit false --outDir dist
 
       - name: Publish to npm
         run: npm publish --provenance --access public
