@@ -99,6 +99,11 @@ jobs:
           }
           EOF
 
+      - name: Copy package docs
+        run: |
+          cp README.md dist/README.md
+          cp LICENSE dist/LICENSE
+
       - name: Generate type declarations
         run: bunx tsc --declaration --emitDeclarationOnly --outDir dist
 
