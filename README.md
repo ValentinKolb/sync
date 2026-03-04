@@ -6,10 +6,10 @@ Distributed synchronization primitives for Bun and TypeScript, backed by Redis.
 
 - **Bun-native** - Built for [Bun](https://bun.sh). Uses `Bun.redis`, `Bun.sleep`, `RedisClient` directly. No Node.js compatibility layers.
 - **Minimal dependencies** - Only `zod` as a peer dependency. Everything else is Bun built-ins and Redis Lua scripts.
-- **Composable building blocks** - Five focused primitives that work independently or together. `job` composes `queue` + `topic` internally.
+- **Composable building blocks** - Seven focused primitives that work independently or together. `job` composes `queue` + `topic` internally, `scheduler` composes durable dispatch on top of `job`.
 - **Consistent API** - Every module follows the same pattern: `moduleName({ id, ...config })` returns an instance. No classes, no `.create()`, no `new`.
 - **Atomic by default** - All Redis operations use Lua scripts for atomicity. No multi-step race conditions at the Redis level.
-- **Schema-validated** - Queue, topic, and job payloads are validated with Zod at the boundary. Invalid data never enters Redis.
+- **Schema-validated** - Queue, topic, job, and ephemeral payloads are validated with Zod at the boundary. Invalid data never enters Redis.
 
 ## Features
 
@@ -18,8 +18,11 @@ Distributed synchronization primitives for Bun and TypeScript, backed by Redis.
 - **Queue** - Durable work queue with leases, DLQ, delayed messages, and idempotency
 - **Topic** - Pub/sub with consumer groups, at-least-once delivery, and live streaming
 - **Job** - Durable job processing built on queue + topic with retries, cancellation, and event sourcing
+- **Scheduler** - Distributed cron scheduler with idempotent registration, leader fencing, and durable dispatch via job submission
+- **Ephemeral** - TTL-based ephemeral key/value store with typed snapshots and event stream for upsert/touch/delete/expire
+- **Retry utility** - Small transport-aware retry helper with sensible defaults and per-call override
 
-For a complete API reference (types, config options, Redis key patterns, internals), see [`llms.txt`](./llms.txt).
+For complete API details, use the modular skills in [`skills/`](./skills), especially each feature's `references/api.md`.
 
 ## Installation
 
@@ -27,7 +30,66 @@ For a complete API reference (types, config options, Redis key patterns, interna
 bun add @valentinkolb/sync zod
 ```
 
+## Retry Utility
+
+KISS transport retry helper for Redis/network hiccups.
+Defaults are exported as `DEFAULT_RETRY_OPTIONS`; override only when needed.
+
+```ts
+import {
+  retry,
+  DEFAULT_RETRY_OPTIONS,
+  isRetryableTransportError,
+} from "@valentinkolb/sync";
+
+// default usage (recommended)
+const value = await retry(() => fragileCall());
+
+console.log(DEFAULT_RETRY_OPTIONS);
+// {
+//   attempts: 8,
+//   minDelayMs: 100,
+//   maxDelayMs: 2000,
+//   factor: 2,
+//   jitter: 0.2,
+//   retryIf: isRetryableTransportError
+// }
+
+// per-call override (edge cases only)
+const value2 = await retry(
+  () => fragileCall(),
+  {
+    attempts: 12,
+    maxDelayMs: 5_000,
+    retryIf: isRetryableTransportError,
+  },
+);
+```
+
+Internal default behavior:
+- Queue/topic/ephemeral `stream({ wait: true })` and topic `live()` use transport retries to stay alive across brief outages.
+- One-shot calls (`recv()`, `stream({ wait: false })`, `send()/pub()/submit()`) keep explicit failure semantics unless you wrap them with `retry(...)`.
+
 Requires [Bun](https://bun.sh) and a Redis-compatible server (Redis 6.2+, Valkey, Dragonfly).
+
+### Install Agent Skills (optional)
+
+This repository ships reusable agent skills in [`skills/`](./skills).  
+Using the [Vercel Skills CLI](https://github.com/vercel-labs/skills), install them with:
+
+```bash
+# list available skills from this repo
+bunx skills add https://github.com/valentinkolb/sync --list
+
+# install all skills (project-local)
+bunx skills add https://github.com/valentinkolb/sync --skill '*'
+
+# install selected skills (example)
+bunx skills add https://github.com/valentinkolb/sync \
+  --skill sync-scheduler \
+  --skill sync-job \
+  --skill sync-retry
+```
 
 ## Rate Limit
 
@@ -134,6 +196,8 @@ const msg2 = await reader.recv({ signal: abortController.signal });
 - **Idempotency**: `send({ idempotencyKey })` deduplicates within a configurable TTL.
 - **Multi-tenant**: Pass `tenantId` to `send()` and `recv()` for isolated queues.
 - **AbortSignal**: Pass `signal` to `recv()` for graceful shutdown.
+- **Transport resilience in stream loops**: `stream({ wait: true })` auto-retries transient transport errors and keeps consuming after short Redis outages.
+- **One-shot semantics stay explicit**: `recv()` and `stream({ wait: false })` keep direct error semantics (no hidden infinite retry wrapper).
 
 ## Topic
 
@@ -186,6 +250,8 @@ for await (const event of t.live({ after: "0-0" })) {
 - **Retention**: Automatic XTRIM based on `retentionMs`.
 - **Multi-tenant**: Pass `tenantId` to `pub()` and `recv()` for isolated streams.
 - **AbortSignal**: Pass `signal` to `recv()`, `stream()`, and `live()`.
+- **Transport resilience in stream loops**: `reader().stream({ wait: true })` and `live()` auto-retry transient transport errors by default.
+- **One-shot semantics stay explicit**: `recv()` and `stream({ wait: false })` keep direct error semantics.
 
 ## Job
 
@@ -251,11 +317,94 @@ sendOrderMail.stop();
 - **AbortSignal**: `ctx.signal` is aborted on timeout, error, or cancellation.
 - **Graceful shutdown**: `stop()` signals the worker loop to exit.
 - **Per-job state TTL**: Each job's state has its own Redis TTL (7 days default).
+- **Worker transport resilience**: Internal worker receive loop auto-retries transient transport errors and self-recovers after short Redis outages.
+
+## Scheduler
+
+Distributed cron scheduler for horizontally scaled apps. Registration is idempotent per schedule `id`; one active leader dispatches due slots and submits durable jobs.
+
+```ts
+import { z } from "zod";
+import { job, scheduler } from "@valentinkolb/sync";
+
+const cleanup = job({
+  id: "cleanup-temp",
+  schema: z.object({ scope: z.string() }),
+  process: async ({ input }) => {
+    await runCleanup(input.scope);
+  },
+});
+
+const sched = scheduler({
+  id: "platform",
+  onMetric: (metric) => console.log(metric),
+});
+
+sched.start();
+
+await sched.register({
+  id: "cleanup-hourly",    // idempotent key
+  cron: "0 * * * *",       // every hour
+  tz: "Europe/Berlin",
+  job: cleanup,
+  input: { scope: "tmp" },
+  misfire: "skip",         // default: do not replay backlog
+  meta: { owner: "ops" },
+});
+```
+
+### Scheduler features
+
+- **Idempotent upsert registration**: repeated `register({ id, ... })` creates once, then updates in place.
+- **No fixed leader pod**: leadership uses a renewable Redis lease (`mutex`) with epoch fencing.
+- **Durable dispatch**: each cron slot maps to deterministic job key (`scheduleId:slotTs`) to prevent duplicates.
+- **Misfire policies**: `skip` (default), `catch_up_one`, `catch_up_all` with cap (`maxCatchUpRuns`).
+- **Failure isolation**: submit retry + backoff, dispatch DLQ, configurable threshold for auto-advance after repeated failures.
+- **Handler safety**: optional `strictHandlers` mode (default `true`) relinquishes leadership when required handlers are missing.
+
+## Ephemeral
+
+Typed ephemeral key/value store with TTL semantics and stream events. Useful for short-lived state like presence, worker heartbeats, or temporary coordination hints.
+
+```ts
+import { z } from "zod";
+import { ephemeral } from "@valentinkolb/sync";
+
+const presence = ephemeral({
+  id: "presence",
+  schema: z.object({ nodeId: z.string(), status: z.enum(["up", "down"]) }),
+  ttlMs: 30_000,
+});
+
+await presence.upsert({ key: "worker:42", value: { nodeId: "42", status: "up" } });
+await presence.touch({ key: "worker:42" }); // extend TTL
+
+const snap = await presence.snapshot();
+console.log(snap.entries.length, snap.cursor);
+
+for await (const event of presence.reader({ after: snap.cursor }).stream()) {
+  console.log(event.type);
+}
+```
+
+### Ephemeral features
+
+- **TTL-first model**: each key has an independent expiration and can be extended with `touch()`.
+- **Bounded capacity**: configurable `maxEntries` and payload-size limits.
+- **Typed values**: schema validation on write and read-path parsing.
+- **Change stream**: emits `upsert`, `touch`, `delete`, `expire`, and `overflow` events.
+- **Snapshot + cursor**: take a consistent snapshot and continue with stream replay.
+- **Tenant isolation**: optional per-operation `tenantId` for keyspace isolation.
+- **Transport resilience in stream loops**: `reader().stream({ wait: true })` auto-retries transient transport errors by default.
 
 ## Testing
 
 ```bash
 bun test --preload ./tests/preload.ts
+# fault-tolerance suites
+bun run test:fault
+# all test files
+bun run test:all
 ```
 
 Requires a Redis-compatible server on `localhost:6399` (configured in `tests/preload.ts`).
@@ -277,6 +426,7 @@ You need a Redis-compatible server on port 6399. The easiest way is Docker/Podma
 ```bash
 docker run -d --name valkey -p 6399:6379 valkey/valkey:latest
 bun test --preload ./tests/preload.ts
+bun run test:fault
 ```
 
 ### Project structure
@@ -288,7 +438,11 @@ src/
   queue.ts           # Durable work queue
   topic.ts           # Pub/sub with consumer groups
   job.ts             # Job processing (composes queue + topic)
+  scheduler.ts       # Distributed cron scheduler (durable dispatch via job)
+  ephemeral.ts       # TTL-based ephemeral store with event stream
+  retry.ts           # Generic transport-aware retry utility
   internal/
+    cron.ts          # Cron parsing/next timestamp + timezone validation
     job-utils.ts     # Job helper functions (retry, timeout, parsing)
     topic-utils.ts   # Stream entry parsing helpers
 tests/
@@ -296,7 +450,7 @@ tests/
   *-utils.unit.test.ts  # Pure unit tests
   preload.ts         # Sets REDIS_URL for test environment
 index.ts             # Public API exports
-llms.txt             # Complete API reference for LLMs
+skills/              # Modular agent skills + per-feature API references
 ```
 
 ### Guidelines
