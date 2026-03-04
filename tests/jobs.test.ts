@@ -506,3 +506,58 @@ test("multiple rapid submits produce independent jobs", async () => {
   }
   expect(count).toBe(10);
 });
+
+test("worker recovers when state key is missing but queue message exists", async () => {
+  let runs = 0;
+
+  const worker = job({
+    id: uid("job-recover-missing-state"),
+    schema: z.object({ v: z.number() }),
+    process: async ({ input }) => {
+      runs += 1;
+      return input.v * 3;
+    },
+  });
+
+  const id = await worker.submit({
+    input: { v: 7 },
+    key: "recover-state-key",
+    delayMs: 100,
+  });
+
+  await Bun.sleep(20);
+  await redis.del(`sync:job:${worker.id}:state:${id}`);
+
+  const terminal = await worker.join({ id, timeoutMs: 6_000 });
+  expect(terminal.status).toBe("completed");
+  expect(terminal.result).toBe(21);
+  expect(runs).toBe(1);
+});
+
+test("cancel remains authoritative if written before completion finalize", async () => {
+  let started = false;
+
+  const worker = job({
+    id: uid("job-cancel-authoritative"),
+    schema: z.object({}),
+    process: async () => {
+      started = true;
+      await Bun.sleep(120);
+      return "done";
+    },
+  });
+
+  const id = await worker.submit({ input: {}, leaseMs: 5_000 });
+  while (!started) await Bun.sleep(5);
+
+  await worker.cancel({ id, reason: "force-cancel" });
+  const terminal = await worker.join({ id, timeoutMs: 5_000 });
+  expect(terminal.status).toBe("cancelled");
+
+  const raw = await redis.get(`sync:job:${worker.id}:state:${id}`);
+  expect(raw).not.toBeNull();
+  const state = JSON.parse(raw!);
+  expect(state.status).toBe("cancelled");
+
+  worker.stop();
+});
