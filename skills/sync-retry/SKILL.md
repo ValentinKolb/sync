@@ -1,6 +1,6 @@
 ---
 name: sync-retry
-description: Use this skill when handling transient transport failures with @valentinkolb/sync retry utility: applying sensible defaults, per-call overrides, AbortSignal cancellation, and retryIf classification for Redis/network operations.
+description: "Use this skill when handling transient transport failures with @valentinkolb/sync retry utility: applying sensible defaults, per-call overrides, AbortSignal cancellation, and retryIf classification for Redis/network operations."
 ---
 
 # Sync Retry

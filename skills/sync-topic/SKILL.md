@@ -1,6 +1,6 @@
 ---
 name: sync-topic
-description: Use this skill when implementing event streams with @valentinkolb/sync topic: publishing typed events, consumer-group processing with commit, live replay, retention tuning, idempotent publish, and multi-tenant stream isolation.
+description: "Use this skill when implementing event streams with @valentinkolb/sync topic: publishing typed events, consumer-group processing with commit, live replay, retention tuning, idempotent publish, and multi-tenant stream isolation."
 ---
 
 # Sync Topic

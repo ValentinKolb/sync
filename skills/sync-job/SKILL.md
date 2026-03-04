@@ -1,6 +1,6 @@
 ---
 name: sync-job
-description: Use this skill when implementing durable background jobs with @valentinkolb/sync job: typed submit/join/cancel flows, retries and backoff, lease timeouts, heartbeat-based lease extension, event-stream integration, and idempotent submission semantics.
+description: "Use this skill when implementing durable background jobs with @valentinkolb/sync job: typed submit/join/cancel flows, retries and backoff, lease timeouts, heartbeat-based lease extension, event-stream integration, and idempotent submission semantics."
 ---
 
 # Sync Job

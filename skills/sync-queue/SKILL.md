@@ -1,6 +1,6 @@
 ---
 name: sync-queue
-description: Use this skill when implementing durable queue processing with @valentinkolb/sync queue: send/recv/stream loops, at-least-once delivery, lease management, retries via nack delays, DLQ behavior, multi-tenant keyspaces, and idempotent enqueueing.
+description: "Use this skill when implementing durable queue processing with @valentinkolb/sync queue: send/recv/stream loops, at-least-once delivery, lease management, retries via nack delays, DLQ behavior, multi-tenant keyspaces, and idempotent enqueueing."
 ---
 
 # Sync Queue

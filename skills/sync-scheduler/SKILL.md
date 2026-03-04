@@ -1,6 +1,6 @@
 ---
 name: sync-scheduler
-description: Use this skill when implementing distributed cron scheduling with @valentinkolb/sync scheduler: idempotent schedule registration across pods, leader-fenced dispatch, misfire policy design, durable dispatch via job.submit, and scheduler reliability/metrics handling.
+description: "Use this skill when implementing distributed cron scheduling with @valentinkolb/sync scheduler: idempotent schedule registration across pods, leader-fenced dispatch, misfire policy design, durable dispatch via job.submit, and scheduler reliability/metrics handling."
 ---
 
 # Sync Scheduler

@@ -1,6 +1,6 @@
 ---
 name: sync-ratelimit
-description: Use this skill when working with @valentinkolb/sync rate limiting in Bun/TypeScript: creating per-identifier limits, handling RateLimitError, tuning windows, and reasoning about sliding-window guarantees and Redis keys.
+description: "Use this skill when working with @valentinkolb/sync rate limiting in Bun/TypeScript: creating per-identifier limits, handling RateLimitError, tuning windows, and reasoning about sliding-window guarantees and Redis keys."
 ---
 
 # Sync RateLimit

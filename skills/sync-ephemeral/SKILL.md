@@ -1,6 +1,6 @@
 ---
 name: sync-ephemeral
-description: Use this skill when implementing short-lived typed state with @valentinkolb/sync ephemeral: TTL-based upsert/touch/remove, snapshot-plus-cursor reconciliation, stream consumers for upsert/touch/delete/expire events, and capacity/payload safety limits.
+description: "Use this skill when implementing short-lived typed state with @valentinkolb/sync ephemeral: TTL-based upsert/touch/remove, snapshot-plus-cursor reconciliation, stream consumers for upsert/touch/delete/expire events, and capacity/payload safety limits."
 ---
 
 # Sync Ephemeral

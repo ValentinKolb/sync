@@ -1,6 +1,6 @@
 ---
 name: sync-mutex
-description: Use this skill when working with @valentinkolb/sync distributed locks: exclusive critical sections across pods, lease extension, retry tuning, owner-safe release, and lock-failure handling.
+description: "Use this skill when working with @valentinkolb/sync distributed locks: exclusive critical sections across pods, lease extension, retry tuning, owner-safe release, and lock-failure handling."
 ---
 
 # Sync Mutex
