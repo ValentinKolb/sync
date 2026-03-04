@@ -1,6 +1,7 @@
 import { redis, RedisClient } from "bun";
 import type { z } from "zod";
 import { fieldArrayToObject, parseFirstStreamEntry, type ParsedEntry } from "./internal/topic-utils";
+import { isRetryableTransportError, retry } from "./retry";
 
 const DEFAULT_PREFIX = "sync:e";
 const DEFAULT_TENANT = "default";
@@ -803,7 +804,16 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
       const wait = cfg.wait ?? true;
       try {
         while (!cfg.signal?.aborted) {
-          const event = await recv(cfg);
+          const event = wait
+            ? await retry(
+                async () => await recv(cfg),
+                {
+                  attempts: Number.POSITIVE_INFINITY,
+                  signal: cfg.signal,
+                  retryIf: isRetryableTransportError,
+                },
+              )
+            : await recv(cfg);
           if (event) {
             yield event;
             continue;
