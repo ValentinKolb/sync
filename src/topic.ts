@@ -2,6 +2,7 @@ import { redis, RedisClient } from "bun";
 import { randomUUID } from "crypto";
 import type { z } from "zod";
 import { parseFirstStreamEntry, type ParsedEntry } from "./internal/topic-utils";
+import { isRetryableTransportError, retry } from "./retry";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_PREFIX = "sync:topic";
@@ -332,7 +333,16 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
       const wait = streamCfg.wait ?? true;
       try {
         while (!streamCfg.signal?.aborted) {
-          const message = await recv(streamCfg);
+          const message = wait
+            ? await retry(
+                async () => await recv(streamCfg),
+                {
+                  attempts: Number.POSITIVE_INFINITY,
+                  signal: streamCfg.signal,
+                  retryIf: isRetryableTransportError,
+                },
+              )
+            : await recv(streamCfg);
           if (message) {
             yield message;
             continue;
@@ -374,21 +384,29 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
 
     try {
       while (!liveCfg.signal?.aborted) {
-        const result = liveCfg.signal
-          ? await blockingReadWithTemporaryClient(
-              "XREAD",
-              ["COUNT", "1", "BLOCK", timeoutMs.toString(), "STREAMS", key, cursor],
-              liveCfg.signal,
-            )
-          : await (async (): Promise<unknown> => {
-              try {
-                const client = await ensureBlockingClient();
-                return await client.send("XREAD", ["COUNT", "1", "BLOCK", timeoutMs.toString(), "STREAMS", key, cursor]);
-              } catch (error) {
-                resetBlockingClient();
-                throw asError(error);
-              }
-            })();
+        const result = await retry(
+          async (): Promise<unknown> =>
+            liveCfg.signal
+              ? await blockingReadWithTemporaryClient(
+                  "XREAD",
+                  ["COUNT", "1", "BLOCK", timeoutMs.toString(), "STREAMS", key, cursor],
+                  liveCfg.signal,
+                )
+              : await (async (): Promise<unknown> => {
+                  try {
+                    const client = await ensureBlockingClient();
+                    return await client.send("XREAD", ["COUNT", "1", "BLOCK", timeoutMs.toString(), "STREAMS", key, cursor]);
+                  } catch (error) {
+                    resetBlockingClient();
+                    throw asError(error);
+                  }
+                })(),
+          {
+            attempts: Number.POSITIVE_INFINITY,
+            signal: liveCfg.signal,
+            retryIf: isRetryableTransportError,
+          },
+        );
 
         const entry = parseFirstStreamEntry(result);
         if (!entry) continue;

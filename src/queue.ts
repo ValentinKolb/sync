@@ -1,6 +1,7 @@
 import { redis, RedisClient } from "bun";
 import { randomUUID } from "crypto";
 import type { z } from "zod";
+import { isRetryableTransportError, retry } from "./retry";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_PREFIX = "sync:queue";
@@ -645,7 +646,16 @@ export const queue = <TSchema extends z.ZodTypeAny>(config: QueueConfig<TSchema>
       const wait = streamCfg.wait ?? true;
       try {
         while (!streamCfg.signal?.aborted) {
-          const message = await recv(streamCfg);
+          const message = wait
+            ? await retry(
+                async () => await recv(streamCfg),
+                {
+                  attempts: Number.POSITIVE_INFINITY,
+                  signal: streamCfg.signal,
+                  retryIf: isRetryableTransportError,
+                },
+              )
+            : await recv(streamCfg);
           if (message) {
             yield message;
             continue;

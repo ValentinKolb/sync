@@ -41,6 +41,17 @@ export {
   type JobDefinition,
 } from "./src/job";
 export {
+  scheduler,
+  type Scheduler,
+  type SchedulerConfig,
+  type SchedulerRegisterConfig,
+  type SchedulerUnregisterConfig,
+  type SchedulerGetConfig,
+  type SchedulerInfo,
+  type SchedulerMetric,
+  type SchedulerMetricsSnapshot,
+} from "./src/scheduler";
+export {
   ephemeral,
   EphemeralCapacityError,
   EphemeralPayloadTooLargeError,
@@ -55,3 +66,9 @@ export {
   type EphemeralReader,
   type EphemeralStore,
 } from "./src/ephemeral";
+export {
+  retry,
+  isRetryableTransportError,
+  DEFAULT_RETRY_OPTIONS,
+  type RetryOptions,
+} from "./src/retry";

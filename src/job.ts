@@ -1,7 +1,8 @@
-import { redis } from "bun";
+import { redis, sleep } from "bun";
 import { z, type ZodTypeAny } from "zod";
 import { queue } from "./queue";
 import { topic, type Topic } from "./topic";
+import { isRetryableTransportError, retry } from "./retry";
 import {
   computeRetryDelay,
   isTerminalStatus,
@@ -15,6 +16,44 @@ const DEFAULT_LEASE_MS = 30_000;
 const DEFAULT_WORKER_RECV_TIMEOUT_MS = 1_000;
 const DEFAULT_MAX_ATTEMPTS = 1;
 const DEFAULT_STATE_RETENTION_MS = 7 * DAY_MS;
+const FINALIZE_STATE_SCRIPT = `
+  local key = KEYS[1]
+  local payload = ARGV[1]
+  local ttlMs = tonumber(ARGV[2])
+
+  local raw = redis.call("GET", key)
+  if not raw then return 0 end
+
+  local ok, state = pcall(cjson.decode, raw)
+  if not ok then return 0 end
+
+  local status = tostring(state.status or "")
+  if status == "cancelled" then return -1 end
+  if status == "completed" or status == "failed" or status == "timed_out" then return 0 end
+
+  redis.call("SET", key, payload, "PX", tostring(ttlMs))
+  return 1
+`;
+
+const CANCEL_STATE_SCRIPT = `
+  local key = KEYS[1]
+  local payload = ARGV[1]
+  local ttlMs = tonumber(ARGV[2])
+
+  local raw = redis.call("GET", key)
+  if not raw then return 0 end
+
+  local ok, state = pcall(cjson.decode, raw)
+  if not ok then return 0 end
+
+  local status = tostring(state.status or "")
+  if status == "completed" or status == "failed" or status == "timed_out" or status == "cancelled" then
+    return 0
+  end
+
+  redis.call("SET", key, payload, "PX", tostring(ttlMs))
+  return 1
+`;
 
 const activeWorkers = new Map<string, AbortController>();
 
@@ -35,6 +74,7 @@ export type JobTerminal<Result = unknown> = {
 
 export type SubmitOptions = {
   key?: string;
+  keyTtlMs?: number;
   delayMs?: number;
   at?: number;
   maxAttempts?: number;
@@ -75,6 +115,7 @@ export type JobContext = {
 export type JobHandle<Input, Result = unknown> = {
   id: string;
   submit(cfg: { input: Input } & SubmitOptions): Promise<JobId>;
+  validateInput(input: unknown): void;
   join(cfg: { id: JobId } & JoinOptions): Promise<JobTerminal<Result>>;
   cancel(cfg: { id: JobId } & CancelOptions): Promise<void>;
   events(id: JobId): JobEvents;
@@ -188,173 +229,243 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
     await redis.send("SET", [stateKey(state.id), JSON.stringify(state), "PX", ttlMs.toString()]);
   };
 
+  const writeStateIfAbsent = async (state: InternalState<Result>, ttlMs: number = DEFAULT_STATE_RETENTION_MS): Promise<boolean> => {
+    const result = await redis.send("SET", [stateKey(state.id), JSON.stringify(state), "PX", ttlMs.toString(), "NX"]);
+    return result === "OK";
+  };
+
+  const writeFinalState = async (state: InternalState<Result>, ttlMs: number = DEFAULT_STATE_RETENTION_MS): Promise<"ok" | "cancelled" | "missing"> => {
+    const result = Number(
+      await redis.send("EVAL", [
+        FINALIZE_STATE_SCRIPT,
+        "1",
+        stateKey(state.id),
+        JSON.stringify(state),
+        String(ttlMs),
+      ]),
+    );
+    if (result === 1) return "ok";
+    if (result === -1) return "cancelled";
+    return "missing";
+  };
+
+  const writeCancelledState = async (state: InternalState<Result>, ttlMs: number = DEFAULT_STATE_RETENTION_MS): Promise<boolean> => {
+    const result = Number(
+      await redis.send("EVAL", [
+        CANCEL_STATE_SCRIPT,
+        "1",
+        stateKey(state.id),
+        JSON.stringify(state),
+        String(ttlMs),
+      ]),
+    );
+    return result === 1;
+  };
+
   const startWorker = (): void => {
     if (activeWorkers.has(workerId)) return;
     const workerAc = new AbortController();
     activeWorkers.set(workerId, workerAc);
 
     void (async () => {
-      while (!workerAc.signal.aborted) {
-        const message = await workQueue.recv({
-          wait: true,
-          timeoutMs: DEFAULT_WORKER_RECV_TIMEOUT_MS,
-          leaseMs: DEFAULT_LEASE_MS,
-        });
+      try {
+        while (!workerAc.signal.aborted) {
+          try {
+            const message = await retry(
+              async () =>
+                await workQueue.recv({
+                  wait: true,
+                  timeoutMs: DEFAULT_WORKER_RECV_TIMEOUT_MS,
+                  leaseMs: DEFAULT_LEASE_MS,
+                }),
+              {
+                attempts: Number.POSITIVE_INFINITY,
+                signal: workerAc.signal,
+                retryIf: isRetryableTransportError,
+              },
+            );
 
-        if (!message) continue;
+            if (!message) continue;
 
-        const payload = message.data as WorkPayload;
-        const state = await readState(payload.id);
+            const payload = message.data as WorkPayload;
+            let state = await readState(payload.id);
 
-        if (!state) {
-          await message.ack();
-          continue;
-        }
+            if (!state) {
+              // Recover from submit crash windows where the queue message exists
+              // but the durable state key was never written.
+              await writeStateIfAbsent({
+                id: payload.id,
+                status: "submitted",
+                attempts: 0,
+                updatedAt: now(),
+              });
+              state = await readState(payload.id);
+              if (!state) {
+                await message.nack({ delayMs: 250, reason: "state_missing_recover_failed" });
+                continue;
+              }
+            }
 
-        if (state.status === "cancelled") {
-          await message.ack();
-          continue;
-        }
+            if (state.status === "cancelled") {
+              await message.ack();
+              continue;
+            }
 
-        if (isTerminalStatus(state.status)) {
-          await message.ack();
-          continue;
-        }
+            if (isTerminalStatus(state.status)) {
+              await message.ack();
+              continue;
+            }
 
-        const attempt = message.attempt;
-        const runId = message.deliveryId;
-        const startedAt = now();
-
-        await writeState({
-          ...state,
-          status: "running",
-          attempts: attempt,
-          updatedAt: startedAt,
-        });
-
-        await emitEvent(payload.id, {
-          type: "started",
-          id: payload.id,
-          runId,
-          attempt,
-          ts: startedAt,
-        });
-
-        await message.touch({ leaseMs: payload.leaseMs });
-
-        const jobAc = new AbortController();
-
-        const ctx: JobContext = {
-          signal: jobAc.signal,
-          step: async <T>(cfg: { id: string; run: () => Promise<T> | T }): Promise<T> => {
-            return await Promise.resolve(cfg.run());
-          },
-          heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
-            await message.touch({ leaseMs: cfg?.leaseMs ?? payload.leaseMs });
-            await emitEvent(payload.id, {
-              type: "heartbeat",
-              id: payload.id,
-              runId,
-              ts: now(),
-            });
-          },
-        };
-
-        try {
-          const inputParsed = definition.schema.safeParse(payload.input);
-          if (!inputParsed.success) {
-            throw inputParsed.error;
-          }
-
-          const processPromise = Promise.resolve(definition.process({ ctx, input: inputParsed.data as Input }));
-          const result = await withTimeout(processPromise, payload.leaseMs);
-
-          const latest = await readState(payload.id);
-          if (latest?.status === "cancelled") {
-            jobAc.abort();
-            await message.ack();
-            continue;
-          }
-
-          const acked = await message.ack();
-          if (!acked) continue;
-
-          const finishedAt = now();
-          await writeState({
-            id: payload.id,
-            status: "completed",
-            attempts: attempt,
-            updatedAt: finishedAt,
-            finishedAt,
-            result: result as Result,
-          });
-
-          await emitEvent(payload.id, {
-            type: "completed",
-            id: payload.id,
-            ts: finishedAt,
-          });
-        } catch (error) {
-          jobAc.abort();
-          const err = error instanceof Error ? error : new Error(String(error));
-          const timedOut = err.name === "JobTimeoutError";
-          const canRetry = attempt < payload.maxAttempts;
-
-          if (canRetry) {
-            const delayMs = computeRetryDelay(payload.backoff, attempt);
-            const nextAt = now() + delayMs;
-
-            const nacked = await message.nack({
-              delayMs,
-              reason: timedOut ? "timed_out" : "error",
-              error: err.message,
-            });
-
-            if (!nacked) continue;
+            const attempt = message.attempt;
+            const runId = message.deliveryId;
+            const startedAt = now();
 
             await writeState({
-              id: payload.id,
-              status: "submitted",
+              ...state,
+              status: "running",
               attempts: attempt,
-              updatedAt: now(),
+              updatedAt: startedAt,
             });
 
             await emitEvent(payload.id, {
-              type: "retry",
+              type: "started",
               id: payload.id,
               runId,
-              nextAt,
-              reason: err.message,
-              ts: now(),
+              attempt,
+              ts: startedAt,
             });
 
-            continue;
+            await message.touch({ leaseMs: payload.leaseMs });
+
+            const jobAc = new AbortController();
+
+            const ctx: JobContext = {
+              signal: jobAc.signal,
+              step: async <T>(cfg: { id: string; run: () => Promise<T> | T }): Promise<T> => {
+                return await Promise.resolve(cfg.run());
+              },
+              heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
+                await message.touch({ leaseMs: cfg?.leaseMs ?? payload.leaseMs });
+                await emitEvent(payload.id, {
+                  type: "heartbeat",
+                  id: payload.id,
+                  runId,
+                  ts: now(),
+                });
+              },
+            };
+
+            try {
+              const inputParsed = definition.schema.safeParse(payload.input);
+              if (!inputParsed.success) {
+                throw inputParsed.error;
+              }
+
+              const processPromise = Promise.resolve(definition.process({ ctx, input: inputParsed.data as Input }));
+              const result = await withTimeout(processPromise, payload.leaseMs);
+
+              const latest = await readState(payload.id);
+              if (latest?.status === "cancelled") {
+                jobAc.abort();
+                await message.ack();
+                continue;
+              }
+
+              const acked = await message.ack();
+              if (!acked) continue;
+
+              const finishedAt = now();
+              const writeResult = await writeFinalState({
+                id: payload.id,
+                status: "completed",
+                attempts: attempt,
+                updatedAt: finishedAt,
+                finishedAt,
+                result: result as Result,
+              });
+              if (writeResult !== "ok") continue;
+
+              await emitEvent(payload.id, {
+                type: "completed",
+                id: payload.id,
+                ts: finishedAt,
+              });
+            } catch (error) {
+              jobAc.abort();
+              const err = error instanceof Error ? error : new Error(String(error));
+              const timedOut = err.name === "JobTimeoutError";
+              const canRetry = attempt < payload.maxAttempts;
+
+              if (canRetry) {
+                const delayMs = computeRetryDelay(payload.backoff, attempt);
+                const nextAt = now() + delayMs;
+
+                const nacked = await message.nack({
+                  delayMs,
+                  reason: timedOut ? "timed_out" : "error",
+                  error: err.message,
+                });
+
+                if (!nacked) continue;
+
+                const latestState = await readState(payload.id);
+                if (latestState?.status === "cancelled") continue;
+
+                await writeState({
+                  id: payload.id,
+                  status: "submitted",
+                  attempts: attempt,
+                  updatedAt: now(),
+                });
+
+                await emitEvent(payload.id, {
+                  type: "retry",
+                  id: payload.id,
+                  runId,
+                  nextAt,
+                  reason: err.message,
+                  ts: now(),
+                });
+
+                continue;
+              }
+
+              const acked = await message.ack();
+              if (!acked) continue;
+
+              const finishedAt = now();
+              const status: JobStatus = timedOut ? "timed_out" : "failed";
+
+              const writeResult = await writeFinalState({
+                id: payload.id,
+                status,
+                attempts: attempt,
+                updatedAt: finishedAt,
+                finishedAt,
+                error: {
+                  message: err.message,
+                  code: timedOut ? "TIMEOUT" : undefined,
+                },
+              });
+              if (writeResult !== "ok") continue;
+
+              await emitEvent(payload.id, {
+                type: "failed",
+                id: payload.id,
+                reason: err.message,
+                ts: finishedAt,
+              });
+            }
+          } catch {
+            // Keep worker alive on transient infrastructure errors.
+            if (workerAc.signal.aborted) break;
+            await sleep(25);
           }
-
-          const acked = await message.ack();
-          if (!acked) continue;
-
-          const finishedAt = now();
-          const status: JobStatus = timedOut ? "timed_out" : "failed";
-
-          await writeState({
-            id: payload.id,
-            status,
-            attempts: attempt,
-            updatedAt: finishedAt,
-            finishedAt,
-            error: {
-              message: err.message,
-              code: timedOut ? "TIMEOUT" : undefined,
-            },
-          });
-
-          await emitEvent(payload.id, {
-            type: "failed",
-            id: payload.id,
-            reason: err.message,
-            ts: finishedAt,
-          });
+        }
+      } finally {
+        const current = activeWorkers.get(workerId);
+        if (current === workerAc) {
+          activeWorkers.delete(workerId);
         }
       }
     })();
@@ -385,8 +496,10 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
     const leaseMs = Math.max(1, cfg.leaseMs ?? definition.defaults?.leaseMs ?? DEFAULT_LEASE_MS);
     const backoff = cfg.backoff ?? definition.defaults?.backoff;
     const delayMs = cfg.at !== undefined ? Math.max(0, cfg.at - now()) : Math.max(0, cfg.delayMs ?? 0);
+    const keyTtlMs = Math.max(1_000, cfg.keyTtlMs ?? DEFAULT_STATE_RETENTION_MS);
 
     let jobId: string;
+    let isNewSubmission = true;
 
     if (cfg.key) {
       const idemKey = `${keys.idempotencyPrefix}:${cfg.key}`;
@@ -395,15 +508,22 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
         "2",
         idemKey,
         keys.seq,
-        String(DEFAULT_STATE_RETENTION_MS),
+        String(keyTtlMs),
       ]);
       const arr = result as [string, number];
       jobId = String(arr[0]);
-      if (Number(arr[1]) === 0) return jobId;
+      isNewSubmission = Number(arr[1]) === 1;
     } else {
       const nextId = await redis.incr(keys.seq);
       jobId = String(nextId);
     }
+
+    const submittedState: InternalState<Result> = {
+      id: jobId,
+      status: "submitted",
+      attempts: 0,
+      updatedAt: now(),
+    };
 
     const payload: WorkPayload = {
       id: jobId,
@@ -414,28 +534,48 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
       meta: cfg.meta,
     };
 
-    await writeState({
-      id: jobId,
-      status: "submitted",
-      attempts: 0,
-      updatedAt: now(),
-    });
+    if (!isNewSubmission) {
+      const existingState = await readState(jobId);
+      if (existingState) return jobId;
+      // Recover from partial failures where idempotency key was written
+      // but state/queue write did not complete.
+      await workQueue.send({
+        data: payload,
+        delayMs,
+        idempotencyKey: cfg.key,
+        idempotencyTtlMs: keyTtlMs,
+        meta: cfg.meta,
+      });
 
-    await workQueue.send({
-      data: payload,
-      delayMs,
-      idempotencyKey: cfg.key,
-      idempotencyTtlMs: DEFAULT_STATE_RETENTION_MS,
-      meta: cfg.meta,
-    });
+      const wrote = await writeStateIfAbsent(submittedState);
+      if (wrote) {
+        await emitEvent(jobId, {
+          type: "submitted",
+          id: jobId,
+          ts: now(),
+        });
+      }
+      return jobId;
+    } else {
+      await workQueue.send({
+        data: payload,
+        delayMs,
+        idempotencyKey: cfg.key,
+        idempotencyTtlMs: keyTtlMs,
+        meta: cfg.meta,
+      });
 
-    await emitEvent(jobId, {
-      type: "submitted",
-      id: jobId,
-      ts: now(),
-    });
+      const wrote = await writeStateIfAbsent(submittedState);
+      if (wrote) {
+        await emitEvent(jobId, {
+          type: "submitted",
+          id: jobId,
+          ts: now(),
+        });
+      }
 
-    return jobId;
+      return jobId;
+    }
   };
 
   const join = async (cfg: { id: JobId } & JoinOptions): Promise<JobTerminal<Result>> => {
@@ -517,7 +657,7 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
 
     const finishedAt = now();
 
-    await writeState({
+    const wrote = await writeCancelledState({
       id: cfg.id,
       status: "cancelled",
       attempts: existing.attempts,
@@ -530,6 +670,7 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
           }
         : undefined,
     });
+    if (!wrote) return;
 
     await emitEvent(cfg.id, {
       type: "cancelled",
@@ -558,6 +699,10 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
   return {
     id: definition.id,
     submit,
+    validateInput: (input: unknown): void => {
+      const parsed = definition.schema.safeParse(input);
+      if (!parsed.success) throw parsed.error;
+    },
     join,
     cancel,
     events,
