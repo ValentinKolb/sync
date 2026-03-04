@@ -40,3 +40,18 @@ export {
   type JobHandle,
   type JobDefinition,
 } from "./src/job";
+export {
+  ephemeral,
+  EphemeralCapacityError,
+  EphemeralPayloadTooLargeError,
+  type EphemeralConfig,
+  type EphemeralUpsertConfig,
+  type EphemeralTouchConfig,
+  type EphemeralRemoveConfig,
+  type EphemeralEntry,
+  type EphemeralSnapshot,
+  type EphemeralRecvConfig,
+  type EphemeralEvent,
+  type EphemeralReader,
+  type EphemeralStore,
+} from "./src/ephemeral";
