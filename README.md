@@ -351,6 +351,11 @@ await sched.register({
   misfire: "skip",         // default: do not replay backlog
   meta: { owner: "ops" },
 });
+
+await sched.triggerNow({
+  id: "cleanup-hourly",
+  key: "ops-manual-run-1", // optional but recommended for retry-safe manual triggers
+});
 ```
 
 ### Scheduler features
@@ -358,9 +363,15 @@ await sched.register({
 - **Idempotent upsert registration**: repeated `register({ id, ... })` creates once, then updates in place.
 - **No fixed leader pod**: leadership uses a renewable Redis lease (`mutex`) with epoch fencing.
 - **Durable dispatch**: each cron slot maps to deterministic job key (`scheduleId:slotTs`) to prevent duplicates.
+- **Durable manual trigger**: `triggerNow({ id, key? })` submits immediately through the same durable job path. Durability begins once `triggerNow()` returns a `jobId`.
 - **Misfire policies**: `skip` (default), `catch_up_one`, `catch_up_all` with cap (`maxCatchUpRuns`).
 - **Failure isolation**: submit retry + backoff, dispatch DLQ, configurable threshold for auto-advance after repeated failures.
 - **Handler safety**: optional `strictHandlers` mode (default `true`) relinquishes leadership when required handlers are missing.
+
+Manual trigger notes:
+- `triggerNow()` does not require `start()` and does not alter cron state (`nextRunAt`, misfire handling, due slots).
+- `triggerNow()` reuses the registered schedule input. If you need custom input per run, call the underlying `job.submit(...)` directly.
+- Pass `key` for retry-safe idempotent manual triggering. Without `key`, repeated calls create additional runs.
 
 ## Ephemeral
 

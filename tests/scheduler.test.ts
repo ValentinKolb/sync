@@ -1091,3 +1091,336 @@ test("chaos: forward clock jump with skip policy does not replay backlog", async
     worker.stop();
   }
 });
+
+test("triggerNow submits immediately without start and forwards stored input/meta", async () => {
+  const schedulerId = uid("sched-trigger-now");
+  const captured: Array<{
+    input: unknown;
+    key?: string;
+    at?: number;
+    meta?: Record<string, unknown>;
+  }> = [];
+
+  const manualJob = {
+    id: uid("sched-trigger-now-job"),
+    validateInput: (_input: unknown): void => {},
+    submit: async (cfg: {
+      key?: string;
+      keyTtlMs?: number;
+      at?: number;
+      delayMs?: number;
+      input: unknown;
+      meta?: Record<string, unknown>;
+    }): Promise<string> => {
+      captured.push({
+        input: cfg.input,
+        key: cfg.key,
+        at: cfg.at,
+        meta: cfg.meta,
+      });
+      return "manual-job-1";
+    },
+  };
+
+  const s = scheduler({ id: schedulerId });
+  try {
+    await s.register({
+      id: "cleanup-now",
+      cron: "0 * * * *",
+      tz: "UTC",
+      job: manualJob,
+      input: { scope: "tmp" },
+      meta: { owner: "ops" },
+    });
+
+    const before = await s.get({ id: "cleanup-now" });
+    const jobId = await s.triggerNow({ id: "cleanup-now", key: "req-1" });
+    const after = await s.get({ id: "cleanup-now" });
+
+    expect(jobId).toBe("manual-job-1");
+    expect(before).not.toBeNull();
+    expect(after).not.toBeNull();
+    expect(after!.nextRunAt).toBe(before!.nextRunAt);
+    expect(captured.length).toBe(1);
+    expect(captured[0].input).toEqual({ scope: "tmp" });
+    expect(captured[0].key).toBe("manual:cleanup-now:req-1");
+    expect(captured[0].at).toBeUndefined();
+    expect(captured[0].meta).toEqual({
+      owner: "ops",
+      scheduleId: "cleanup-now",
+      schedulerId,
+      scheduleTrigger: "manual",
+      scheduleManualKey: "req-1",
+    });
+    expect("scheduleSlotTs" in (captured[0].meta ?? {})).toBe(false);
+    expect(s.metrics().triggerSubmitted).toBe(1);
+  } finally {
+    await s.stop();
+  }
+});
+
+test("triggerNow deduplicates repeated calls with the same key", async () => {
+  const schedulerId = uid("sched-trigger-dedupe");
+  let runs = 0;
+
+  const worker = job({
+    id: uid("sched-trigger-dedupe-job"),
+    schema: z.object({ id: z.string() }),
+    process: async ({ input }) => {
+      runs += 1;
+      return input.id;
+    },
+  });
+
+  const s = scheduler({ id: schedulerId });
+  try {
+    await s.register({
+      id: "dedupe-me",
+      cron: "0 * * * *",
+      tz: "UTC",
+      job: worker,
+      input: { id: "same" },
+    });
+
+    const [first, second] = await Promise.all([
+      s.triggerNow({ id: "dedupe-me", key: "req-42" }),
+      s.triggerNow({ id: "dedupe-me", key: "req-42" }),
+    ]);
+
+    expect(first).toBe(second);
+    const terminal = await worker.join({ id: first, timeoutMs: 5_000 });
+    expect(terminal.status).toBe("completed");
+    expect(runs).toBe(1);
+    expect(s.metrics().triggerSubmitted).toBe(2);
+  } finally {
+    await s.stop();
+    worker.stop();
+  }
+});
+
+test("triggerNow keeps job completion alive after scheduler stop", async () => {
+  const schedulerId = uid("sched-trigger-stop");
+
+  const worker = job({
+    id: uid("sched-trigger-stop-job"),
+    schema: z.object({ v: z.number() }),
+    process: async ({ input }) => {
+      await Bun.sleep(50);
+      return input.v * 2;
+    },
+  });
+
+  const s = scheduler({ id: schedulerId });
+  try {
+    await s.register({
+      id: "stop-safe",
+      cron: "0 * * * *",
+      tz: "UTC",
+      job: worker,
+      input: { v: 21 },
+    });
+
+    const jobId = await s.triggerNow({ id: "stop-safe" });
+    await s.stop();
+    const terminal = await worker.join({ id: jobId, timeoutMs: 5_000 });
+
+    expect(terminal.status).toBe("completed");
+    expect(terminal.result).toBe(42);
+  } finally {
+    await s.stop();
+    worker.stop();
+  }
+});
+
+test("triggerNow rejects when the local scheduler instance lacks the handler", async () => {
+  const schedulerId = uid("sched-trigger-missing-handler");
+  const metrics: string[] = [];
+
+  const worker = job({
+    id: uid("sched-trigger-missing-handler-job"),
+    schema: z.object({ id: z.string() }),
+    process: async () => "ok",
+  });
+
+  const owner = scheduler({ id: schedulerId });
+  const other = scheduler({
+    id: schedulerId,
+    onMetric: (metric) => {
+      if (metric.type === "trigger_rejected") metrics.push(metric.reason);
+    },
+  });
+
+  try {
+    await owner.register({
+      id: "shared",
+      cron: "0 * * * *",
+      tz: "UTC",
+      job: worker,
+      input: { id: "x" },
+    });
+
+    await expect(other.triggerNow({ id: "shared" })).rejects.toThrow("missing local handler");
+    expect(other.metrics().triggerRejected).toBe(1);
+    expect(metrics).toEqual(["missing_handler"]);
+  } finally {
+    await owner.stop();
+    await other.stop();
+    worker.stop();
+  }
+});
+
+test("triggerNow rejects corrupt stored schedules", async () => {
+  const schedulerId = uid("sched-trigger-invalid");
+  const s = scheduler({ id: schedulerId });
+  try {
+    await redis.send("SET", [`sync:scheduler:${schedulerId}:schedule:broken`, "{oops"]);
+
+    await expect(s.triggerNow({ id: "broken" })).rejects.toThrow("invalid schedule broken");
+    expect(s.metrics().triggerRejected).toBe(1);
+  } finally {
+    await s.stop();
+  }
+});
+
+test("triggerNow retries submit failures and reports final failure metrics", async () => {
+  const schedulerId = uid("sched-trigger-retry");
+  let attempts = 0;
+
+  const flakyJob = {
+    id: uid("sched-trigger-retry-job"),
+    validateInput: (_input: unknown): void => {},
+    submit: async (_cfg: {
+      key?: string;
+      keyTtlMs?: number;
+      at?: number;
+      delayMs?: number;
+      input: unknown;
+      meta?: Record<string, unknown>;
+    }): Promise<string> => {
+      attempts += 1;
+      throw new Error("always-fail");
+    },
+  };
+
+  const s = scheduler({
+    id: schedulerId,
+    dispatch: {
+      submitRetries: 2,
+      submitBackoffBaseMs: 10,
+      submitBackoffMaxMs: 20,
+    },
+  });
+
+  try {
+    await s.register({
+      id: "retry-me-now",
+      cron: "0 * * * *",
+      tz: "UTC",
+      job: flakyJob,
+      input: { ok: true },
+    });
+
+    await expect(s.triggerNow({ id: "retry-me-now" })).rejects.toThrow("always-fail");
+    expect(attempts).toBe(3);
+    expect(s.metrics().triggerFailed).toBe(1);
+    expect(s.metrics().triggerSubmitted).toBe(0);
+  } finally {
+    await s.stop();
+  }
+});
+
+test("triggerNow does not retry zod-like failures", async () => {
+  const schedulerId = uid("sched-trigger-zod");
+  let attempts = 0;
+
+  const brokenJob = {
+    id: uid("sched-trigger-zod-job"),
+    validateInput: (_input: unknown): void => {},
+    submit: async (_cfg: {
+      key?: string;
+      keyTtlMs?: number;
+      at?: number;
+      delayMs?: number;
+      input: unknown;
+      meta?: Record<string, unknown>;
+    }): Promise<string> => {
+      attempts += 1;
+      const err = new Error("bad input");
+      err.name = "ZodError";
+      throw err;
+    },
+  };
+
+  const s = scheduler({
+    id: schedulerId,
+    dispatch: {
+      submitRetries: 5,
+      submitBackoffBaseMs: 10,
+      submitBackoffMaxMs: 20,
+    },
+  });
+
+  try {
+    await s.register({
+      id: "bad-input-now",
+      cron: "0 * * * *",
+      tz: "UTC",
+      job: brokenJob,
+      input: { ok: true },
+    });
+
+    await expect(s.triggerNow({ id: "bad-input-now" })).rejects.toThrow("bad input");
+    expect(attempts).toBe(1);
+    expect(s.metrics().triggerFailed).toBe(1);
+  } finally {
+    await s.stop();
+  }
+});
+
+test("triggerNow may still submit successfully when unregister races after schedule read", async () => {
+  const schedulerId = uid("sched-trigger-unregister-race");
+  let releaseSubmit: (() => void) | null = null;
+  let submitEntered = false;
+
+  const gate = new Promise<void>((resolve) => {
+    releaseSubmit = resolve;
+  });
+
+  const jobHandle = {
+    id: uid("sched-trigger-unregister-race-job"),
+    validateInput: (_input: unknown): void => {},
+    submit: async (_cfg: {
+      key?: string;
+      keyTtlMs?: number;
+      at?: number;
+      delayMs?: number;
+      input: unknown;
+      meta?: Record<string, unknown>;
+    }): Promise<string> => {
+      submitEntered = true;
+      await gate;
+      return "race-job-1";
+    },
+  };
+
+  const s = scheduler({ id: schedulerId });
+  try {
+    await s.register({
+      id: "race",
+      cron: "0 * * * *",
+      tz: "UTC",
+      job: jobHandle,
+      input: { ok: true },
+    });
+
+    const pending = s.triggerNow({ id: "race" });
+    await waitUntil(() => submitEntered, 2_000);
+    await s.unregister({ id: "race" });
+    releaseSubmit?.();
+
+    await expect(pending).resolves.toBe("race-job-1");
+    expect(await s.get({ id: "race" })).toBeNull();
+  } finally {
+    await s.stop();
+  }
+});

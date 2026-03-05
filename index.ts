@@ -46,6 +46,7 @@ export {
   type SchedulerConfig,
   type SchedulerRegisterConfig,
   type SchedulerUnregisterConfig,
+  type SchedulerTriggerNowConfig,
   type SchedulerGetConfig,
   type SchedulerInfo,
   type SchedulerMetric,

@@ -62,6 +62,11 @@ type SchedulerRegisterConfig = {
   meta?: Record<string, unknown>;
 };
 
+type SchedulerTriggerNowConfig = {
+  id: string;
+  key?: string;
+};
+
 type SchedulerInfo = {
   id: string;
   cron: string;
@@ -83,6 +88,9 @@ type SchedulerMetricsSnapshot = {
   dispatchRetried: number;
   dispatchSkipped: number;
   dispatchDlq: number;
+  triggerSubmitted: number;
+  triggerFailed: number;
+  triggerRejected: number;
   tickErrors: number;
   lastTickAt: number | null;
 };
@@ -93,6 +101,7 @@ type Scheduler = {
   stop(): Promise<void>;
   register(cfg: SchedulerRegisterConfig): Promise<{ created: boolean; updated: boolean }>;
   unregister(cfg: { id: string }): Promise<void>;
+  triggerNow(cfg: SchedulerTriggerNowConfig): Promise<string>;
   get(cfg: { id: string }): Promise<SchedulerInfo | null>;
   list(): Promise<SchedulerInfo[]>;
   metrics(): SchedulerMetricsSnapshot;
@@ -112,6 +121,9 @@ type Scheduler = {
 - `dispatch_failed`
 - `dispatch_dlq`
 - `dispatch_advanced_after_failures`
+- `trigger_submitted`
+- `trigger_failed`
+- `trigger_rejected` (`reason: "missing_schedule" | "missing_handler" | "invalid_schedule"`)
 
 ## Config Options and Defaults
 
@@ -166,7 +178,21 @@ await sched.register({
   input: { scope: "temp" },
   misfire: "skip",
 });
+
+await sched.triggerNow({
+  id: "cleanup-hourly",
+  key: "ops-manual-run-1",
+});
 ```
+
+## `triggerNow()` Notes
+
+- `triggerNow()` submits immediately on the calling instance through the same durable `job.submit(...)` path.
+- Durability begins once `triggerNow()` resolves with a `jobId`.
+- `triggerNow()` does not require `start()`.
+- `triggerNow()` does not alter `nextRunAt` or cron dispatch state.
+- `key` is optional but recommended for retry-safe manual triggering.
+- Manual triggers reuse the stored schedule input. Use direct `job.submit(...)` if you need custom input per run.
 
 ## Internals Summary
 

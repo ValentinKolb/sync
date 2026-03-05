@@ -26,8 +26,9 @@ Scheduler dispatches by calling `job.submit()` with deterministic key `${schedul
 3. Call `start()` on each pod.
 4. On startup, call `register()` for each schedule (idempotent upsert).
 5. Keep callback logic in job handler, not in scheduler.
-6. Observe `onMetric` and `metrics()` for health.
-7. Call `stop()` during shutdown.
+6. Use `triggerNow({ id, key? })` for durable manual runs of an existing schedule.
+7. Observe `onMetric` and `metrics()` for health.
+8. Call `stop()` during shutdown.
 
 ## Behavioral Guarantees
 
@@ -35,12 +36,14 @@ Scheduler dispatches by calling `job.submit()` with deterministic key `${schedul
 - Leader fencing via epoch CAS prevents stale leaders from rescheduling.
 - Registration is idempotent by schedule id (`created` vs `updated`).
 - Dispatch is durable through job system with deterministic submit keys.
+- `triggerNow()` is durable after it returns a `jobId`; it reuses the registered schedule input and submits locally through the same job path.
 - Missing handler policy can fail-safe (`strictHandlers: true` default).
 
 ## Non-Guarantees
 
 - Do not run every missed slot by default (`misfire` default is `skip`).
 - Do not execute exactly once end-to-end (job system remains at-least-once).
+- Do not override schedule input via `triggerNow()`; use direct `job.submit(...)` if per-run input differs.
 - Do not emit metrics reliably if user callback throws (metric hook is best effort).
 
 ## API Reference

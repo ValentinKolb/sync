@@ -235,7 +235,15 @@ export type SchedulerMetric =
   | { type: "dispatch_skipped"; ts: number; scheduleId: string; reason: "missing_handler" | "cas_stale" }
   | { type: "dispatch_failed"; ts: number; scheduleId: string; message: string }
   | { type: "dispatch_dlq"; ts: number; scheduleId: string; slotTs: number; message: string }
-  | { type: "dispatch_advanced_after_failures"; ts: number; scheduleId: string; slotTs: number; failures: number };
+  | { type: "dispatch_advanced_after_failures"; ts: number; scheduleId: string; slotTs: number; failures: number }
+  | { type: "trigger_submitted"; ts: number; scheduleId: string; jobId: string }
+  | {
+      type: "trigger_rejected";
+      ts: number;
+      scheduleId: string;
+      reason: "missing_schedule" | "missing_handler" | "invalid_schedule";
+    }
+  | { type: "trigger_failed"; ts: number; scheduleId: string; message: string };
 
 export type SchedulerConfig = {
   id: string;
@@ -274,6 +282,11 @@ export type SchedulerUnregisterConfig = {
   id: string;
 };
 
+export type SchedulerTriggerNowConfig = {
+  id: string;
+  key?: string;
+};
+
 export type SchedulerGetConfig = {
   id: string;
 };
@@ -299,6 +312,9 @@ export type SchedulerMetricsSnapshot = {
   dispatchRetried: number;
   dispatchSkipped: number;
   dispatchDlq: number;
+  triggerSubmitted: number;
+  triggerFailed: number;
+  triggerRejected: number;
   tickErrors: number;
   lastTickAt: number | null;
 };
@@ -309,6 +325,7 @@ export type Scheduler = {
   stop(): Promise<void>;
   register(cfg: SchedulerRegisterConfig): Promise<{ created: boolean; updated: boolean }>;
   unregister(cfg: SchedulerUnregisterConfig): Promise<void>;
+  triggerNow(cfg: SchedulerTriggerNowConfig): Promise<string>;
   get(cfg: SchedulerGetConfig): Promise<SchedulerInfo | null>;
   list(): Promise<SchedulerInfo[]>;
   metrics(): SchedulerMetricsSnapshot;
@@ -419,6 +436,9 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     dispatchRetried: 0,
     dispatchSkipped: 0,
     dispatchDlq: 0,
+    triggerSubmitted: 0,
+    triggerFailed: 0,
+    triggerRejected: 0,
     tickErrors: 0,
     lastTickAt: null,
   };
@@ -560,27 +580,26 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     });
   };
 
-  const submitWithRetry = async (cfg: {
+  const submitScheduledJob = async (cfg: {
     jobHandle: JobSubmitter;
     schedule: StoredSchedule;
-    slotTs: number;
-  }): Promise<void> => {
-    await retry(
+    key?: string;
+    at?: number;
+    meta?: Record<string, unknown>;
+    requireLeadership: boolean;
+    onRetry?: () => void;
+  }): Promise<string> => {
+    return await retry(
       async () => {
-        if (!(await ensureLeadership({ forceRefresh: true }))) {
+        if (cfg.requireLeadership && !(await ensureLeadership({ forceRefresh: true }))) {
           throw new Error("leadership lost during dispatch");
         }
         return await cfg.jobHandle.submit({
           input: cfg.schedule.input,
-          key: `${cfg.schedule.id}:${cfg.slotTs}`,
+          key: cfg.key,
           keyTtlMs: scheduledJobKeyTtlMs,
-          at: cfg.slotTs,
-          meta: {
-            ...(cfg.schedule.meta ?? {}),
-            scheduleId: cfg.schedule.id,
-            scheduleSlotTs: cfg.slotTs,
-            schedulerId: config.id,
-          },
+          ...(cfg.at !== undefined ? { at: cfg.at } : {}),
+          meta: cfg.meta,
         });
       },
       {
@@ -592,8 +611,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         retryIf: (error): boolean => {
           const err = asError(error);
           if (err.name === "ZodError") return false;
-          if (err.message === "leadership lost during dispatch") return false;
-          metricsState.dispatchRetried += 1;
+          if (cfg.requireLeadership && err.message === "leadership lost during dispatch") return false;
+          cfg.onRetry?.();
           return true;
         },
       },
@@ -696,10 +715,21 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
           break;
         }
         try {
-          await submitWithRetry({
+          const jobId = await submitScheduledJob({
             jobHandle: jobHandle!,
             schedule,
-            slotTs,
+            key: `${schedule.id}:${slotTs}`,
+            at: slotTs,
+            meta: {
+              ...(schedule.meta ?? {}),
+              scheduleId: schedule.id,
+              scheduleSlotTs: slotTs,
+              schedulerId: config.id,
+            },
+            requireLeadership: true,
+            onRetry: (): void => {
+              metricsState.dispatchRetried += 1;
+            },
           });
           metricsState.dispatchSubmitted += 1;
           submitsRemaining -= 1;
@@ -710,7 +740,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
             ts: Date.now(),
             scheduleId: schedule.id,
             slotTs,
-            jobId: schedule.jobId,
+            jobId,
           });
         } catch (error) {
           submitFailed = true;
@@ -897,6 +927,78 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     }
   };
 
+  const triggerNow = async (cfg: SchedulerTriggerNowConfig): Promise<string> => {
+    const raw = await redis.get(scheduleKey(cfg.id));
+    if (!raw) {
+      metricsState.triggerRejected += 1;
+      safeMetric(config.onMetric, {
+        type: "trigger_rejected",
+        ts: Date.now(),
+        scheduleId: cfg.id,
+        reason: "missing_schedule",
+      });
+      throw new Error(`scheduler trigger rejected: missing schedule ${cfg.id}`);
+    }
+
+    const schedule = parseSchedule(raw);
+    if (!schedule) {
+      metricsState.triggerRejected += 1;
+      safeMetric(config.onMetric, {
+        type: "trigger_rejected",
+        ts: Date.now(),
+        scheduleId: cfg.id,
+        reason: "invalid_schedule",
+      });
+      throw new Error(`scheduler trigger rejected: invalid schedule ${cfg.id}`);
+    }
+
+    const jobHandle = jobsById.get(schedule.jobId);
+    if (!jobHandle) {
+      metricsState.triggerRejected += 1;
+      safeMetric(config.onMetric, {
+        type: "trigger_rejected",
+        ts: Date.now(),
+        scheduleId: schedule.id,
+        reason: "missing_handler",
+      });
+      throw new Error(`scheduler trigger rejected: missing local handler for schedule ${schedule.id}`);
+    }
+
+    try {
+      const jobId = await submitScheduledJob({
+        jobHandle,
+        schedule,
+        key: cfg.key ? `manual:${schedule.id}:${cfg.key}` : undefined,
+        meta: {
+          ...(schedule.meta ?? {}),
+          scheduleId: schedule.id,
+          schedulerId: config.id,
+          scheduleTrigger: "manual",
+          ...(cfg.key ? { scheduleManualKey: cfg.key } : {}),
+        },
+        requireLeadership: false,
+      });
+      metricsState.triggerSubmitted += 1;
+      safeMetric(config.onMetric, {
+        type: "trigger_submitted",
+        ts: Date.now(),
+        scheduleId: schedule.id,
+        jobId,
+      });
+      return jobId;
+    } catch (error) {
+      metricsState.triggerFailed += 1;
+      const err = asError(error);
+      safeMetric(config.onMetric, {
+        type: "trigger_failed",
+        ts: Date.now(),
+        scheduleId: schedule.id,
+        message: err.message,
+      });
+      throw err;
+    }
+  };
+
   const get = async (cfg: SchedulerGetConfig): Promise<SchedulerInfo | null> => {
     const raw = await redis.get(scheduleKey(cfg.id));
     const parsed = parseSchedule(raw);
@@ -952,6 +1054,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     stop,
     register,
     unregister,
+    triggerNow,
     get,
     list,
     metrics,
