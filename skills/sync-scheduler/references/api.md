@@ -185,6 +185,18 @@ await sched.triggerNow({
 });
 ```
 
+## `unregister()` Notes
+
+- `unregister({ id })` removes the schedule from the due zset and index set atomically.
+- Already-dispatched jobs are NOT cancelled — only future dispatch is stopped.
+- Idempotent: unregistering a non-existent schedule is a no-op.
+
+## `get()` and `list()` Notes
+
+- `get({ id })` returns `SchedulerInfo | null` for a single schedule.
+- `list()` returns all registered schedules as `SchedulerInfo[]`.
+- Both are useful for admin/health dashboards.
+
 ## `triggerNow()` Notes
 
 - `triggerNow()` submits immediately on the calling instance through the same durable `job.submit(...)` path.

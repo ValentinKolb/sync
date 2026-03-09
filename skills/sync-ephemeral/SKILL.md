@@ -1,34 +1,36 @@
 ---
 name: sync-ephemeral
-description: "Use this skill when implementing short-lived typed state with @valentinkolb/sync ephemeral: TTL-based upsert/touch/remove, snapshot-plus-cursor reconciliation, stream consumers for upsert/touch/delete/expire events, and capacity/payload safety limits."
+description: "Use this skill when implementing short-lived typed state with @valentinkolb/sync ephemeral: TTL-based key/value with upsert/touch/remove, snapshot-plus-cursor reconciliation for cache hydration, streaming upsert/touch/delete/expire events, capacity/payload limits, and presence-style use cases where entries should naturally expire."
 ---
 
 # Sync Ephemeral
 
-Use this skill for TTL-scoped key/value state that should naturally expire.
+TTL-scoped typed key/value store where all entries must have a time-to-live. Ideal for presence, sessions, and temporary state.
 
-## Workflow
+## Typical Pattern: Snapshot + Stream
 
-1. Define strict value schema.
-2. Instantiate `ephemeral()` with default TTL.
-3. Use `upsert()` for create/update, `touch()` for lease extension, `remove()` for explicit delete.
-4. Use `snapshot()` to load current state and cursor.
-5. Use `reader({ after: snapshot.cursor })` for incremental updates.
-6. Handle `overflow` events by re-snapshotting.
+```
+snapshot() → hydrate local state → reader({ after: cursor }).stream() → apply incremental events
+```
 
-## Behavioral Guarantees
+On `overflow` event (cursor fell behind retention window), re-snapshot and restart the stream.
 
-- Write operations are atomic Lua scripts.
-- Each mutation emits stream event (`upsert`, `touch`, `delete`, `expire`).
-- Expiration reconciliation removes stale entries and emits `expire`.
-- Snapshot runs full reconcile before returning entries.
-- Payloads are validated by schema and size-limited.
+## Decision Guide
 
-## Non-Guarantees
+- **Create/update entry**: `upsert({ key, value })` — resets TTL.
+- **Extend TTL without changing value**: `touch({ key })` — returns `{ ok: false }` if key missing.
+- **Explicit removal**: `remove({ key, reason? })` — emits `delete` event.
+- **Multi-tenant**: pass `tenantId` on factory or per-operation override.
 
-- Do not provide durable historical event logs beyond retention window.
-- Do not preserve data after TTL expiration by design.
-- Do not guarantee replay if consumer cursor falls behind retention window (overflow signal instead).
+## Gotchas
+
+- Every entry MUST have a TTL (`ttlMs` on factory is required, > 0). This is not optional storage.
+- `maxEntries` default is 10,000. `upsert()` throws `EphemeralCapacityError` when full.
+- `maxPayloadBytes` default is 4,096. `upsert()` throws `EphemeralPayloadTooLargeError` on oversized JSON.
+- Logical key must be non-empty and <= 512 bytes.
+- `snapshot()` runs internal reconciliation (expiry cleanup) before returning — may be slow on first call with many stale entries.
+- `stream({ wait: true })` auto-retries transient transport errors internally. Do not wrap with `retry()`.
+- Event stream retention default is 5 minutes (`eventRetentionMs`). Slow consumers will get `overflow`.
 
 ## API Reference
 

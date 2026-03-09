@@ -1,34 +1,32 @@
 ---
 name: sync-topic
-description: "Use this skill when implementing event streams with @valentinkolb/sync topic: publishing typed events, consumer-group processing with commit, live replay, retention tuning, idempotent publish, and multi-tenant stream isolation."
+description: "Use this skill when implementing event streams with @valentinkolb/sync topic: publishing typed events with idempotency, consumer-group processing with commit for at-least-once delivery, live replay from any cursor, retention tuning, and multi-tenant stream isolation. Also use when choosing between topic (pub/sub events) vs queue (work distribution)."
 ---
 
 # Sync Topic
 
-Use this skill for typed pub/sub and event-stream workflows with `topic()`.
+Typed event streams backed by Redis Streams. Two consumption modes: **reader** (consumer groups, at-least-once, commit-based) and **live** (stateless fan-out/replay).
 
-## Workflow
+## Decision Guide: reader() vs live()
 
-1. Define a strict event schema.
-2. Instantiate topic with retention and payload limits.
-3. Publish with optional idempotency and metadata.
-4. Consume via `reader(group)` for at-least-once processing.
-5. Call `commit()` after durable downstream handling.
-6. Use `live({ after })` for replay or fan-out listeners.
+- **reader(group)**: durable, at-least-once. Each group tracks its own cursor. Call `commit()` after processing. Use for event-driven workers (mailer, projections, analytics).
+- **live({ after })**: stateless fan-out. No group state, no commit. Use for real-time dashboards, debugging, or replay from `"0-0"`.
 
-## Behavioral Guarantees
+## Decision Guide: topic vs queue
 
-- Publish atomically (`XADD + optional idempotency SET + XTRIM`) via Lua.
-- Consumer groups provide at-least-once semantics.
-- Group creation is idempotent and auto-managed.
-- Live consumers can replay from any stream cursor.
-- Payloads are schema-validated on publish and on read path.
+- **topic**: events are broadcast to all consumer groups independently. No ack/nack per message — use `commit()`. Best for fan-out, event sourcing, audit.
+- **queue**: work items are distributed to exactly one consumer. Use `ack()`/`nack()` per message. Best for task distribution, job pipelines. See `sync-queue` skill.
 
-## Non-Guarantees
+## Gotchas
 
-- Do not provide exactly-once delivery.
-- Do not auto-recover pending entries of dead consumers (no explicit XAUTOCLAIM flow).
-- Do not guarantee strict total ordering across independent consumer groups.
+- `commit()` is per-delivery, not per-batch. Always commit after processing each event.
+- Invalid payloads on the read path are auto-acknowledged and skipped (logged, not thrown).
+- `reader().stream({ wait: true })` auto-retries transient errors. Do not wrap with `retry()`.
+- `live()` also auto-retries while preserving cursor progression.
+- `retentionMs` defaults to 7 days. Events older than this are trimmed.
+- `idempotencyKey` deduplication uses a separate SET key with configurable TTL (default 7 days).
+- Payload max is 128KB by default (`limits.payloadBytes`).
+- No XAUTOCLAIM: dead consumers' pending entries are NOT auto-recovered. Design consumers to be restartable.
 
 ## API Reference
 

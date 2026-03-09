@@ -100,15 +100,32 @@ type JobHandle<Input, Result = unknown> = {
 - Existing idempotent key returns same job id.
 - If key existed but state missing, implementation recovers by re-enqueue + write missing state.
 
+## ctx.step() Semantics
+
+- `ctx.step({ id, run })` executes `run()` and returns its result.
+- Step IDs should be unique within a handler invocation.
+- Steps are NOT automatically idempotent across retries — the handler re-runs from the beginning on each attempt. Use step IDs for logging/tracing, not for resume-from-checkpoint.
+
+## ctx.heartbeat() Semantics
+
+- Extends the underlying queue message lease (prevents re-delivery during long work).
+- Emits a `heartbeat` event on the job's event stream.
+- Optional `leaseMs` parameter overrides the default lease extension.
+- Call periodically in long-running handlers (e.g. every 10-20s for a 30s lease).
+
 ## Execution Semantics
 
 - Worker reads from internal queue (`sync:job:queue:...`).
 - Worker receive loop auto-retries transient transport errors and keeps running after short Redis outages.
 - Before process, state moves to `running` and `started` event emitted.
-- `ctx.heartbeat()` extends queue lease and emits heartbeat event.
 - On handler error/timeout and attempts left: message nacked with computed delay and `retry` event emitted.
 - On terminal failure: state set to `failed` or `timed_out`.
 - On cancellation race: final writes are CAS-guarded and cancelled wins.
+
+## stop()
+
+- `stop()` signals the worker loop to shut down gracefully.
+- Call during process shutdown to prevent orphaned workers.
 
 ## join/cancel
 
