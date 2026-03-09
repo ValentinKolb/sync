@@ -73,3 +73,21 @@ export {
   DEFAULT_RETRY_OPTIONS,
   type RetryOptions,
 } from "./src/retry";
+export {
+  registry,
+  RegistryCapacityError,
+  RegistryPayloadTooLargeError,
+  type Registry,
+  type RegistryConfig,
+  type RegistryUpsertConfig,
+  type RegistryTouchConfig,
+  type RegistryRemoveConfig,
+  type RegistryGetConfig,
+  type RegistryListConfig,
+  type RegistryCasConfig,
+  type RegistryEntry,
+  type RegistrySnapshot,
+  type RegistryRecvConfig,
+  type RegistryEvent,
+  type RegistryReader,
+} from "./src/registry";

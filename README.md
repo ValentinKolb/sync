@@ -6,10 +6,10 @@ Distributed synchronization primitives for Bun and TypeScript, backed by Redis.
 
 - **Bun-native** - Built for [Bun](https://bun.sh). Uses `Bun.redis`, `Bun.sleep`, `RedisClient` directly. No Node.js compatibility layers.
 - **Minimal dependencies** - Only `zod` as a peer dependency. Everything else is Bun built-ins and Redis Lua scripts.
-- **Composable building blocks** - Seven focused primitives that work independently or together. `job` composes `queue` + `topic` internally, `scheduler` composes durable dispatch on top of `job`.
+- **Composable building blocks** - Nine focused primitives that work independently or together. `job` composes `queue` + `topic` internally, `scheduler` composes durable dispatch on top of `job`.
 - **Consistent API** - Every module follows the same pattern: `moduleName({ id, ...config })` returns an instance. No classes, no `.create()`, no `new`.
 - **Atomic by default** - All Redis operations use Lua scripts for atomicity. No multi-step race conditions at the Redis level.
-- **Schema-validated** - Queue, topic, job, and ephemeral payloads are validated with Zod at the boundary. Invalid data never enters Redis.
+- **Schema-validated** - Queue, topic, job, registry, and ephemeral payloads are validated with Zod at the boundary. Invalid data never enters Redis.
 
 ## Features
 
@@ -19,10 +19,11 @@ Distributed synchronization primitives for Bun and TypeScript, backed by Redis.
 - **Topic** - Pub/sub with consumer groups, at-least-once delivery, and live streaming
 - **Job** - Durable job processing built on queue + topic with retries, cancellation, and event sourcing
 - **Scheduler** - Distributed cron scheduler with idempotent registration, leader fencing, and durable dispatch via job submission
+- **Registry** - Generic typed service/config registry with native prefix queries, CAS, TTL-backed liveness, and push-based change streams
 - **Ephemeral** - TTL-based ephemeral key/value store with typed snapshots and event stream for upsert/touch/delete/expire
 - **Retry utility** - Small transport-aware retry helper with sensible defaults and per-call override
 
-For complete API details, use the modular skills in [`skills/`](./skills), especially each feature's `references/api.md`.
+For complete API details, use the modular skills in [`skills/`](./skills), especially each feature's `references/api.md` such as `sync-registry`, `sync-scheduler`, `sync-job`, and `sync-topic`.
 
 ## Installation
 
@@ -67,7 +68,7 @@ const value2 = await retry(
 ```
 
 Internal default behavior:
-- Queue/topic/ephemeral `stream({ wait: true })` and topic `live()` use transport retries to stay alive across brief outages.
+- Queue/topic/registry/ephemeral `stream({ wait: true })` and topic `live()` use transport retries to stay alive across brief outages.
 - One-shot calls (`recv()`, `stream({ wait: false })`, `send()/pub()/submit()`) keep explicit failure semantics unless you wrap them with `retry(...)`.
 
 Requires [Bun](https://bun.sh) and a Redis-compatible server (Redis 6.2+, Valkey, Dragonfly).
@@ -86,6 +87,7 @@ bunx skills add https://github.com/valentinkolb/sync --skill '*'
 
 # install selected skills (example)
 bunx skills add https://github.com/valentinkolb/sync \
+  --skill sync-registry \
   --skill sync-scheduler \
   --skill sync-job \
   --skill sync-retry
@@ -373,6 +375,56 @@ Manual trigger notes:
 - `triggerNow()` reuses the registered schedule input. If you need custom input per run, call the underlying `job.submit(...)` directly.
 - Pass `key` for retry-safe idempotent manual triggering. Without `key`, repeated calls create additional runs.
 
+## Registry
+
+Typed service/config registry with exact-key reads, native prefix listing, compare-and-swap, optional TTL-backed liveness, and stream-based change notifications.
+
+```ts
+import { z } from "zod";
+import { registry } from "@valentinkolb/sync";
+
+const services = registry({
+  id: "services",
+  schema: z.object({
+    appId: z.string(),
+    kind: z.enum(["instance", "setting", "flag"]),
+    url: z.string().url().optional(),
+  }),
+});
+
+await services.upsert({
+  key: "apps/contacts/instances/i-1",
+  value: { appId: "contacts", kind: "instance", url: "https://contacts-1.internal" },
+  ttlMs: 15_000,
+});
+
+await services.touch({ key: "apps/contacts/instances/i-1" });
+
+const active = await services.list({
+  prefix: "apps/contacts/instances/",
+  status: "active",
+});
+
+const snap = await services.list({ prefix: "apps/" });
+const ac = new AbortController();
+
+for await (const ev of services.reader({ prefix: "apps/", after: snap.cursor }).stream({ signal: ac.signal })) {
+  console.log(ev.type);
+}
+```
+
+### Registry features
+
+- **Native prefix listing**: `list({ prefix })` uses Redis-side lex indexing instead of client-side filtering.
+- **Typed payloads**: values are validated with Zod on write and parsed on read.
+- **CAS updates**: `cas({ key, version, value })` is atomic in Redis.
+- **Optional liveness**: records with `ttlMs` are live and refreshed via `touch()`.
+- **Expired-state visibility**: recently expired entries can be queried via `status: "expired"`.
+- **Snapshot + cursor**: `list()` returns a cursor for replay-safe handoff into `reader()`.
+- **Scoped streams**: watch a single key, a namespace prefix, or the whole registry.
+- **Namespace-safe prefixes**: `list({ prefix })` and `reader({ prefix })` expect slash-suffixed namespace prefixes such as `apps/contacts/`.
+- **Bounded growth**: configurable `maxEntries`, payload-size limits, root-stream retention, per-stream max length, and tombstone retention.
+
 ## Ephemeral
 
 Typed ephemeral key/value store with TTL semantics and stream events. Useful for short-lived state like presence, worker heartbeats, or temporary coordination hints.
@@ -450,6 +502,7 @@ src/
   topic.ts           # Pub/sub with consumer groups
   job.ts             # Job processing (composes queue + topic)
   scheduler.ts       # Distributed cron scheduler (durable dispatch via job)
+  registry.ts        # Typed registry with prefix queries, CAS, and liveness
   ephemeral.ts       # TTL-based ephemeral store with event stream
   retry.ts           # Generic transport-aware retry utility
   internal/
@@ -461,7 +514,7 @@ tests/
   *-utils.unit.test.ts  # Pure unit tests
   preload.ts         # Sets REDIS_URL for test environment
 index.ts             # Public API exports
-skills/              # Modular agent skills + per-feature API references
+skills/              # Modular agent skills + per-feature API references (including sync-registry)
 ```
 
 ### Guidelines
