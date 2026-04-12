@@ -1,11 +1,11 @@
 ---
 name: sync-ratelimit
-description: "Use this skill when working with @valentinkolb/sync rate limiting in Bun/TypeScript: creating per-identifier sliding-window limiters, choosing check() vs checkOrThrow(), handling RateLimitError with resetIn/Retry-After headers, tuning window size, and reasoning about Redis key layout."
+description: "Use this skill when working with @valentinkolb/sync rate limiting in Bun/TypeScript: creating per-identifier sliding-window limiters, choosing check() vs checkOrThrow(), handling RateLimitError with resetIn/Retry-After headers, tuning window size, and reasoning about Redis key layout. Also works in the browser via `@valentinkolb/sync/browser` with an in-memory store — same API, no Redis needed."
 ---
 
 # Sync RateLimit
 
-Atomic sliding-window rate limiter backed by Redis Lua. One limiter instance per logical limit — reuse across requests.
+Atomic sliding-window rate limiter. Server version uses Redis Lua, browser version uses an in-memory store. One limiter instance per logical limit — reuse across requests.
 
 ## Decision Guide
 
@@ -21,6 +21,17 @@ Atomic sliding-window rate limiter backed by Redis Lua. One limiter instance per
 - One Lua script per `check()` call — no batching across identifiers.
 - No automatic request queuing or delay — rate-limited callers must handle backoff themselves.
 - Redis key pattern: `{prefix}:{id}:{identifier}:{windowNumber}`, keys expire after `windowSecs * 2`.
+
+## Browser
+
+```ts
+import { ratelimit, RateLimitError } from "@valentinkolb/sync/browser";
+```
+
+Same API. The `store` config option lets you inject a custom store (default: `MemoryStore`). Browser-specific notes:
+- Identifiers > 128 chars use a simple djb2 hash instead of SHA-256.
+- State lives in JS heap and is lost on page refresh.
+- No Redis keys — counters are held in the in-memory store with `setTimeout`-based TTL.
 
 ## API Reference
 

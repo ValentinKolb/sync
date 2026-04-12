@@ -1,5 +1,21 @@
 # API
 
+## Browser
+
+```ts
+import { topic } from "@valentinkolb/sync/browser";
+
+const t = topic({
+  id: "events",
+  schema: z.object({ type: z.string(), data: z.unknown() }),
+  // store: new MemoryStore(), // for idempotency keys
+});
+```
+
+Same types and API. Additional config: `store?: Store` (for idempotency key storage). Events use an in-memory log instead of Redis Streams. No blocking Redis clients — uses Promise-based event emitter internally.
+
+---
+
 ## Factory
 
 ```ts

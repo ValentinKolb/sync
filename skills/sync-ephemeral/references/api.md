@@ -1,5 +1,22 @@
 # API
 
+## Browser
+
+```ts
+import { ephemeral, EphemeralCapacityError, EphemeralPayloadTooLargeError } from "@valentinkolb/sync/browser";
+
+const store = ephemeral({
+  id: "presence",
+  schema: z.object({ status: z.enum(["online", "away"]) }),
+  ttlMs: 30_000,
+  // All server options work: tenantId, limits
+});
+```
+
+Same types and API. Entries and events are held in-memory. TTL expiration uses `setTimeout` (no Redis sentinel keys or reconciliation). The `overflow` event still works — it fires when a reader's cursor falls behind the event log's retention window.
+
+---
+
 ## Factory
 
 ```ts

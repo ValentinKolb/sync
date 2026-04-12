@@ -1,5 +1,23 @@
 # API
 
+## Browser
+
+```ts
+import { mutex, LockError } from "@valentinkolb/sync/browser";
+
+const m = mutex({
+  id: "checkout",
+  // store: new MemoryStore(), // default
+  // retryCount: 10,
+  // retryDelay: 200,
+  // defaultTtl: 10_000,
+});
+```
+
+Same types and API. Additional config: `store?: Store`. Lock state is in-memory, single-tab only. No Lua scripts — JS single-threading provides atomicity.
+
+---
+
 ## Factory
 
 ```ts

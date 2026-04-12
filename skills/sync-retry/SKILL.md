@@ -1,6 +1,6 @@
 ---
 name: sync-retry
-description: "Use this skill when handling transient transport failures with @valentinkolb/sync retry utility: wrapping Redis/network calls with exponential backoff, configuring per-call retry overrides, using AbortSignal for cooperative cancellation, and classifying errors with retryIf. Also use when writing stream reader loops that must survive brief outages."
+description: "Use this skill when handling transient transport failures with @valentinkolb/sync retry utility: wrapping Redis/network calls with exponential backoff, configuring per-call retry overrides, using AbortSignal for cooperative cancellation, and classifying errors with retryIf. Also use when writing stream reader loops that must survive brief outages. Works identically in the browser via `@valentinkolb/sync/browser` — no Redis dependency, uses setTimeout-based sleep."
 ---
 
 # Sync Retry
@@ -19,6 +19,14 @@ Minimal, transport-aware retry wrapper. Prefer `retry(fn)` with defaults in almo
 - `signal.aborted` is checked before each attempt — no wasted work after cancellation.
 - Library internals (queue/topic/ephemeral `stream({ wait: true })`) already use retry with unbounded attempts. Do not double-wrap those calls.
 - `attempts: 1` means no retry — only one try. The default is `8`.
+
+## Browser
+
+```ts
+import { retry, isRetryableTransportError } from "@valentinkolb/sync/browser";
+```
+
+Identical API and defaults. Uses `setTimeout`-based sleep instead of Bun's `sleep`. No transport errors occur in-memory, but `retry()` is still useful for wrapping flaky `fetch()` calls or other async operations in browser apps.
 
 ## API Reference
 

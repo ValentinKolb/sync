@@ -1,5 +1,21 @@
 # API
 
+## Browser
+
+```ts
+import { registry, RegistryCapacityError, RegistryPayloadTooLargeError } from "@valentinkolb/sync/browser";
+
+const reg = registry({
+  id: "services",
+  schema: z.object({ host: z.string(), port: z.number() }),
+  // All server options work: tenantId, limits
+});
+```
+
+Same types and API. State is in-memory. Prefix ref counting, tombstones, and multi-scope event logs all work identically. No Lua scripts — JS single-threading provides atomicity for CAS and prefix operations.
+
+---
+
 ## Factory
 
 ```ts

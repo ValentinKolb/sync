@@ -1,11 +1,11 @@
 ---
 name: sync-scheduler
-description: "Use this skill when implementing distributed cron scheduling with @valentinkolb/sync scheduler: registering idempotent schedules across pods, leader-fenced dispatch via job.submit, misfire policy (skip/catch_up_one/catch_up_all), triggerNow for manual dispatch, unregister, metrics/health, and multi-pod leader election. Depends on sync-job for execution and sync-mutex for leader lock."
+description: "Use this skill when implementing distributed cron scheduling with @valentinkolb/sync scheduler: registering idempotent schedules across pods, leader-fenced dispatch via job.submit, misfire policy (skip/catch_up_one/catch_up_all), triggerNow for manual dispatch, unregister, metrics/health, and multi-pod leader election. Depends on sync-job for execution and sync-mutex for leader lock. Also works in the browser via `@valentinkolb/sync/browser` for single-tab cron scheduling — same API, no Redis needed."
 ---
 
 # Sync Scheduler
 
-Distributed cron with durable dispatch. Leader election across pods via mutex. Dispatch goes through the `job` system for at-least-once execution.
+Cron scheduling with durable dispatch. Server version does distributed leader election across pods, browser version runs single-tab. Dispatch goes through the `job` system.
 
 **Dependencies**: requires `sync-job` handles for execution. Uses `sync-mutex` internally for leader election. Read those skills for deeper semantics if needed.
 
@@ -48,6 +48,20 @@ await sched.stop();
 - Dispatch uses deterministic submit keys `${scheduleId}:${slotTs}` — the job system deduplicates naturally.
 - After `maxConsecutiveDispatchFailures` (default 5), the schedule slot is advanced and failure is logged to DLQ.
 - `onMetric` callback is best-effort — errors in the callback are swallowed.
+
+## Browser
+
+```ts
+import { scheduler } from "@valentinkolb/sync/browser";
+import { job } from "@valentinkolb/sync/browser";
+```
+
+Same API (start/stop/register/unregister/triggerNow/get/list/metrics). Browser-specific notes:
+- Leader election trivially succeeds (single tab = always leader).
+- The tick loop uses `setInterval`-style polling via `setTimeout` + async loop.
+- `setTimeout` may be throttled in background tabs — tick precision is best-effort. Misfire policies handle catch-up.
+- Schedules and state are in-memory, lost on page refresh.
+- Cron parsing uses `Intl.DateTimeFormat` for timezone support — works in all modern browsers.
 
 ## API Reference
 

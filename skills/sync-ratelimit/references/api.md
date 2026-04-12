@@ -1,5 +1,22 @@
 # API
 
+## Browser
+
+```ts
+import { ratelimit, RateLimitError } from "@valentinkolb/sync/browser";
+
+const limiter = ratelimit({
+  id: "api",
+  limit: 100,
+  windowSecs: 60,
+  // store: new MemoryStore(), // default — can inject custom store
+});
+```
+
+Same types and API. Additional config: `store?: Store` (default: built-in `MemoryStore`). State is in-memory — lost on page refresh. Replace "Redis Keys" section with in-memory key pattern using the Store interface.
+
+---
+
 ## Factory
 
 ```ts

@@ -1,11 +1,11 @@
 ---
 name: sync-queue
-description: "Use this skill when implementing durable queue processing with @valentinkolb/sync queue: send/recv/stream consumer loops, at-least-once delivery with ack/nack/touch, lease-based visibility timeout, delayed messages, DLQ behavior, idempotent enqueueing, and multi-tenant keyspaces. Also use when choosing between queue (work distribution) vs topic (event fan-out) vs job (durable execution with state)."
+description: "Use this skill when implementing durable queue processing with @valentinkolb/sync queue: send/recv/stream consumer loops, at-least-once delivery with ack/nack/touch, lease-based visibility timeout, delayed messages, DLQ behavior, idempotent enqueueing, and multi-tenant keyspaces. Also use when choosing between queue (work distribution) vs topic (event fan-out) vs job (durable execution with state). Also works in the browser via `@valentinkolb/sync/browser` with in-memory state — same API, no Redis needed."
 ---
 
 # Sync Queue
 
-Durable at-least-once work queue. Messages are delivered to exactly one consumer per delivery attempt.
+At-least-once work queue. Server version is Redis-backed and durable, browser version uses in-memory state. Messages are delivered to exactly one consumer per delivery attempt.
 
 ## Consumer Pattern
 
@@ -38,6 +38,19 @@ for await (const msg of q.stream({ signal: ac.signal })) {
 - Maintenance (lease reclaim, delayed→ready promotion, DLQ moves) runs automatically during recv calls.
 - Payload max 128KB. Validated at send and re-parsed at receive.
 - `idempotencyKey` with `idempotencyTtlMs` prevents duplicate sends (default TTL 7 days).
+
+## Browser
+
+```ts
+import { queue } from "@valentinkolb/sync/browser";
+```
+
+Same API (send/recv/stream/ack/nack/touch). Browser-specific notes:
+- Queue state (ready list, delayed messages, deliveries, DLQ) lives in JS heap — lost on page refresh.
+- Blocking `recv({ wait: true })` uses a Promise-based event emitter instead of Redis `BLMOVE`.
+- Maintenance (lease reclaim, delayed→ready promotion) runs lazily on each `recv()` call, same as server.
+- No transport error retries wrapping — no network errors possible in-memory.
+- `stream({ wait: true })` works identically but without the retry wrapper.
 
 ## API Reference
 

@@ -1,5 +1,25 @@
 # API
 
+## Browser
+
+```ts
+import { scheduler } from "@valentinkolb/sync/browser";
+import { job } from "@valentinkolb/sync/browser";
+
+const cleanupJob = job({ id: "cleanup", schema, process: handler });
+const sched = scheduler({ id: "app", dispatch: { tickMs: 1000 } });
+
+sched.start();
+await sched.register({
+  id: "cleanup-hourly", cron: "0 * * * *", tz: "UTC",
+  job: cleanupJob, input: { scope: "temp" }, misfire: "skip",
+});
+```
+
+Same types and API. Leader election always succeeds (single-tab). Schedules are stored in a `Map`. Uses shared `cron.ts` parser (pure JS, browser-compatible). Tick loop timing may be affected by browser tab throttling — misfire policies compensate.
+
+---
+
 ## Factory
 
 ```ts

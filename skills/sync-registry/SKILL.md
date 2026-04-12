@@ -1,11 +1,11 @@
 ---
 name: sync-registry
-description: "Use this skill when implementing typed service/config registries with @valentinkolb/sync registry: exact-key lookups, Redis-native prefix listing, compare-and-swap updates, optional TTL-backed liveness via touch(), snapshot-plus-cursor cache hydration, scoped change-stream readers for keys/prefixes/whole registry, and tombstone retention for expired entries. Also use when choosing between registry (name-addressable, CAS, prefix queries) vs ephemeral (TTL-only, simpler)."
+description: "Use this skill when implementing typed service/config registries with @valentinkolb/sync registry: exact-key lookups, Redis-native prefix listing, compare-and-swap updates, optional TTL-backed liveness via touch(), snapshot-plus-cursor cache hydration, scoped change-stream readers for keys/prefixes/whole registry, and tombstone retention for expired entries. Also use when choosing between registry (name-addressable, CAS, prefix queries) vs ephemeral (TTL-only, simpler). Also works in the browser via `@valentinkolb/sync/browser` with in-memory state — same API, no Redis needed."
 ---
 
 # Sync Registry
 
-Name-addressable typed records with optional TTL-backed liveness, CAS updates, and Redis-native prefix queries. Combines the change-streaming of ephemeral with durable key/value semantics.
+Name-addressable typed records with optional TTL-backed liveness, CAS updates, and prefix queries. Server version uses Redis, browser version runs in-memory. Combines the change-streaming of ephemeral with durable key/value semantics.
 
 ## Decision Guide: registry vs ephemeral
 
@@ -36,6 +36,19 @@ On `overflow`, re-list and restart.
 - Reader scoping: `reader({ key })` = exact key, `reader({ prefix })` = namespace, `reader()` = whole registry. Each scope has its own Redis stream.
 - `stream({ wait: true })` auto-retries transient errors. Do not wrap with `retry()`.
 - `eventRetentionMs` default 5 min. Slow consumers get `overflow`.
+
+## Browser
+
+```ts
+import { registry, RegistryCapacityError } from "@valentinkolb/sync/browser";
+```
+
+Same API (upsert/touch/remove/get/list/cas/reader). Browser-specific notes:
+- Entries, tombstones, and prefix ref counts are held in Maps in JS heap.
+- TTL expiration uses `setTimeout` callbacks — no Redis reconciliation needed.
+- CAS is synchronous (safe because JS is single-threaded).
+- Reader scoping (key/prefix/root) works identically via separate in-memory event logs.
+- State is single-tab, lost on page refresh.
 
 ## API Reference
 

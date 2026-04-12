@@ -1,11 +1,11 @@
 ---
 name: sync-job
-description: "Use this skill when implementing durable background jobs with @valentinkolb/sync job: defining typed process handlers with ctx.step/ctx.heartbeat/ctx.signal, submit/join/cancel flows, idempotent submission via key, retries with exponential backoff, lease timeouts, and per-job event streams for audit. Also use when choosing between job (durable execution with state) vs queue (simple work distribution)."
+description: "Use this skill when implementing durable background jobs with @valentinkolb/sync job: defining typed process handlers with ctx.step/ctx.heartbeat/ctx.signal, submit/join/cancel flows, idempotent submission via key, retries with exponential backoff, lease timeouts, and per-job event streams for audit. Also use when choosing between job (durable execution with state) vs queue (simple work distribution). Also works in the browser via `@valentinkolb/sync/browser` with in-memory state — same API, no Redis needed."
 ---
 
 # Sync Job
 
-Durable async execution: submit, process (with retries), join for result, cancel cooperatively. Built on top of `queue` and `topic` internally.
+Async execution with lifecycle: submit, process (with retries), join for result, cancel cooperatively. Server version is durable (Redis-backed), browser version runs in-memory. Built on top of `queue` and `topic` internally.
 
 ## Decision Guide: job vs queue
 
@@ -40,6 +40,19 @@ process: async ({ ctx, input }) => {
 - `ctx.heartbeat()` extends the underlying queue lease. Call it in long-running handlers to prevent lease expiry and re-delivery.
 - State is retained for 7 days (`DEFAULT_STATE_RETENTION_MS`). After that, `join()` cannot find the result.
 - Worker receive loop auto-retries transient transport errors — survives brief Redis outages.
+
+## Browser
+
+```ts
+import { job } from "@valentinkolb/sync/browser";
+```
+
+Same API (submit/join/cancel/events/stop). Browser-specific notes:
+- Job state, the work queue, and event topics all run in-memory.
+- State transitions (finalize, cancel CAS) are synchronous — safe because JS is single-threaded.
+- `stop()` is still important to halt the worker loop and prevent memory leaks.
+- Jobs are lost on page refresh — not durable. Best for in-session background tasks.
+- `ctx.step()`, `ctx.heartbeat()`, and `ctx.signal` all work identically.
 
 ## API Reference
 

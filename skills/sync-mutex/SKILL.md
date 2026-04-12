@@ -1,11 +1,11 @@
 ---
 name: sync-mutex
-description: "Use this skill when working with @valentinkolb/sync distributed locks: exclusive critical sections across pods with withLock/withLockOrThrow, manual acquire/release, lease extension for long work, retry tuning, owner-safe release via Lua, and LockError handling."
+description: "Use this skill when working with @valentinkolb/sync distributed locks: exclusive critical sections across pods with withLock/withLockOrThrow, manual acquire/release, lease extension for long work, retry tuning, owner-safe release via Lua, and LockError handling. Also works in the browser via `@valentinkolb/sync/browser` with an in-memory store for single-tab lock coordination."
 ---
 
 # Sync Mutex
 
-Lease-based distributed lock via Redis `SET NX PX`. One mutex instance per lock namespace, one lock per resource string.
+Lease-based lock. Server version uses Redis `SET NX PX`, browser version uses an in-memory store. One mutex instance per lock namespace, one lock per resource string.
 
 ## Decision Guide
 
@@ -24,6 +24,19 @@ Lease-based distributed lock via Redis `SET NX PX`. One mutex instance per lock 
 - No fairness: contenders are not queued in order.
 - `lock.expiration` is `Date.now() + ttl` at acquire/extend time. Use it to check remaining time before starting new work.
 - The scheduler module uses mutex internally for leader election.
+
+## Browser
+
+```ts
+import { mutex, LockError } from "@valentinkolb/sync/browser";
+```
+
+Same API. Browser-specific notes:
+- Locks are single-tab only — no cross-tab coordination.
+- JS is single-threaded, so locks are primarily useful for coordinating async operations (preventing concurrent API calls, serializing IndexedDB writes).
+- TTL uses `setTimeout` — may be throttled in background tabs.
+- Resources > 128 chars use djb2 hash instead of SHA-256.
+- Release/extend use synchronous compare-and-delete (safe because JS is single-threaded).
 
 ## API Reference
 

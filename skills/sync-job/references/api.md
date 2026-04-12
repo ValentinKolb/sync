@@ -1,5 +1,27 @@
 # API
 
+## Browser
+
+```ts
+import { job } from "@valentinkolb/sync/browser";
+
+const worker = job({
+  id: "process-data",
+  schema: z.object({ items: z.array(z.string()) }),
+  process: async ({ ctx, input }) => {
+    for (const item of input.items) {
+      await ctx.step({ id: item, run: () => processItem(item) });
+      await ctx.heartbeat();
+    }
+    return { processed: input.items.length };
+  },
+});
+```
+
+Same types and API. Uses browser `queue` and `topic` internally. Job state is in a `Map` instead of Redis. No Lua CAS scripts — synchronous state checks. Worker loop and event streaming work identically.
+
+---
+
 ## Factory
 
 ```ts

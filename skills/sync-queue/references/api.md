@@ -1,5 +1,21 @@
 # API
 
+## Browser
+
+```ts
+import { queue } from "@valentinkolb/sync/browser";
+
+const q = queue({
+  id: "mail.send",
+  schema: z.object({ to: z.string().email(), subject: z.string() }),
+  // All server options work: tenantId, prefix, limits, delivery
+});
+```
+
+Same types and API. State is in-memory (arrays, Maps) instead of Redis data structures. Blocking reads use an event emitter. No `store` config needed — queue manages its own internal state.
+
+---
+
 ## Factory
 
 ```ts
