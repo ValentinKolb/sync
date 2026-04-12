@@ -28,10 +28,11 @@ Atomic sliding-window rate limiter. Server version uses Redis Lua, browser versi
 import { ratelimit, RateLimitError } from "@valentinkolb/sync/browser";
 ```
 
-Same API. The `store` config option lets you inject a custom store (default: `MemoryStore`). Browser-specific notes:
+Same API. The `store` config option lets you inject a custom store (default: `MemoryStore`). Use `createLocalStorageStore()` for persistence across tab reloads. Browser-specific notes:
 - Identifiers > 128 chars use a simple djb2 hash instead of SHA-256.
-- State lives in JS heap and is lost on page refresh.
-- No Redis keys — counters are held in the in-memory store with `setTimeout`-based TTL.
+- With `MemoryStore` (default), state is lost on page refresh.
+- With `LocalStorageStore`, rate limit counters persist across reloads.
+- No Redis keys — counters are held in the store with `setTimeout`-based TTL.
 
 ## API Reference
 

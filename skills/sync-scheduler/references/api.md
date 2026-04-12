@@ -3,20 +3,26 @@
 ## Browser
 
 ```ts
-import { scheduler } from "@valentinkolb/sync/browser";
-import { job } from "@valentinkolb/sync/browser";
+import { scheduler, job, createLocalStorageStore } from "@valentinkolb/sync/browser";
 
 const cleanupJob = job({ id: "cleanup", schema, process: handler });
-const sched = scheduler({ id: "app", dispatch: { tickMs: 1000 } });
+
+// With persistence (survives tab close):
+const sched = scheduler({
+  id: "app",
+  dispatch: { tickMs: 1000 },
+  store: createLocalStorageStore(), // persists lastRunAt across reloads
+});
 
 sched.start();
 await sched.register({
   id: "cleanup-hourly", cron: "0 * * * *", tz: "UTC",
-  job: cleanupJob, input: { scope: "temp" }, misfire: "skip",
+  job: cleanupJob, input: { scope: "temp" }, misfire: "catch_up_one",
 });
+// On next tab open: register() reads persisted lastRunAt, catches up missed runs.
 ```
 
-Same types and API. Leader election always succeeds (single-tab). Schedules are stored in a `Map`. Uses shared `cron.ts` parser (pure JS, browser-compatible). Tick loop timing may be affected by browser tab throttling — misfire policies compensate.
+Same types and API. Additional browser config: `store?: Store` (default: `MemoryStore`). Pass `createLocalStorageStore()` for persistence. Only `lastRunAt` is stored per schedule — cron, handler, input come from code. Leader election always succeeds (single-tab). Uses shared `cron.ts` parser (pure JS, browser-compatible). Tick loop timing may be throttled in background tabs — misfire policies compensate.
 
 ---
 
@@ -58,6 +64,7 @@ type SchedulerConfig = {
   };
   strictHandlers?: boolean;
   onMetric?: (metric: SchedulerMetric) => void;
+  store?: Store; // browser only: persist lastRunAt across tab reloads
 };
 
 type SchedulerRegisterConfig = {

@@ -389,7 +389,7 @@ for await (const msg of q.stream({ wait: false })) {
 
 | | Server | Browser |
 |---|---|---|
-| **State** | Redis | JS heap (lost on refresh) |
+| **State** | Redis | JS heap (default) or localStorage |
 | **Atomicity** | Lua scripts | JS single-threading |
 | **Blocking reads** | Redis `BRPOPLPUSH` / `XREAD BLOCK` | Promise-based event emitters |
 | **TTL** | Redis key expiry + reconciliation | `setTimeout` callbacks |
@@ -398,20 +398,29 @@ for await (const msg of q.stream({ wait: false })) {
 
 ### Store abstraction
 
-Browser modules use a `MemoryStore` by default. Some modules accept an optional `store` config for custom storage:
+Browser modules use a `MemoryStore` by default (state lost on refresh). For persistence across tab reloads, use `LocalStorageStore`:
 
 ```ts
-import { ratelimit, createMemoryStore, type Store } from "@valentinkolb/sync/browser";
+import { scheduler, job, createLocalStorageStore } from "@valentinkolb/sync/browser";
 
-const limiter = ratelimit({
-  id: "api",
-  limit: 10,
-  windowSecs: 60,
-  store: createMemoryStore(), // default — can be replaced
+// Scheduler with persistence — catches up missed runs after tab reopen
+const sched = scheduler({
+  id: "app",
+  store: createLocalStorageStore(),
 });
 ```
 
-The `Store` interface is minimal:
+Two built-in implementations:
+
+```ts
+import { createMemoryStore, createLocalStorageStore } from "@valentinkolb/sync/browser";
+
+createMemoryStore()              // default — fast, lost on refresh
+createLocalStorageStore()        // persistent — survives tab close (~5MB limit)
+createLocalStorageStore("myapp") // custom prefix to avoid collisions
+```
+
+The `Store` interface is minimal — implement your own for IndexedDB or other backends:
 
 ```ts
 interface Store {

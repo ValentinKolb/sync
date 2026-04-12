@@ -52,15 +52,19 @@ await sched.stop();
 ## Browser
 
 ```ts
-import { scheduler } from "@valentinkolb/sync/browser";
-import { job } from "@valentinkolb/sync/browser";
+import { scheduler, job, createLocalStorageStore } from "@valentinkolb/sync/browser";
+
+const sched = scheduler({
+  id: "app",
+  store: createLocalStorageStore(), // persists lastRunAt across tab reloads
+});
 ```
 
 Same API (start/stop/register/unregister/triggerNow/get/list/metrics). Browser-specific notes:
+- **Tab resume**: pass a `store` (e.g. `createLocalStorageStore()`) so the scheduler persists `lastRunAt` per schedule. On tab reopen, `register()` reads the persisted timestamp and applies the misfire policy to catch up missed runs. Without a persistent store, the default `MemoryStore` loses state on refresh.
+- **Code = source of truth**: cron, handler, input, and misfire policy always come from your `register()` call. Only `lastRunAt` is persisted. If you change the cron between deploys, the new cron is used with the old `lastRunAt` — catch-up computes correctly.
 - Leader election trivially succeeds (single tab = always leader).
-- The tick loop uses `setInterval`-style polling via `setTimeout` + async loop.
-- `setTimeout` may be throttled in background tabs — tick precision is best-effort. Misfire policies handle catch-up.
-- Schedules and state are in-memory, lost on page refresh.
+- The tick loop uses `setTimeout`-based polling. May be throttled in background tabs — misfire policies handle catch-up.
 - Cron parsing uses `Intl.DateTimeFormat` for timezone support — works in all modern browsers.
 
 ## API Reference
