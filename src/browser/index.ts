@@ -1,5 +1,5 @@
 // Store
-export { createMemoryStore, MemoryStore, type Store } from "./store";
+export { createMemoryStore, createLocalStorageStore, MemoryStore, LocalStorageStore, type Store } from "./store";
 
 // Retry
 export { retry, isRetryableTransportError, DEFAULT_RETRY_OPTIONS, type RetryOptions } from "./retry";
