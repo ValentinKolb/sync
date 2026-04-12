@@ -33,8 +33,18 @@ jobs:
           REDIS_URL: redis://localhost:6399
         run: bun test
 
+  test-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile --registry=https://registry.npmjs.org
+      - name: Run browser tests
+        run: bun run test:browser
+
   publish-npm:
-    needs: test
+    needs: [test, test-browser]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
