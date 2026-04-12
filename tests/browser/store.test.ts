@@ -1,0 +1,224 @@
+import { test, expect, beforeEach, describe } from "bun:test";
+import { MemoryStore } from "../../src/browser/store";
+
+let store: MemoryStore;
+
+beforeEach(() => {
+  store = new MemoryStore();
+});
+
+// ==========================
+// Basic get / set / del
+// ==========================
+
+describe("get", () => {
+  test("returns undefined for a missing key", () => {
+    expect(store.get("nonexistent")).toBeUndefined();
+  });
+});
+
+describe("set and get roundtrip", () => {
+  test("string value", () => {
+    store.set("k", "hello");
+    expect(store.get("k")).toBe("hello");
+  });
+
+  test("number value", () => {
+    store.set("k", 42);
+    expect(store.get("k")).toBe(42);
+  });
+
+  test("object value", () => {
+    const obj = { a: 1, b: "two", nested: { c: true } };
+    store.set("k", obj);
+    expect(store.get("k")).toEqual(obj);
+  });
+
+  test("array value", () => {
+    const arr = [1, "two", null, { x: 3 }];
+    store.set("k", arr);
+    expect(store.get("k")).toEqual(arr);
+  });
+
+  test("boolean value", () => {
+    store.set("k", false);
+    expect(store.get("k")).toBe(false);
+  });
+
+  test("null value", () => {
+    store.set("k", null);
+    expect(store.get("k")).toBeNull();
+  });
+
+  test("overwriting a key replaces the value", () => {
+    store.set("k", "first");
+    store.set("k", "second");
+    expect(store.get("k")).toBe("second");
+  });
+});
+
+describe("del", () => {
+  test("removes an existing key", () => {
+    store.set("k", "value");
+    expect(store.get("k")).toBe("value");
+    store.del("k");
+    expect(store.get("k")).toBeUndefined();
+  });
+
+  test("is a no-op for a non-existent key", () => {
+    // Should not throw
+    store.del("ghost");
+    expect(store.get("ghost")).toBeUndefined();
+  });
+
+  test("does not affect other keys", () => {
+    store.set("a", 1);
+    store.set("b", 2);
+    store.del("a");
+    expect(store.get("a")).toBeUndefined();
+    expect(store.get("b")).toBe(2);
+  });
+});
+
+// ==========================
+// keys
+// ==========================
+
+describe("keys", () => {
+  test("returns all keys when no prefix is given", () => {
+    store.set("x", 1);
+    store.set("y", 2);
+    store.set("z", 3);
+    expect(store.keys().sort()).toEqual(["x", "y", "z"]);
+  });
+
+  test("returns empty array when store is empty", () => {
+    expect(store.keys()).toEqual([]);
+  });
+
+  test("filters by prefix", () => {
+    store.set("user:1", "Alice");
+    store.set("user:2", "Bob");
+    store.set("item:1", "Sword");
+    expect(store.keys("user:").sort()).toEqual(["user:1", "user:2"]);
+  });
+
+  test("returns empty array when no keys match prefix", () => {
+    store.set("a", 1);
+    expect(store.keys("z:")).toEqual([]);
+  });
+
+  test("prefix is exact startsWith match", () => {
+    store.set("abc", 1);
+    store.set("ab", 2);
+    store.set("a", 3);
+    expect(store.keys("ab").sort()).toEqual(["ab", "abc"]);
+  });
+});
+
+// ==========================
+// TTL
+// ==========================
+
+describe("TTL", () => {
+  test("value is available immediately after set with ttlMs", () => {
+    store.set("k", "value", 200);
+    expect(store.get("k")).toBe("value");
+  });
+
+  test("value is gone after TTL expires", async () => {
+    store.set("k", "value", 100);
+    expect(store.get("k")).toBe("value");
+    await Bun.sleep(200);
+    expect(store.get("k")).toBeUndefined();
+  });
+
+  test("keys() excludes expired entries", async () => {
+    store.set("a", 1, 100);
+    store.set("b", 2); // no TTL
+    await Bun.sleep(200);
+    expect(store.keys()).toEqual(["b"]);
+  });
+
+  test("overwriting a key resets the TTL timer", async () => {
+    store.set("k", "v1", 100);
+    await Bun.sleep(50);
+    // Overwrite with a fresh TTL
+    store.set("k", "v2", 200);
+    await Bun.sleep(100);
+    // Original TTL (100ms) would have expired, but the new one (200ms) hasn't
+    expect(store.get("k")).toBe("v2");
+    await Bun.sleep(200);
+    // Now the new TTL has expired
+    expect(store.get("k")).toBeUndefined();
+  });
+
+  test("overwriting with no TTL removes the expiry", async () => {
+    store.set("k", "v1", 100);
+    store.set("k", "v2"); // no TTL
+    await Bun.sleep(200);
+    expect(store.get("k")).toBe("v2");
+  });
+
+  test("del clears the TTL timer", async () => {
+    store.set("k", "value", 200);
+    store.del("k");
+    // Re-set without TTL after del
+    store.set("k", "new-value");
+    await Bun.sleep(250);
+    // The old timer should not have deleted the new value
+    expect(store.get("k")).toBe("new-value");
+  });
+
+  test("zero ttlMs is treated as no TTL", async () => {
+    store.set("k", "value", 0);
+    await Bun.sleep(30);
+    expect(store.get("k")).toBe("value");
+  });
+
+  test("negative ttlMs is treated as no TTL", async () => {
+    store.set("k", "value", -10);
+    await Bun.sleep(30);
+    expect(store.get("k")).toBe("value");
+  });
+});
+
+// ==========================
+// clear
+// ==========================
+
+describe("clear", () => {
+  test("removes all keys", () => {
+    store.set("a", 1);
+    store.set("b", 2);
+    store.set("c", 3);
+    store.clear();
+    expect(store.keys()).toEqual([]);
+    expect(store.get("a")).toBeUndefined();
+    expect(store.get("b")).toBeUndefined();
+    expect(store.get("c")).toBeUndefined();
+  });
+
+  test("clears TTL timers so they do not fire after clear", async () => {
+    store.set("k", "value", 100);
+    store.clear();
+    // Re-set the same key with no TTL
+    store.set("k", "fresh");
+    await Bun.sleep(200);
+    // The old timer should not have deleted the fresh value
+    expect(store.get("k")).toBe("fresh");
+  });
+
+  test("is safe to call on an empty store", () => {
+    store.clear();
+    expect(store.keys()).toEqual([]);
+  });
+
+  test("store is usable after clear", () => {
+    store.set("x", 1);
+    store.clear();
+    store.set("y", 2);
+    expect(store.get("y")).toBe(2);
+    expect(store.keys()).toEqual(["y"]);
+  });
+});
