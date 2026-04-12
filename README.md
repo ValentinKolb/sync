@@ -1,10 +1,13 @@
 # @valentinkolb/sync
 
-Distributed synchronization primitives for [Bun](https://bun.sh) and TypeScript, backed by Redis (6.2+, Valkey, Dragonfly).
+Synchronization primitives for TypeScript — available in two flavors:
 
-Designed for horizontally scaled, high-availability systems where multiple service instances need coordinated access to shared state — rate limiting across pods, distributed locking, durable job processing, cron scheduling without duplicate dispatch, or real-time event streaming between services.
+- **Server** (`@valentinkolb/sync`): backed by Redis (6.2+, Valkey, Dragonfly), built for [Bun](https://bun.sh). Designed for horizontally scaled systems where multiple service instances need coordinated access to shared state.
+- **Browser** (`@valentinkolb/sync/browser`): fully in-memory, zero dependencies beyond `zod`. Designed for local-first browser apps that need the same primitives (rate limiting, queues, schedulers) without a server.
 
-Provides nine modules: **ratelimit**, **mutex**, **queue**, **topic**, **job**, **scheduler**, **registry**, **ephemeral**, and **retry**. They work independently or compose — `job` uses `queue` + `topic` internally, `scheduler` uses `job` + `mutex`. All state lives in Redis; there is no additional infrastructure required.
+Both share the same API. Code written for one works on the other — just change the import path.
+
+Provides nine modules: **ratelimit**, **mutex**, **queue**, **topic**, **job**, **scheduler**, **registry**, **ephemeral**, and **retry**. They work independently or compose — `job` uses `queue` + `topic` internally, `scheduler` uses `job` + `mutex`.
 
 Requires `zod` as peer dependency for payload validation.
 
@@ -13,6 +16,8 @@ Requires `zod` as peer dependency for payload validation.
 ```bash
 bun add @valentinkolb/sync zod
 ```
+
+Server modules use Redis for state. Browser modules use an in-memory store — no Redis needed.
 
 ### Agent Skills (optional)
 
@@ -353,6 +358,72 @@ Long-lived stream loops (`stream({ wait: true })`, `live()`) use transport retri
 
 ---
 
+## Browser
+
+All nine modules are available as a browser-compatible build with no Redis dependency. State lives in-memory (JS heap) and is lost on page refresh.
+
+```ts
+import { queue, ratelimit, mutex, topic, ephemeral, registry, job, scheduler, retry } from "@valentinkolb/sync/browser";
+```
+
+The API is identical to the server version — same factory pattern, same types, same methods. Just swap the import path.
+
+```ts
+import { z } from "zod";
+import { queue } from "@valentinkolb/sync/browser";
+
+const q = queue({
+  id: "tasks",
+  schema: z.object({ url: z.string().url() }),
+});
+
+await q.send({ data: { url: "https://example.com" } });
+
+for await (const msg of q.stream({ wait: false })) {
+  await fetch(msg.data.url);
+  await msg.ack();
+}
+```
+
+### Key differences from server
+
+| | Server | Browser |
+|---|---|---|
+| **State** | Redis | JS heap (lost on refresh) |
+| **Atomicity** | Lua scripts | JS single-threading |
+| **Blocking reads** | Redis `BRPOPLPUSH` / `XREAD BLOCK` | Promise-based event emitters |
+| **TTL** | Redis key expiry + reconciliation | `setTimeout` callbacks |
+| **Cross-process** | Yes (multi-pod) | No (single-tab) |
+| **Long identifier hashing** | SHA-256 | djb2 (non-cryptographic) |
+
+### Store abstraction
+
+Browser modules use a `MemoryStore` by default. Some modules accept an optional `store` config for custom storage:
+
+```ts
+import { ratelimit, createMemoryStore, type Store } from "@valentinkolb/sync/browser";
+
+const limiter = ratelimit({
+  id: "api",
+  limit: 10,
+  windowSecs: 60,
+  store: createMemoryStore(), // default — can be replaced
+});
+```
+
+The `Store` interface is minimal:
+
+```ts
+interface Store {
+  get(key: string): unknown | undefined;
+  set(key: string, value: unknown, ttlMs?: number): void;
+  del(key: string): void;
+  keys(prefix?: string): string[];
+}
+```
+
+---
+
 ## Development
 
 ```bash
@@ -360,13 +431,19 @@ git clone https://github.com/valentinkolb/sync.git
 cd sync && bun install
 ```
 
-Tests require a Redis-compatible server on port 6399:
+Server tests require a Redis-compatible server on port 6399:
 
 ```bash
 docker run -d --name valkey -p 6399:6379 valkey/valkey:latest
-bun test --preload ./tests/preload.ts   # integration tests
+bun test --preload ./tests/preload.ts   # server integration tests
 bun run test:fault                       # fault-tolerance suites
-bun run test:all                         # everything
+bun run test:all                         # all server tests
+```
+
+Browser tests run without Redis:
+
+```bash
+bun run test:browser                     # all browser tests (~210 tests)
 ```
 
 ### Project structure
@@ -382,17 +459,23 @@ src/
   registry.ts        # Typed registry with prefix queries and CAS
   ephemeral.ts       # TTL-based ephemeral store
   retry.ts           # Transport-aware retry utility
-  internal/          # Cron parsing, job/topic helpers
-tests/               # Integration + unit tests (require Redis)
+  internal/          # Cron parsing, job/topic helpers (pure JS, shared)
+  browser/           # Browser-compatible in-memory implementations
+    store.ts         # Store interface + MemoryStore
+    internal/        # sleep, emitter, event-log, id utilities
+    *.ts             # One file per module (same API as server)
+tests/               # Server integration + unit tests (require Redis)
+tests/browser/       # Browser tests (no Redis needed)
 skills/              # Agent skills with per-feature API references
 ```
 
 ### Guidelines
 
-- Every Redis mutation must be in a Lua script for atomicity.
+- Server: every Redis mutation must be in a Lua script for atomicity.
+- Browser: JS single-threading provides atomicity — no locks needed.
 - All modules follow the `moduleName({ id, ...config })` factory pattern.
 - Validate at boundaries, trust internal data.
-- Tests go in `tests/`. Use `test:q`, `test:t`, etc. as prefix to avoid collisions.
+- Server tests go in `tests/`. Browser tests go in `tests/browser/`.
 
 ## License
 
