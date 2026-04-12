@@ -222,3 +222,164 @@ describe("clear", () => {
     expect(store.keys()).toEqual(["y"]);
   });
 });
+
+// ==========================
+// LocalStorageStore
+// ==========================
+
+// Simple localStorage mock for testing
+const createLocalStorageMock = () => {
+  const store = new Map<string, string>();
+  return {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => store.set(key, value),
+    removeItem: (key: string) => store.delete(key),
+    key: (index: number) => [...store.keys()][index] ?? null,
+    get length() { return store.size; },
+    clear: () => store.clear(),
+  } as unknown as Storage;
+};
+
+import { LocalStorageStore, createLocalStorageStore } from "../../src/browser/store";
+
+// We need to polyfill localStorage for Bun
+const originalLocalStorage = globalThis.localStorage;
+
+test("LocalStorageStore: get returns undefined for missing key", () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const store = new LocalStorageStore("test");
+    expect(store.get("missing")).toBeUndefined();
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("LocalStorageStore: set and get roundtrip", () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const store = new LocalStorageStore("test");
+    store.set("key1", { hello: "world" });
+    expect(store.get("key1")).toEqual({ hello: "world" });
+    store.set("key2", 42);
+    expect(store.get("key2")).toBe(42);
+    store.set("key3", "string");
+    expect(store.get("key3")).toBe("string");
+    store.set("key4", null);
+    expect(store.get("key4")).toBeNull();
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("LocalStorageStore: del removes key", () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const store = new LocalStorageStore("test");
+    store.set("k", "v");
+    expect(store.get("k")).toBe("v");
+    store.del("k");
+    expect(store.get("k")).toBeUndefined();
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("LocalStorageStore: keys returns all keys with prefix filter", () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const store = new LocalStorageStore("test");
+    store.set("a:1", 1);
+    store.set("a:2", 2);
+    store.set("b:1", 3);
+    expect(store.keys().sort()).toEqual(["a:1", "a:2", "b:1"]);
+    expect(store.keys("a:").sort()).toEqual(["a:1", "a:2"]);
+    expect(store.keys("b:")).toEqual(["b:1"]);
+    expect(store.keys("c:")).toEqual([]);
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("LocalStorageStore: TTL expiry works", async () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const store = new LocalStorageStore("test");
+    store.set("ttl-key", "value", 100);
+    expect(store.get("ttl-key")).toBe("value");
+    await Bun.sleep(200);
+    expect(store.get("ttl-key")).toBeUndefined();
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("LocalStorageStore: overwrite resets TTL timer", async () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const store = new LocalStorageStore("test");
+    store.set("k", "v1", 100);
+    await Bun.sleep(60);
+    store.set("k", "v2", 200);
+    await Bun.sleep(100); // 160ms total — first TTL would have fired
+    expect(store.get("k")).toBe("v2"); // still alive
+    await Bun.sleep(200);
+    expect(store.get("k")).toBeUndefined(); // second TTL fired
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("LocalStorageStore: get returns undefined for corrupted JSON", () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const store = new LocalStorageStore("test");
+    // Manually inject corrupted data
+    localStorage.setItem("test:corrupt", "not-json{{{");
+    expect(store.get("corrupt")).toBeUndefined();
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("LocalStorageStore: custom prefix isolates data", () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const store1 = new LocalStorageStore("app1");
+    const store2 = new LocalStorageStore("app2");
+    store1.set("key", "from-app1");
+    store2.set("key", "from-app2");
+    expect(store1.get("key")).toBe("from-app1");
+    expect(store2.get("key")).toBe("from-app2");
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("LocalStorageStore: clear removes only prefixed keys", () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const store = new LocalStorageStore("myapp");
+    store.set("a", 1);
+    store.set("b", 2);
+    // Add a key with different prefix directly
+    localStorage.setItem("other:key", "value");
+    store.clear();
+    expect(store.get("a")).toBeUndefined();
+    expect(store.get("b")).toBeUndefined();
+    expect(localStorage.getItem("other:key")).toBe("value");
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("createLocalStorageStore factory works", () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const store = createLocalStorageStore("factory-test");
+    store.set("k", 42);
+    expect(store.get("k")).toBe(42);
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});

@@ -421,8 +421,7 @@ test("ctx.signal is aborted on cancel", async () => {
 
   // Give abort handler time to fire
   await Bun.sleep(50);
-  // Note: ctx.signal is aborted when the worker catches the cancel during
-  // the post-process check or on error. The signal abort fires via jobAc.abort().
+  expect(signalAborted).toBe(true);
 });
 
 // ==========================

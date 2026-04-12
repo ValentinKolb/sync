@@ -315,3 +315,67 @@ test("two mutex instances with shared store coordinate", async () => {
   expect(lock3).not.toBeNull();
   await m2.release(lock3!);
 });
+
+// ==========================
+// Stale lock safety
+// ==========================
+
+test("release with stale lock value is a no-op after re-acquisition", async () => {
+  const { createMemoryStore } = await import("../../src/browser/store");
+  const sharedStore = createMemoryStore();
+  const m = mutex({ id: "stale", prefix: "test:mx", store: sharedStore, defaultTtl: 100, retryCount: 0 });
+
+  const lock1 = await m.acquire("res");
+  expect(lock1).not.toBeNull();
+
+  // Wait for lock to expire
+  await Bun.sleep(200);
+
+  // Another acquire succeeds (different owner token)
+  const lock2 = await m.acquire("res");
+  expect(lock2).not.toBeNull();
+  expect(lock2!.value).not.toBe(lock1!.value);
+
+  // Releasing the OLD lock should be a no-op (different value)
+  await m.release(lock1!);
+
+  // lock2 should still be held
+  const lock3 = await m.acquire("res");
+  expect(lock3).toBeNull(); // can't acquire because lock2 still holds it
+  await m.release(lock2!);
+});
+
+test("extend with stale lock value returns false after re-acquisition", async () => {
+  const { createMemoryStore } = await import("../../src/browser/store");
+  const sharedStore = createMemoryStore();
+  const m = mutex({ id: "stale-ext", prefix: "test:mx", store: sharedStore, defaultTtl: 100, retryCount: 0 });
+
+  const lock1 = await m.acquire("res");
+  expect(lock1).not.toBeNull();
+  await Bun.sleep(200);
+
+  const lock2 = await m.acquire("res");
+  expect(lock2).not.toBeNull();
+
+  // Extending the old lock should fail
+  const extended = await m.extend(lock1!, 5000);
+  expect(extended).toBe(false);
+
+  // lock2 should still be valid
+  const extended2 = await m.extend(lock2!, 5000);
+  expect(extended2).toBe(true);
+  await m.release(lock2!);
+});
+
+test("withLockOrThrow success path acquires, executes, and releases", async () => {
+  const m = mutex({ id: "wlot-success", prefix: "test:mx", retryCount: 0 });
+  const result = await m.withLockOrThrow("res", async () => {
+    return 42;
+  });
+  expect(result).toBe(42);
+
+  // Lock should be released — can re-acquire
+  const lock = await m.acquire("res");
+  expect(lock).not.toBeNull();
+  await m.release(lock!);
+});

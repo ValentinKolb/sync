@@ -546,3 +546,86 @@ test("touch after ack returns false", async () => {
   await msg!.ack();
   expect(await msg!.touch()).toBe(false);
 });
+
+// ==========================
+// Queue maintenance tests
+// ==========================
+
+test("message age expiry in claimNext moves to DLQ", async () => {
+  const q = queue({
+    id: `age-dlq-${Date.now()}`,
+    schema: z.object({ v: z.number() }),
+    limits: { maxMessageAgeMs: 100 },
+    delivery: { defaultLeaseMs: 30_000 },
+  });
+  await q.send({ data: { v: 1 } });
+  // Wait for the message to age out
+  await Bun.sleep(200);
+  // recv should return null because the message aged out during claimNext
+  const msg = await q.recv({ wait: false });
+  expect(msg).toBeNull();
+});
+
+test("nack after ack returns false", async () => {
+  const q = queue({
+    id: `nack-after-ack-${Date.now()}`,
+    schema: z.object({ v: z.number() }),
+  });
+  await q.send({ data: { v: 1 } });
+  const msg = await q.recv({ wait: false });
+  expect(msg).not.toBeNull();
+  expect(await msg!.ack()).toBe(true);
+  expect(await msg!.nack()).toBe(false);
+});
+
+test("ack after nack returns false", async () => {
+  const q = queue({
+    id: `ack-after-nack-${Date.now()}`,
+    schema: z.object({ v: z.number() }),
+  });
+  await q.send({ data: { v: 1 } });
+  const msg = await q.recv({ wait: false });
+  expect(msg).not.toBeNull();
+  expect(await msg!.nack()).toBe(true);
+  expect(await msg!.ack()).toBe(false);
+});
+
+test("delayed message age expiry during maintenance moves to DLQ", async () => {
+  const q = queue({
+    id: `delayed-age-${Date.now()}`,
+    schema: z.object({ v: z.number() }),
+    limits: { maxMessageAgeMs: 50 },
+  });
+  // Send with a delay longer than maxMessageAgeMs
+  await q.send({ data: { v: 1 }, delayMs: 200 });
+  // Wait for the message to age AND the delay to pass
+  await Bun.sleep(300);
+  // Maintenance should have moved it to DLQ during the next recv
+  // Force maintenance by calling recv
+  const msg = await q.recv({ wait: false });
+  expect(msg).toBeNull();
+});
+
+test("tenant isolation between queues", async () => {
+  const q = queue({
+    id: `tenant-iso-${Date.now()}`,
+    schema: z.object({ v: z.number() }),
+  });
+  await q.send({ data: { v: 1 }, tenantId: "t1" });
+  await q.send({ data: { v: 2 }, tenantId: "t2" });
+
+  const msg1 = await q.recv({ wait: false, tenantId: "t1" });
+  expect(msg1).not.toBeNull();
+  expect(msg1!.data.v).toBe(1);
+
+  const msg2 = await q.recv({ wait: false, tenantId: "t2" });
+  expect(msg2).not.toBeNull();
+  expect(msg2!.data.v).toBe(2);
+
+  // t1 queue should be empty now
+  const msg3 = await q.recv({ wait: false, tenantId: "t1" });
+  expect(msg3).toBeNull();
+
+  await msg1!.ack();
+  await msg2!.ack();
+});

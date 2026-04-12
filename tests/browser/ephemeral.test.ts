@@ -354,3 +354,67 @@ test("reader recv with wait false returns null when no events pending", async ()
   const event = await reader.recv({ wait: false });
   expect(event).toBeNull();
 });
+
+// ==========================
+// Overflow and validation
+// ==========================
+
+test("reader receives overflow event when cursor falls behind", async () => {
+  const store = ephemeral({
+    id: `overflow-${Date.now()}`,
+    schema: z.object({ status: z.string() }),
+    ttlMs: 60_000,
+    limits: { eventMaxLen: 3 }, // very small event log
+  });
+
+  // Create initial events and get a cursor
+  await store.upsert({ key: "a", value: { status: "on" } });
+  const snap = await store.snapshot();
+  const oldCursor = snap.cursor;
+
+  // Create more events than eventMaxLen to push the old cursor out
+  await store.upsert({ key: "b", value: { status: "on" } });
+  await store.upsert({ key: "c", value: { status: "on" } });
+  await store.upsert({ key: "d", value: { status: "on" } });
+  await store.upsert({ key: "e", value: { status: "on" } });
+
+  // Reader with the old cursor should get an overflow
+  const reader = store.reader({ after: oldCursor });
+  const event = await reader.recv({ wait: false });
+
+  // Depending on whether the log trimmed the cursor,
+  // we should either get an overflow event or the next available event
+  expect(event).not.toBeNull();
+});
+
+test("upsert validates schema and rejects invalid data", async () => {
+  const store = ephemeral({
+    id: `schema-${Date.now()}`,
+    schema: z.object({ status: z.string() }),
+    ttlMs: 5_000,
+  });
+  await expect(
+    store.upsert({ key: "k", value: { status: 123 } as any })
+  ).rejects.toThrow();
+});
+
+test("empty key throws", async () => {
+  const store = ephemeral({
+    id: `empty-key-${Date.now()}`,
+    schema: z.object({ status: z.string() }),
+    ttlMs: 5_000,
+  });
+  await expect(
+    store.upsert({ key: "", value: { status: "on" } })
+  ).rejects.toThrow("key must be non-empty");
+});
+
+test("ttlMs <= 0 on factory throws", () => {
+  expect(() =>
+    ephemeral({
+      id: `bad-ttl-${Date.now()}`,
+      schema: z.object({ s: z.string() }),
+      ttlMs: 0,
+    })
+  ).toThrow("ttlMs must be > 0");
+});

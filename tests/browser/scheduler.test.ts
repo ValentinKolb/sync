@@ -760,3 +760,177 @@ test("register with changed cron uses new cron from code (code = source of truth
   await s2.stop();
   w.stop();
 });
+
+test("same browser schedule dispatches across multiple simulated cron cycles", async () => {
+  const originalNow = Date.now;
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  Date.now = (): number => fakeNow;
+
+  let runs = 0;
+  const w = job({
+    id: uid("repeat-worker"),
+    schema: taskSchema,
+    process: async () => {
+      runs += 1;
+      return true;
+    },
+  });
+  const s = makeScheduler(uid("repeat-inst"), {
+    tickMs: 20,
+    leaseMs: 500,
+    heartbeatMs: 50,
+  });
+  const schedId = uid("repeat-schedule");
+
+  try {
+    await s.register({
+      id: schedId,
+      cron: "* * * * *",
+      tz: "UTC",
+      job: w,
+      input: { run: true },
+      misfire: "catch_up_one",
+    });
+
+    s.start();
+    await waitUntil(() => s.metrics().isLeader, 2_000);
+
+    for (let cycle = 1; cycle <= 3; cycle += 1) {
+      fakeNow += 60_000;
+      await waitUntil(() => runs >= cycle, 2_000);
+    }
+
+    expect(runs).toBe(3);
+    expect(s.metrics().dispatchSubmitted).toBe(3);
+
+    const info = await s.get({ id: schedId });
+    expect(info).not.toBeNull();
+    expect(info!.nextRunAt).toBeGreaterThan(fakeNow);
+  } finally {
+    Date.now = originalNow;
+    await s.stop();
+    w.stop();
+  }
+});
+
+// ==========================
+// catch_up_all + dispatch edge cases
+// ==========================
+
+test("catch_up_all dispatches multiple missed slots", async () => {
+  const originalNow = Date.now;
+  // Start at a known time: Jan 1, 2026 00:00 UTC
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  Date.now = (): number => fakeNow;
+
+  let runs = 0;
+  const w = job({
+    id: uid("catchall-worker"),
+    schema: taskSchema,
+    process: async () => { runs += 1; return true; },
+  });
+  const s = makeScheduler(uid("catchall-inst"), {
+    tickMs: 20,
+    leaseMs: 500,
+    heartbeatMs: 50,
+  });
+
+  try {
+    await s.register({
+      id: uid("catchall-sched"),
+      cron: "* * * * *", // every minute
+      tz: "UTC",
+      job: w,
+      input: { run: true },
+      misfire: "catch_up_all",
+      maxCatchUpRuns: 5,
+    });
+
+    s.start();
+    await waitUntil(() => s.metrics().isLeader, 2_000);
+
+    // Jump 3 minutes into the future — should catch up 3 slots
+    fakeNow += 3 * 60_000;
+    await waitUntil(() => runs >= 3, 5_000);
+
+    expect(runs).toBeGreaterThanOrEqual(3);
+    expect(s.metrics().dispatchSubmitted).toBeGreaterThanOrEqual(3);
+  } finally {
+    Date.now = originalNow;
+    await s.stop();
+    w.stop();
+  }
+});
+
+test("register validates timezone", async () => {
+  const w = makeWorker(uid("tz-worker"));
+  const s = makeScheduler(uid("tz-inst"));
+  try {
+    await expect(s.register({
+      id: uid("tz-sched"),
+      cron: "* * * * *",
+      tz: "Invalid/Timezone",
+      job: w,
+      input: { run: true },
+    })).rejects.toThrow();
+  } finally {
+    await s.stop();
+    w.stop();
+  }
+});
+
+test("start is idempotent", async () => {
+  const s = makeScheduler(uid("idempotent-start"));
+  try {
+    s.start();
+    s.start(); // second call should not create a second loop
+    await waitUntil(() => s.metrics().isLeader, 3_000);
+    expect(s.metrics().leaderChanges).toBe(1); // only one leader acquisition
+  } finally {
+    await s.stop();
+  }
+});
+
+test("stop is idempotent", async () => {
+  const s = makeScheduler(uid("idempotent-stop"));
+  s.start();
+  await waitUntil(() => s.metrics().isLeader, 3_000);
+  await s.stop();
+  await s.stop(); // second call should not throw
+  expect(s.metrics().isLeader).toBe(false);
+});
+
+test("unregister cleans up persisted lastRunAt from store", async () => {
+  const { createMemoryStore } = await import("../../src/browser/store");
+  const persistentStore = createMemoryStore();
+  const schedId = uid("unreg-persist");
+  const w = makeWorker(uid("unreg-worker"));
+  const sid = uid("unreg-inst");
+  const s = scheduler({
+    id: sid,
+    dispatch: { tickMs: 50 },
+    store: persistentStore,
+  });
+  try {
+    await s.register({
+      id: schedId,
+      cron: "0 */6 * * *",
+      tz: "UTC",
+      job: w,
+      input: { run: true },
+    });
+    await s.triggerNow({ id: schedId });
+
+    // Verify lastRunAt was persisted
+    const keys = persistentStore.keys(`sync:scheduler:${sid}:lastRun:`);
+    expect(keys.length).toBeGreaterThan(0);
+
+    // Unregister should clean it up
+    await s.unregister({ id: schedId });
+    const keysAfter = persistentStore.keys(`sync:scheduler:${sid}:lastRun:`);
+    expect(keysAfter.length).toBe(0);
+  } finally {
+    await s.stop();
+    w.stop();
+  }
+});
