@@ -70,36 +70,57 @@ jobs:
         run: npm --version
 
       - name: Set version from tag
-        run: npm version ${GITHUB_REF#refs/tags/v} --no-git-tag-version
+        run: npm version ${GITHUB_REF#refs/tags/v} --no-git-tag-version --allow-same-version
 
-      - name: Build package
+      - name: Build server bundle
         run: bun build ./index.ts --outdir ./dist --target bun
+
+      - name: Build browser modules
+        run: |
+          mkdir -p dist/browser
+          bun build ./src/browser/index.ts --outdir ./dist/browser --target browser
+          # Build individual modules for tree-shaking subpath imports
+          for mod in ratelimit mutex queue topic job scheduler ephemeral registry retry store; do
+            bun build ./src/browser/${mod}.ts --outdir ./dist/browser --target browser
+          done
 
       - name: Create dist package.json
         run: |
-          # Get version from package.json
           VERSION=$(node -p "require('./package.json').version")
-
-          # Create package.json for dist with lowercase name for npm
           cat > dist/package.json << EOF
           {
             "name": "@valentinkolb/sync",
             "version": "$VERSION",
-            "description": "Distributed synchronization primitives for Bun and TypeScript",
+            "description": "Synchronization primitives for TypeScript — server (Redis) and browser (in-memory)",
             "main": "index.js",
             "module": "index.js",
             "types": "index.d.ts",
             "type": "module",
+            "sideEffects": false,
             "exports": {
               ".": {
                 "import": "./index.js",
                 "types": "./index.d.ts"
-              }
+              },
+              "./browser": {
+                "import": "./browser/index.js",
+                "types": "./browser/index.d.ts"
+              },
+              "./browser/ratelimit": { "import": "./browser/ratelimit.js", "types": "./browser/ratelimit.d.ts" },
+              "./browser/mutex": { "import": "./browser/mutex.js", "types": "./browser/mutex.d.ts" },
+              "./browser/queue": { "import": "./browser/queue.js", "types": "./browser/queue.d.ts" },
+              "./browser/topic": { "import": "./browser/topic.js", "types": "./browser/topic.d.ts" },
+              "./browser/job": { "import": "./browser/job.js", "types": "./browser/job.d.ts" },
+              "./browser/scheduler": { "import": "./browser/scheduler.js", "types": "./browser/scheduler.d.ts" },
+              "./browser/ephemeral": { "import": "./browser/ephemeral.js", "types": "./browser/ephemeral.d.ts" },
+              "./browser/registry": { "import": "./browser/registry.js", "types": "./browser/registry.d.ts" },
+              "./browser/retry": { "import": "./browser/retry.js", "types": "./browser/retry.d.ts" },
+              "./browser/store": { "import": "./browser/store.js", "types": "./browser/store.d.ts" }
             },
             "peerDependencies": {
               "zod": "^4"
             },
-            "keywords": ["bun", "redis", "ratelimit", "mutex", "jobs", "queue", "distributed"],
+            "keywords": ["bun", "redis", "ratelimit", "mutex", "jobs", "queue", "distributed", "browser", "local-first"],
             "author": "Valentin Kolb",
             "license": "MIT",
             "repository": {
