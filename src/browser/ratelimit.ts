@@ -1,0 +1,98 @@
+import { type Store, createMemoryStore } from "./store";
+import { simpleHash } from "./internal/id";
+
+const DEFAULT_PREFIX = "sync:ratelimit";
+const DEFAULT_WINDOW_SECS = 1;
+const MAX_IDENTIFIER_LENGTH = 128;
+
+const normalizeIdentifier = (identifier: string): string => {
+  if (identifier.length <= MAX_IDENTIFIER_LENGTH) return identifier;
+  return simpleHash(identifier);
+};
+
+// ==========================
+// Types
+// ==========================
+
+export type RateLimitResult = {
+  limited: boolean;
+  remaining: number;
+  resetIn: number;
+};
+
+export type RateLimitConfig = {
+  id: string;
+  limit: number;
+  windowSecs?: number;
+  prefix?: string;
+  store?: Store;
+};
+
+export type RateLimiter = {
+  id: string;
+  check(identifier: string): Promise<RateLimitResult>;
+  checkOrThrow(identifier: string): Promise<RateLimitResult>;
+};
+
+// ==========================
+// Rate Limit Error
+// ==========================
+
+export class RateLimitError extends Error {
+  readonly remaining: number;
+  readonly resetIn: number;
+
+  constructor(result: RateLimitResult) {
+    super("Rate limit exceeded");
+    this.name = "RateLimitError";
+    this.remaining = result.remaining;
+    this.resetIn = result.resetIn;
+  }
+}
+
+// ==========================
+// Rate Limiter Factory
+// ==========================
+
+export const ratelimit = (config: RateLimitConfig): RateLimiter => {
+  const prefix = config.prefix ?? DEFAULT_PREFIX;
+  const windowSecs = config.windowSecs ?? DEFAULT_WINDOW_SECS;
+  const { limit } = config;
+  const store = config.store ?? createMemoryStore();
+
+  const check = async (identifier: string): Promise<RateLimitResult> => {
+    const safeIdentifier = normalizeIdentifier(identifier);
+    const now = Date.now();
+    const windowMs = windowSecs * 1000;
+    const currentWindow = Math.floor(now / windowMs);
+    const previousWindow = currentWindow - 1;
+    const elapsedInWindow = now % windowMs;
+    const elapsedRatio = elapsedInWindow / windowMs;
+
+    const currentKey = `${prefix}:${config.id}:${safeIdentifier}:${currentWindow}`;
+    const previousKey = `${prefix}:${config.id}:${safeIdentifier}:${previousWindow}`;
+
+    const previousCount = (store.get(previousKey) as number) ?? 0;
+
+    const currentCount = ((store.get(currentKey) as number) ?? 0) + 1;
+    store.set(currentKey, currentCount, windowSecs * 2000);
+
+    const weightedCount = previousCount * (1 - elapsedRatio) + currentCount;
+
+    const limited = weightedCount > limit;
+    const remaining = Math.max(0, Math.floor(limit - weightedCount));
+    const resetIn = windowMs - elapsedInWindow;
+
+    return { limited, remaining, resetIn };
+  };
+
+  const checkOrThrow = async (identifier: string): Promise<RateLimitResult> => {
+    const result = await check(identifier);
+    if (result.limited) {
+      throw new RateLimitError(result);
+    }
+    return result;
+  };
+
+  return { id: config.id, check, checkOrThrow };
+};
