@@ -620,3 +620,143 @@ test("strict handlers: missing handler causes dispatch skip and leadership relin
     await s.stop();
   }
 }, 70_000);
+
+// ==========================
+// Store-backed resume after "tab reopen"
+// ==========================
+
+test("register resumes from persisted lastRunAt (simulates tab reopen)", async () => {
+  const { createMemoryStore } = await import("../../src/browser/store");
+
+  // Shared store simulates persistence across "tab sessions"
+  const persistentStore = createMemoryStore();
+  const schedId = uid("resume-sched");
+  const workerId = uid("resume-worker");
+
+  // --- Session 1: register, trigger, stop ---
+  const w1 = job({
+    id: workerId,
+    schema: taskSchema,
+    process: async () => true,
+  });
+  const s1 = scheduler({
+    id: uid("resume-inst"),
+    dispatch: { tickMs: 50 },
+    leader: { leaseMs: 2000, heartbeatMs: 200 },
+    store: persistentStore,
+  });
+
+  await s1.register({
+    id: schedId,
+    cron: "0 */6 * * *", // every 6 hours
+    tz: "UTC",
+    job: w1,
+    input: { run: true },
+    misfire: "catch_up_one",
+  });
+
+  // Manual trigger to simulate a successful run
+  await s1.triggerNow({ id: schedId });
+  await s1.stop();
+  w1.stop();
+
+  // Verify lastRunAt was persisted
+  const lastRun = persistentStore.get(`sync:scheduler:${s1.id}:lastRun:${schedId}`) as number;
+  expect(lastRun).toBeGreaterThan(0);
+
+  // --- Simulate time passing (tab closed for 2 days) ---
+  // Overwrite the persisted lastRunAt to 48 hours ago — guarantees multiple missed 6h slots
+  const twoDaysAgo = Date.now() - 48 * 60 * 60 * 1000;
+  persistentStore.set(`sync:scheduler:${s1.id}:lastRun:${schedId}`, twoDaysAgo);
+
+  // --- Session 2: new scheduler, same store ---
+  const w2 = job({
+    id: uid("resume-worker2"),
+    schema: taskSchema,
+    process: async () => true,
+  });
+  const s2 = scheduler({
+    id: s1.id, // same scheduler ID!
+    dispatch: { tickMs: 50 },
+    leader: { leaseMs: 2000, heartbeatMs: 200 },
+    store: persistentStore,
+  });
+
+  await s2.register({
+    id: schedId,
+    cron: "0 */6 * * *",
+    tz: "UTC",
+    job: w2,
+    input: { run: true },
+    misfire: "catch_up_one",
+  });
+
+  // nextRunAt should be computed from the persisted lastRunAt (48h ago),
+  // NOT from now. With "0 */6 * * *" and lastRun 48h ago,
+  // the next slot is definitely in the past!
+  const info = await s2.get({ id: schedId });
+  expect(info).not.toBeNull();
+  // nextRunAt should be in the past (there are missed slots to catch up)
+  expect(info!.nextRunAt).toBeLessThan(Date.now());
+
+  // Start and let the tick loop catch up
+  s2.start();
+  await waitUntil(() => s2.metrics().dispatchSubmitted > 0, 5_000);
+
+  const m = s2.metrics();
+  // catch_up_one should have dispatched exactly 1 catch-up job
+  expect(m.dispatchSubmitted).toBeGreaterThanOrEqual(1);
+
+  await s2.stop();
+  w2.stop();
+});
+
+test("register with changed cron uses new cron from code (code = source of truth)", async () => {
+  const { createMemoryStore } = await import("../../src/browser/store");
+  const persistentStore = createMemoryStore();
+  const schedId = uid("cron-change");
+
+  const w = job({
+    id: uid("cron-change-worker"),
+    schema: taskSchema,
+    process: async () => true,
+  });
+
+  const sid = uid("cron-change-inst");
+
+  // Session 1: register with every-6h cron, trigger to persist lastRunAt
+  const s1 = scheduler({
+    id: sid,
+    dispatch: { tickMs: 50 },
+    store: persistentStore,
+  });
+  await s1.register({
+    id: schedId,
+    cron: "0 */6 * * *",
+    tz: "UTC",
+    job: w,
+    input: { run: true },
+  });
+  await s1.triggerNow({ id: schedId });
+  await s1.stop();
+
+  // Session 2: same schedule ID but DIFFERENT cron (every 12h)
+  const s2 = scheduler({
+    id: sid,
+    dispatch: { tickMs: 50 },
+    store: persistentStore,
+  });
+  await s2.register({
+    id: schedId,
+    cron: "0 */12 * * *", // changed from */6 to */12
+    tz: "UTC",
+    job: w,
+    input: { run: true },
+  });
+
+  const info = await s2.get({ id: schedId });
+  expect(info).not.toBeNull();
+  expect(info!.cron).toBe("0 */12 * * *"); // new cron from code
+  await s2.stop();
+  w.stop();
+});

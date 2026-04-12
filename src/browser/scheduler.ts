@@ -101,6 +101,10 @@ export type SchedulerConfig = {
   };
   strictHandlers?: boolean;
   onMetric?: (metric: SchedulerMetric) => void;
+  /** Optional store for persisting lastRunAt timestamps across tab reloads.
+   *  Default: MemoryStore (state lost on refresh).
+   *  Pass a localStorage-backed store to survive tab closes. */
+  store?: Store;
 };
 
 export type SchedulerRegisterConfig = {
@@ -252,6 +256,9 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     config.dispatch?.maxConsecutiveDispatchFailures ?? DEFAULT_MAX_CONSECUTIVE_DISPATCH_FAILURES,
   );
   const strictHandlers = config.strictHandlers ?? DEFAULT_STRICT_HANDLERS;
+  const store = config.store ?? createMemoryStore();
+
+  const lastRunKey = (scheduleId: string): string => `${prefix}:${config.id}:lastRun:${scheduleId}`;
 
   // Share a single mutex store across scheduler instances with the same ID
   // so that leader election actually coordinates between them.
@@ -560,6 +567,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
           schedule.nextRunAt = nextCronTimestamp(schedule.cron, schedule.tz, lastSubmittedSlotTs);
           schedule.updatedAt = Date.now();
           scheduleToJobId.set(schedule.id, schedule.jobId);
+          // Persist lastRunAt so we can catch up after tab reopen
+          store.set(lastRunKey(schedule.id), lastSubmittedSlotTs);
         }
         break;
       }
@@ -568,6 +577,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       schedule.nextRunAt = plan.nextRunAt;
       schedule.updatedAt = Date.now();
       scheduleToJobId.set(schedule.id, schedule.jobId);
+      // Persist lastRunAt — use the last slot from the plan (or now if no slots)
+      if (plan.slots.length > 0) {
+        store.set(lastRunKey(schedule.id), plan.slots[plan.slots.length - 1]!);
+      }
     }
   };
 
@@ -607,7 +620,15 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     const nowMs = Date.now();
     const misfire = cfg.misfire ?? DEFAULT_MISFIRE;
     const maxCatchUpRuns = Math.max(1, cfg.maxCatchUpRuns ?? DEFAULT_MAX_CATCH_UP_RUNS);
-    const firstRunAt = nextCronTimestamp(cfg.cron, tz, nowMs);
+
+    // Code is the source of truth for schedule definition.
+    // The store only persists lastRunAt so we can catch up after tab reopen.
+    const persistedLastRunAt = store.get(lastRunKey(cfg.id)) as number | undefined;
+
+    // Compute nextRunAt: if we have a persisted lastRunAt, resume from there.
+    // Otherwise start fresh from now.
+    const resumeFrom = persistedLastRunAt ?? nowMs;
+    const firstRunAt = nextCronTimestamp(cfg.cron, tz, resumeFrom);
 
     const existing = schedules.get(cfg.id);
 
@@ -626,8 +647,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       consecutiveDispatchFailures: 0,
     };
 
-    // Preserve nextRunAt if cron/tz unchanged
-    if (existing && existing.cron === cfg.cron && existing.tz === tz) {
+    // If re-registering in the same session with unchanged cron/tz AND
+    // no persisted lastRunAt to recover from, keep the in-memory state.
+    // Persisted lastRunAt takes priority (cross-session recovery).
+    if (!persistedLastRunAt && existing && existing.cron === cfg.cron && existing.tz === tz) {
       stored.nextRunAt = existing.nextRunAt;
       stored.consecutiveDispatchFailures = existing.consecutiveDispatchFailures;
       stored.lastFailedSlotTs = existing.lastFailedSlotTs;
@@ -675,6 +698,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     const jobId = scheduleToJobId.get(cfg.id);
     schedules.delete(cfg.id);
     scheduleToJobId.delete(cfg.id);
+    store.del(lastRunKey(cfg.id));
 
     safeMetric(config.onMetric, {
       type: "schedule_unregistered",
@@ -734,6 +758,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         requireLeadership: false,
       });
       metricsState.triggerSubmitted += 1;
+      // Persist lastRunAt for manual triggers too
+      store.set(lastRunKey(schedule.id), Date.now());
       safeMetric(config.onMetric, {
         type: "trigger_submitted",
         ts: Date.now(),
