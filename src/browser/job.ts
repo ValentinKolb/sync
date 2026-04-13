@@ -5,7 +5,6 @@ import { sleep } from "./internal/sleep";
 import {
   computeRetryDelay,
   isTerminalStatus,
-  withTimeout,
 } from "../internal/job-utils";
 
 const DEFAULT_PREFIX = "sync:job";
@@ -139,6 +138,7 @@ const workPayloadSchema = z.object({
 const now = (): number => Date.now();
 
 const activeWorkers = new Map<string, AbortController>();
+const activeJobRuns = new Map<string, AbortController>();
 
 // Module-level shared stores keyed by definition ID.
 // This ensures multiple job() calls with the same definition.id share state,
@@ -186,6 +186,7 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
 
   const prefix = DEFAULT_PREFIX;
   const workerId = `${prefix}:${definition.id}`;
+  const runningJobKey = (jobId: JobId): string => `${workerId}:run:${jobId}`;
 
   // Shared state across all handles with the same definition.id
   const shared = getSharedState(definition.id);
@@ -316,31 +317,57 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
             await message.touch({ leaseMs: payload.leaseMs });
 
             const jobAc = new AbortController();
-
-            const ctx: JobContext = {
-              signal: jobAc.signal,
-              step: async <T>(cfg: { id: string; run: () => Promise<T> | T }): Promise<T> => {
-                return await Promise.resolve(cfg.run());
-              },
-              heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
-                await message.touch({ leaseMs: cfg?.leaseMs ?? payload.leaseMs });
-                await emitEvent(payload.id, {
-                  type: "heartbeat",
-                  id: payload.id,
-                  runId,
-                  ts: now(),
-                });
-              },
-            };
+            const jobRunKey = runningJobKey(payload.id);
+            activeJobRuns.set(jobRunKey, jobAc);
 
             try {
+              let leaseDeadline = Date.now() + payload.leaseMs;
+
+              const ctx: JobContext = {
+                signal: jobAc.signal,
+                step: async <T>(cfg: { id: string; run: () => Promise<T> | T }): Promise<T> => {
+                  return await Promise.resolve(cfg.run());
+                },
+                heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
+                  const extendMs = cfg?.leaseMs ?? payload.leaseMs;
+                  leaseDeadline = Date.now() + extendMs;
+                  await message.touch({ leaseMs: extendMs });
+                  await emitEvent(payload.id, {
+                    type: "heartbeat",
+                    id: payload.id,
+                    runId,
+                    ts: now(),
+                  });
+                },
+              };
+
               const inputParsed = definition.schema.safeParse(payload.input);
               if (!inputParsed.success) {
                 throw inputParsed.error;
               }
 
               const processPromise = Promise.resolve(definition.process({ ctx, input: inputParsed.data as Input }));
-              const result = await withTimeout(processPromise, payload.leaseMs);
+
+              // Resettable timeout that respects heartbeat extensions
+              const result = await new Promise<Result>((resolve, reject) => {
+                let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+
+                const checkTimeout = (): void => {
+                  const remaining = leaseDeadline - Date.now();
+                  if (remaining <= 0) {
+                    const err = new Error("job execution timed out");
+                    err.name = "JobTimeoutError";
+                    reject(err);
+                    return;
+                  }
+                  timeoutHandle = setTimeout(checkTimeout, Math.min(remaining, 1000));
+                };
+
+                checkTimeout();
+                processPromise.then(resolve, reject).finally(() => {
+                  if (timeoutHandle) clearTimeout(timeoutHandle);
+                });
+              });
 
               const latest = readState(payload.id);
               if (latest?.status === "cancelled") {
@@ -433,6 +460,11 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
                 reason: err.message,
                 ts: finishedAt,
               });
+            } finally {
+              const active = activeJobRuns.get(jobRunKey);
+              if (active === jobAc) {
+                activeJobRuns.delete(jobRunKey);
+              }
             }
           } catch {
             if (workerAc.signal.aborted) break;
@@ -624,6 +656,8 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
         : undefined,
     });
     if (!wrote) return;
+
+    activeJobRuns.get(runningJobKey(cfg.id))?.abort();
 
     await emitEvent(cfg.id, {
       type: "cancelled",

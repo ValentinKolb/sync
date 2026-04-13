@@ -486,10 +486,12 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
       // Wait with timeout
       const ac = new AbortController();
       const timeout = setTimeout(() => ac.abort(), timeoutMs);
-      const signal = cfg.signal;
+      // Combine user signal and timeout signal
+      const onUserAbort = (): void => ac.abort();
+      if (cfg.signal) cfg.signal.addEventListener("abort", onUserAbort, { once: true });
 
       try {
-        for await (const entry of state.eventLog.subscribe(cursor, signal ?? ac.signal)) {
+        for await (const entry of state.eventLog.subscribe(cursor, ac.signal)) {
           clearTimeout(timeout);
           cursor = entry.id;
           const parsed = parseEvent(entry);
@@ -499,6 +501,7 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
         // Timeout or abort
       } finally {
         clearTimeout(timeout);
+        if (cfg.signal) cfg.signal.removeEventListener("abort", onUserAbort);
       }
 
       return null;

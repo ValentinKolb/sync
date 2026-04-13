@@ -881,11 +881,20 @@ test("register upsert can switch job handler for existing schedule id", async ()
 
 test("strictHandlers false keeps scheduler running but skips missing handlers", async () => {
   const schedulerId = uid("sched-non-strict");
+  let runs = 0;
+  const worker = job({
+    id: uid("sched-non-strict-job"),
+    schema: z.object({ v: z.number() }),
+    process: async () => {
+      runs += 1;
+      return "ok";
+    },
+  });
   const s = scheduler({
     id: schedulerId,
     strictHandlers: false,
     leader: { leaseMs: 700, heartbeatMs: 100 },
-    dispatch: { tickMs: 30 },
+    dispatch: { tickMs: 30, batchSize: 1 },
   });
 
   // Insert a schedule directly without registering handler on this instance.
@@ -911,11 +920,29 @@ test("strictHandlers false keeps scheduler running but skips missing handlers", 
     await redis.send("ZADD", [`sync:scheduler:${schedulerId}:due`, String(schedule.nextRunAt), scheduleId]);
     await redis.send("SADD", [`sync:scheduler:${schedulerId}:index`, scheduleId]);
 
+    await s.register({
+      id: "valid-handler",
+      cron: "* * * * *",
+      tz: "UTC",
+      misfire: "catch_up_one",
+      job: worker,
+      input: { v: 1 },
+    });
+    await forceScheduleDue(schedulerId, "valid-handler", Date.now() - 60_000);
+
     s.start();
     await waitUntil(() => s.metrics().dispatchSkipped >= 1, 4_000);
+    await waitUntil(() => runs >= 1, 4_000);
+
     expect(s.metrics().isLeader).toBe(true);
+    expect(runs).toBe(1);
+
+    const advanced = await s.get({ id: scheduleId });
+    expect(advanced).not.toBeNull();
+    expect(advanced!.nextRunAt).toBeGreaterThan(Date.now() - 1_000);
   } finally {
     await s.stop();
+    worker.stop();
   }
 });
 

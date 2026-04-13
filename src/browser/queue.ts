@@ -403,6 +403,13 @@ export const queue = <TSchema extends z.ZodTypeAny>(config: QueueConfig<TSchema>
       const nack = async (cfg?: { delayMs?: number; reason?: string; error?: string }): Promise<boolean> => {
         if (settled) return false;
         if (!state.deliveries.has(deliveryId)) return false;
+
+        // Validate BEFORE settling to avoid orphaning the message
+        const delayMs = cfg?.delayMs ?? 0;
+        if (delayMs > maxNackDelayMs) {
+          throw new Error(`nack delayMs (${delayMs}) exceeds maxNackDelayMs (${maxNackDelayMs})`);
+        }
+
         settled = true;
         state.deliveries.delete(deliveryId);
         state.leases.delete(deliveryId);
@@ -412,10 +419,6 @@ export const queue = <TSchema extends z.ZodTypeAny>(config: QueueConfig<TSchema>
           return true;
         }
 
-        const delayMs = cfg?.delayMs ?? 0;
-        if (delayMs > maxNackDelayMs) {
-          throw new Error(`nack delayMs (${delayMs}) exceeds maxNackDelayMs (${maxNackDelayMs})`);
-        }
         if (delayMs > 0) {
           state.delayed.set(messageId, Date.now() + delayMs);
         } else {

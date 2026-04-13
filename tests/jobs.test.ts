@@ -284,12 +284,16 @@ test("state TTL is isolated per job", async () => {
 
 test("cancel during running job is detected by worker", async () => {
   let started = false;
+  let signalAborted = false;
 
   const worker = job({
     id: uid("job-cancel-running"),
     schema: z.object({}),
-    process: async () => {
+    process: async ({ ctx }) => {
       started = true;
+      ctx.signal.addEventListener("abort", () => {
+        signalAborted = true;
+      });
       await Bun.sleep(300);
       return "done";
     },
@@ -303,6 +307,8 @@ test("cancel during running job is detected by worker", async () => {
   await worker.cancel({ id, reason: "mid-flight" });
   const terminal = await worker.join({ id, timeoutMs: 5_000 });
   expect(terminal.status).toBe("cancelled");
+  await Bun.sleep(20);
+  expect(signalAborted).toBe(true);
 });
 
 test("cancel on already-completed job is a no-op", async () => {

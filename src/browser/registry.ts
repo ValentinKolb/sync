@@ -676,6 +676,8 @@ export const registry = <TSchema extends z.ZodTypeAny>(config: RegistryConfig<TS
     }
 
     let cursor = readerCfg.after ?? log.latest();
+    let overflowChecked = false;
+    let overflowPending: RegistryEvent<TData> | null = null;
 
     const parseEvent = (entry: EventLogEntry): RegistryEvent<TData> | null => {
       const type = entry.fields.type as string;
@@ -747,6 +749,30 @@ export const registry = <TSchema extends z.ZodTypeAny>(config: RegistryConfig<TS
       const wait = cfg.wait ?? true;
       const timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
+      // Check for replay gap (cursor fell behind trimmed events)
+      if (!overflowChecked) {
+        overflowChecked = true;
+        if (readerCfg.after && readerCfg.after !== "0") {
+          const earliest = log.earliest();
+          if (earliest && !log.has(readerCfg.after) && Number(readerCfg.after) < Number(earliest)) {
+            const liveCursor = log.latest();
+            overflowPending = {
+              type: "overflow" as const,
+              cursor: liveCursor,
+              after: readerCfg.after,
+              firstAvailable: earliest,
+            };
+            cursor = liveCursor;
+          }
+        }
+      }
+
+      if (overflowPending) {
+        const event = overflowPending;
+        overflowPending = null;
+        return event as RegistryEvent<TData>;
+      }
+
       // Try buffered entries
       const entries = log.range(cursor, 1);
       if (entries.length > 0) {
@@ -759,9 +785,12 @@ export const registry = <TSchema extends z.ZodTypeAny>(config: RegistryConfig<TS
       // Wait with timeout
       const ac = new AbortController();
       const timeout = setTimeout(() => ac.abort(), timeoutMs);
+      // Combine user signal and timeout signal
+      const onUserAbort = (): void => ac.abort();
+      if (cfg.signal) cfg.signal.addEventListener("abort", onUserAbort, { once: true });
 
       try {
-        for await (const entry of log.subscribe(cursor, cfg.signal ?? ac.signal)) {
+        for await (const entry of log.subscribe(cursor, ac.signal)) {
           clearTimeout(timeout);
           cursor = entry.id;
           const parsed = parseEvent(entry);
@@ -771,6 +800,7 @@ export const registry = <TSchema extends z.ZodTypeAny>(config: RegistryConfig<TS
         // Timeout or abort
       } finally {
         clearTimeout(timeout);
+        if (cfg.signal) cfg.signal.removeEventListener("abort", onUserAbort);
       }
 
       return null;

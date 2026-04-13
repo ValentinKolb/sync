@@ -60,6 +60,13 @@ export const ratelimit = (config: RateLimitConfig): RateLimiter => {
   const { limit } = config;
   const store = config.store ?? createMemoryStore();
 
+  if (!Number.isFinite(windowSecs) || windowSecs <= 0) {
+    throw new Error("windowSecs must be > 0");
+  }
+  if (!Number.isFinite(limit) || limit <= 0) {
+    throw new Error("limit must be > 0");
+  }
+
   const check = async (identifier: string): Promise<RateLimitResult> => {
     const safeIdentifier = normalizeIdentifier(identifier);
     const now = Date.now();

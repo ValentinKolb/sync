@@ -494,6 +494,12 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
           await relinquishLeadership();
           break;
         }
+
+        schedule.nextRunAt = plan.nextRunAt;
+        schedule.updatedAt = Date.now();
+        if (plan.slots.length > 0) {
+          store.set(lastRunKey(schedule.id), plan.slots[plan.slots.length - 1]!);
+        }
         continue;
       }
 

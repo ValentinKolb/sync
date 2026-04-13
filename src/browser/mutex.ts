@@ -68,6 +68,7 @@ export const mutex = (config: MutexConfig): Mutex => {
   const store = config.store ?? createMemoryStore();
 
   const acquire = async (resource: string, ttl: number = defaultTtl): Promise<Lock | null> => {
+    if (!Number.isFinite(ttl) || ttl <= 0) return null;
     const safeResource = normalizeResource(resource);
     const key = `${prefix}:${config.id}:${safeResource}`;
     const value = randomHex(16);

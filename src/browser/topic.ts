@@ -182,7 +182,9 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
 
   const reader = (group = "default"): TopicReader<TData> => {
     const consumerId = `consumer:${randomId()}`;
-    let cursor = "0";
+    const cursors = new Map<string, string>();
+    const getCursor = (tenantId: string): string => cursors.get(tenantId) ?? "0";
+    const setCursor = (tenantId: string, c: string): void => { cursors.set(tenantId, c); };
 
     const recv = async (recvCfg: TopicRecvConfig = {}): Promise<TopicDelivery<TData> | null> => {
       const tenantId = resolveTenant(recvCfg.tenantId);
@@ -191,7 +193,7 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
       const timeoutMs = recvCfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
       // Try to get the next entry after cursor
-      const entries = log.range(cursor, 1);
+      const entries = log.range(getCursor(tenantId), 1);
       if (entries.length > 0) {
         return deliverEntry(entries[0]!, log, tenantId);
       }
@@ -207,7 +209,7 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
       if (recvCfg.signal) recvCfg.signal.addEventListener("abort", onUserAbort, { once: true });
 
       try {
-        for await (const entry of log.subscribe(cursor, ac.signal)) {
+        for await (const entry of log.subscribe(getCursor(tenantId), ac.signal)) {
           clearTimeout(timeout);
           if (recvCfg.signal) recvCfg.signal.removeEventListener("abort", onUserAbort);
           return deliverEntry(entry, log, tenantId);
@@ -222,20 +224,20 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
       return null;
     };
 
-    const deliverEntry = (entry: EventLogEntry, _log: EventLog, _tenantId: string): TopicDelivery<TData> | null => {
+    const deliverEntry = (entry: EventLogEntry, _log: EventLog, tenantId: string): TopicDelivery<TData> | null => {
       const stored = parsePayload(entry);
       if (!stored) {
-        cursor = entry.id;
+        setCursor(tenantId, entry.id);
         return null;
       }
 
       const parsed = config.schema.safeParse(stored.data);
       if (!parsed.success) {
-        cursor = entry.id;
+        setCursor(tenantId, entry.id);
         return null;
       }
 
-      cursor = entry.id;
+      setCursor(tenantId, entry.id);
 
       const commit = async (): Promise<boolean> => {
         // In-memory: commit is a no-op (cursor already advanced)

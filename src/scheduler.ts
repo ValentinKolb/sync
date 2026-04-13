@@ -702,6 +702,17 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
           await relinquishLeadership();
           break;
         }
+
+        const skippedCas = await rescheduleCas(schedule, plan.nextRunAt, Date.now());
+        if (skippedCas === "stale") {
+          metricsState.dispatchSkipped += 1;
+          safeMetric(config.onMetric, {
+            type: "dispatch_skipped",
+            ts: Date.now(),
+            scheduleId: schedule.id,
+            reason: "cas_stale",
+          });
+        }
         continue;
       }
 

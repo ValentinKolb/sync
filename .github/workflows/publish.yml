@@ -136,7 +136,12 @@ jobs:
           cp LICENSE dist/LICENSE
 
       - name: Generate type declarations
-        run: bunx tsc --declaration --emitDeclarationOnly --noEmit false --outDir dist
+        run: |
+          bunx tsc --declaration --emitDeclarationOnly --noEmit false --outDir dist
+          # tsc generates dist/src/browser/ but dist package.json expects dist/browser/
+          if [ -d "dist/src/browser" ]; then
+            cp -r dist/src/browser/* dist/browser/
+          fi
 
       - name: Publish to npm
         run: npm publish --provenance --access public
