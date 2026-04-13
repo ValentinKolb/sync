@@ -3,7 +3,7 @@
 ## Browser
 
 ```ts
-import { queue } from "@valentinkolb/sync/browser";
+import { queue } from "@valentinkolb/sync-browser";
 
 const q = queue({
   id: "mail.send",

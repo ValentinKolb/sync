@@ -5,7 +5,7 @@ import { sleep } from "./internal/sleep";
 import {
   computeRetryDelay,
   isTerminalStatus,
-} from "../internal/job-utils";
+} from "./internal/job-utils";
 
 const DEFAULT_PREFIX = "sync:job";
 const DEFAULT_LEASE_MS = 30_000;

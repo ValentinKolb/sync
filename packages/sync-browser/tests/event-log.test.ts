@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, describe } from "bun:test";
-import { EventLog } from "../../src/browser/internal/event-log";
+import { EventLog } from "../src/internal/event-log";
 
 let log: EventLog;
 

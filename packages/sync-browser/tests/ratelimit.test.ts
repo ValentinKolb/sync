@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
-import { ratelimit, RateLimitError } from "../../src/browser/ratelimit";
-import { createMemoryStore, type Store } from "../../src/browser/store";
+import { ratelimit, RateLimitError } from "../src/ratelimit";
+import { createMemoryStore, type Store } from "../src/store";
 
 // ==========================
 // Allows requests within limit

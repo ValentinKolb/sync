@@ -1,6 +1,6 @@
 ---
 name: sync-ephemeral
-description: "Use this skill when implementing short-lived typed state with @valentinkolb/sync ephemeral: TTL-based key/value with upsert/touch/remove, snapshot-plus-cursor reconciliation for cache hydration, streaming upsert/touch/delete/expire events, capacity/payload limits, and presence-style use cases where entries should naturally expire. Also works in the browser via `@valentinkolb/sync/browser` with in-memory state — same API, no Redis needed."
+description: "Use this skill when implementing short-lived typed state with @valentinkolb/sync ephemeral: TTL-based key/value with upsert/touch/remove, snapshot-plus-cursor reconciliation for cache hydration, streaming upsert/touch/delete/expire events, capacity/payload limits, and presence-style use cases where entries should naturally expire. Also works in the browser via `@valentinkolb/sync-browser` with in-memory state — same API, no Redis needed."
 ---
 
 # Sync Ephemeral
@@ -35,7 +35,7 @@ On `overflow` event (cursor fell behind retention window), re-snapshot and resta
 ## Browser
 
 ```ts
-import { ephemeral, EphemeralCapacityError } from "@valentinkolb/sync/browser";
+import { ephemeral, EphemeralCapacityError } from "@valentinkolb/sync-browser";
 ```
 
 Same API. Browser-specific notes:

@@ -3,7 +3,7 @@
 ## Browser
 
 ```ts
-import { mutex, LockError } from "@valentinkolb/sync/browser";
+import { mutex, LockError } from "@valentinkolb/sync-browser";
 
 const m = mutex({
   id: "checkout",

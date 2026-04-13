@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { z } from "zod";
-import { queue } from "../../src/browser/queue";
+import { queue } from "../src/queue";
 
 // Helper: unique queue per test to avoid cross-test interference
 let counter = 0;

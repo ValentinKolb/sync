@@ -3,7 +3,7 @@
 ## Browser
 
 ```ts
-import { retry, isRetryableTransportError, DEFAULT_RETRY_OPTIONS } from "@valentinkolb/sync/browser";
+import { retry, isRetryableTransportError, DEFAULT_RETRY_OPTIONS } from "@valentinkolb/sync-browser";
 ```
 
 Same API. Uses `setTimeout` for delays instead of Bun's `sleep`. All options and behavior are identical.

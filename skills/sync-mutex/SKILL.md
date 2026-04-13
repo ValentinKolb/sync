@@ -1,6 +1,6 @@
 ---
 name: sync-mutex
-description: "Use this skill when working with @valentinkolb/sync distributed locks: exclusive critical sections across pods with withLock/withLockOrThrow, manual acquire/release, lease extension for long work, retry tuning, owner-safe release via Lua, and LockError handling. Also works in the browser via `@valentinkolb/sync/browser` with an in-memory store for single-tab lock coordination."
+description: "Use this skill when working with @valentinkolb/sync distributed locks: exclusive critical sections across pods with withLock/withLockOrThrow, manual acquire/release, lease extension for long work, retry tuning, owner-safe release via Lua, and LockError handling. Also works in the browser via `@valentinkolb/sync-browser` with an in-memory store for single-tab lock coordination."
 ---
 
 # Sync Mutex
@@ -28,7 +28,7 @@ Lease-based lock. Server version uses Redis `SET NX PX`, browser version uses an
 ## Browser
 
 ```ts
-import { mutex, LockError } from "@valentinkolb/sync/browser";
+import { mutex, LockError } from "@valentinkolb/sync-browser";
 ```
 
 Same API. Browser-specific notes:

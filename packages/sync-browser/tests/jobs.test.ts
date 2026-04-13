@@ -1,6 +1,6 @@
 import { test, expect, afterEach } from "bun:test";
 import { z } from "zod";
-import { job } from "../../src/browser/job";
+import { job } from "../src/job";
 
 const uid = (name: string): string =>
   `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;

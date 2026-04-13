@@ -3,7 +3,7 @@ import {
   ephemeral,
   EphemeralCapacityError,
   EphemeralPayloadTooLargeError,
-} from "../../src/browser/ephemeral";
+} from "../src/ephemeral";
 import { z } from "zod";
 
 // ==========================

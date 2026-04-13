@@ -3,7 +3,7 @@
 ## Browser
 
 ```ts
-import { topic } from "@valentinkolb/sync/browser";
+import { topic } from "@valentinkolb/sync-browser";
 
 const t = topic({
   id: "events",

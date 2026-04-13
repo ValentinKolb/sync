@@ -1,6 +1,6 @@
 ---
 name: sync-queue
-description: "Use this skill when implementing durable queue processing with @valentinkolb/sync queue: send/recv/stream consumer loops, at-least-once delivery with ack/nack/touch, lease-based visibility timeout, delayed messages, DLQ behavior, idempotent enqueueing, and multi-tenant keyspaces. Also use when choosing between queue (work distribution) vs topic (event fan-out) vs job (durable execution with state). Also works in the browser via `@valentinkolb/sync/browser` with in-memory state — same API, no Redis needed."
+description: "Use this skill when implementing durable queue processing with @valentinkolb/sync queue: send/recv/stream consumer loops, at-least-once delivery with ack/nack/touch, lease-based visibility timeout, delayed messages, DLQ behavior, idempotent enqueueing, and multi-tenant keyspaces. Also use when choosing between queue (work distribution) vs topic (event fan-out) vs job (durable execution with state). Also works in the browser via `@valentinkolb/sync-browser` with in-memory state — same API, no Redis needed."
 ---
 
 # Sync Queue
@@ -42,7 +42,7 @@ for await (const msg of q.stream({ signal: ac.signal })) {
 ## Browser
 
 ```ts
-import { queue } from "@valentinkolb/sync/browser";
+import { queue } from "@valentinkolb/sync-browser";
 ```
 
 Same API (send/recv/stream/ack/nack/touch). Browser-specific notes:

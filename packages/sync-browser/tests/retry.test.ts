@@ -4,7 +4,7 @@ import {
   isRetryableTransportError,
   DEFAULT_RETRY_OPTIONS,
   type RetryOptions,
-} from "../../src/browser/retry";
+} from "../src/retry";
 
 // ==========================
 // Default options

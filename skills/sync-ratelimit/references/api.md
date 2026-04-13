@@ -3,7 +3,7 @@
 ## Browser
 
 ```ts
-import { ratelimit, RateLimitError } from "@valentinkolb/sync/browser";
+import { ratelimit, RateLimitError } from "@valentinkolb/sync-browser";
 
 const limiter = ratelimit({
   id: "api",

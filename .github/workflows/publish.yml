@@ -4,11 +4,12 @@ on:
   push:
     branches: ["**"]
     tags:
-      - "v*"
+      - "sync-v*"
+      - "browser-v*"
   pull_request:
 
 jobs:
-  test:
+  test-server:
     runs-on: ubuntu-latest
     services:
       valkey:
@@ -22,16 +23,13 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v4
-
       - uses: oven-sh/setup-bun@v2
-
       - name: Install dependencies
         run: bun install --frozen-lockfile --registry=https://registry.npmjs.org
-
-      - name: Run tests
+      - name: Run server tests
         env:
           REDIS_URL: redis://localhost:6399
-        run: bun test
+        run: cd packages/sync && bun test --preload ./tests/preload.ts
 
   test-browser:
     runs-on: ubuntu-latest
@@ -41,20 +39,18 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile --registry=https://registry.npmjs.org
       - name: Run browser tests
-        run: bun run test:browser
+        run: cd packages/sync-browser && bun test tests/*.test.ts
 
-  publish-npm:
-    needs: [test, test-browser]
-    if: startsWith(github.ref, 'refs/tags/v')
+  publish-sync:
+    needs: [test-server, test-browser]
+    if: startsWith(github.ref, 'refs/tags/sync-v')
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v4
-
       - uses: oven-sh/setup-bun@v2
-
       - name: Install dependencies
         run: bun install --frozen-lockfile --registry=https://registry.npmjs.org
 
@@ -66,61 +62,34 @@ jobs:
       - name: Use npm 11.5.1+
         run: npm install -g npm@11.5.1
 
-      - name: Verify npm version
-        run: npm --version
-
       - name: Set version from tag
-        run: npm version ${GITHUB_REF#refs/tags/v} --no-git-tag-version --allow-same-version
+        run: cd packages/sync && npm version ${GITHUB_REF#refs/tags/sync-v} --no-git-tag-version --allow-same-version
 
       - name: Build server bundle
-        run: bun build ./index.ts --outdir ./dist --target bun
-
-      - name: Build browser modules
-        run: |
-          mkdir -p dist/browser
-          bun build ./src/browser/index.ts --outdir ./dist/browser --target browser
-          # Build individual modules for tree-shaking subpath imports
-          for mod in ratelimit mutex queue topic job scheduler ephemeral registry retry store; do
-            bun build ./src/browser/${mod}.ts --outdir ./dist/browser --target browser
-          done
+        run: bun build ./packages/sync/index.ts --outdir ./packages/sync/dist --target bun
 
       - name: Create dist package.json
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          cat > dist/package.json << EOF
+          VERSION=$(node -p "require('./packages/sync/package.json').version")
+          cat > packages/sync/dist/package.json << EOF
           {
             "name": "@valentinkolb/sync",
             "version": "$VERSION",
-            "description": "Synchronization primitives for TypeScript — server (Redis) and browser (in-memory)",
+            "description": "Distributed sync primitives for TypeScript and Bun",
             "main": "index.js",
             "module": "index.js",
             "types": "index.d.ts",
             "type": "module",
-            "sideEffects": false,
             "exports": {
               ".": {
                 "import": "./index.js",
                 "types": "./index.d.ts"
-              },
-              "./browser": {
-                "import": "./browser/index.js",
-                "types": "./browser/index.d.ts"
-              },
-              "./browser/ratelimit": { "import": "./browser/ratelimit.js", "types": "./browser/ratelimit.d.ts" },
-              "./browser/mutex": { "import": "./browser/mutex.js", "types": "./browser/mutex.d.ts" },
-              "./browser/queue": { "import": "./browser/queue.js", "types": "./browser/queue.d.ts" },
-              "./browser/topic": { "import": "./browser/topic.js", "types": "./browser/topic.d.ts" },
-              "./browser/job": { "import": "./browser/job.js", "types": "./browser/job.d.ts" },
-              "./browser/scheduler": { "import": "./browser/scheduler.js", "types": "./browser/scheduler.d.ts" },
-              "./browser/ephemeral": { "import": "./browser/ephemeral.js", "types": "./browser/ephemeral.d.ts" },
-              "./browser/registry": { "import": "./browser/registry.js", "types": "./browser/registry.d.ts" },
-              "./browser/retry": { "import": "./browser/retry.js", "types": "./browser/retry.d.ts" },
-              "./browser/store": { "import": "./browser/store.js", "types": "./browser/store.d.ts" }
+              }
             },
             "peerDependencies": {
               "zod": "^4"
             },
-            "keywords": ["bun", "redis", "ratelimit", "mutex", "jobs", "queue", "distributed", "browser", "local-first"],
+            "keywords": ["bun", "redis", "ratelimit", "mutex", "jobs", "queue", "distributed"],
             "author": "Valentin Kolb",
             "license": "MIT",
             "repository": {
@@ -132,17 +101,13 @@ jobs:
 
       - name: Copy package docs
         run: |
-          cp README.md dist/README.md
-          cp LICENSE dist/LICENSE
+          cp README.md packages/sync/dist/README.md
+          cp LICENSE packages/sync/dist/LICENSE
 
       - name: Generate type declarations
-        run: |
-          bunx tsc --declaration --emitDeclarationOnly --noEmit false --outDir dist
-          # tsc generates dist/src/browser/ but dist package.json expects dist/browser/
-          if [ -d "dist/src/browser" ]; then
-            cp -r dist/src/browser/* dist/browser/
-          fi
+        run: bunx tsc --project packages/sync/tsconfig.json --declaration --emitDeclarationOnly --noEmit false --outDir packages/sync/dist
 
-      - name: Publish to npm
+      - name: Publish @valentinkolb/sync
         run: npm publish --provenance --access public
-        working-directory: ./dist
+        working-directory: ./packages/sync/dist
+

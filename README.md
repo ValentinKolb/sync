@@ -1,11 +1,11 @@
 # @valentinkolb/sync
 
-Synchronization primitives for TypeScript — available in two flavors:
+Synchronization primitives for TypeScript — available as two packages:
 
-- **Server** (`@valentinkolb/sync`): backed by Redis (6.2+, Valkey, Dragonfly), built for [Bun](https://bun.sh). Designed for horizontally scaled systems where multiple service instances need coordinated access to shared state.
-- **Browser** (`@valentinkolb/sync/browser`): fully in-memory, zero dependencies beyond `zod`. Designed for local-first browser apps that need the same primitives (rate limiting, queues, schedulers) without a server.
+- **[`@valentinkolb/sync`](./packages/sync)**: backed by Redis (6.2+, Valkey, Dragonfly), built for [Bun](https://bun.sh). Designed for horizontally scaled systems where multiple service instances need coordinated access to shared state.
+- **[`@valentinkolb/sync-browser`](./packages/sync-browser)**: fully in-memory, zero dependencies beyond `zod`. Designed for local-first browser apps that need the same primitives (rate limiting, queues, schedulers) without a server.
 
-Both share the same API. Code written for one works on the other — just change the import path.
+Both share mostly the same API. Code written for one generally works on the other — just change the import. See [Differences between server and browser](#differences-between-server-and-browser) for the details.
 
 Provides nine modules: **ratelimit**, **mutex**, **queue**, **topic**, **job**, **scheduler**, **registry**, **ephemeral**, and **retry**. They work independently or compose — `job` uses `queue` + `topic` internally, `scheduler` uses `job` + `mutex`.
 
@@ -14,10 +14,13 @@ Requires `zod` as peer dependency for payload validation.
 ## Installation
 
 ```bash
+# Server (Redis-backed)
 bun add @valentinkolb/sync zod
-```
 
-Server modules use Redis for state. Browser modules use an in-memory store — no Redis needed.
+# Browser (in-memory, no Redis)
+bun add @valentinkolb/sync-browser zod
+# or: npm install @valentinkolb/sync-browser zod
+```
 
 ### Agent Skills (optional)
 
@@ -358,19 +361,19 @@ Long-lived stream loops (`stream({ wait: true })`, `live()`) use transport retri
 
 ---
 
-## Browser
+## Browser (`@valentinkolb/sync-browser`)
 
-All nine modules are available as a browser-compatible build with no Redis dependency. State lives in-memory (JS heap) and is lost on page refresh.
+All nine modules are available as a separate browser-compatible package. State lives in-memory by default, or in `localStorage` for persistence.
 
 ```ts
-import { queue, ratelimit, mutex, topic, ephemeral, registry, job, scheduler, retry } from "@valentinkolb/sync/browser";
+import { queue, ratelimit, scheduler, createLocalStorageStore } from "@valentinkolb/sync-browser";
 ```
 
-The API is identical to the server version — same factory pattern, same types, same methods. Just swap the import path.
+The API is identical to the server version. Just use `@valentinkolb/sync-browser` instead of `@valentinkolb/sync`.
 
 ```ts
 import { z } from "zod";
-import { queue } from "@valentinkolb/sync/browser";
+import { queue } from "@valentinkolb/sync-browser";
 
 const q = queue({
   id: "tasks",
@@ -389,19 +392,19 @@ for await (const msg of q.stream({ wait: false })) {
 
 | | Server | Browser |
 |---|---|---|
+| **Package** | `@valentinkolb/sync` | `@valentinkolb/sync-browser` |
 | **State** | Redis | JS heap (default) or localStorage |
 | **Atomicity** | Lua scripts | JS single-threading |
 | **Blocking reads** | Redis `BRPOPLPUSH` / `XREAD BLOCK` | Promise-based event emitters |
 | **TTL** | Redis key expiry + reconciliation | `setTimeout` callbacks |
 | **Cross-process** | Yes (multi-pod) | No (single-tab) |
-| **Long identifier hashing** | SHA-256 | djb2 (non-cryptographic) |
 
 ### Store abstraction
 
 Browser modules use a `MemoryStore` by default (state lost on refresh). For persistence across tab reloads, use `LocalStorageStore`:
 
 ```ts
-import { scheduler, job, createLocalStorageStore } from "@valentinkolb/sync/browser";
+import { scheduler, job, createLocalStorageStore } from "@valentinkolb/sync-browser";
 
 // Scheduler with persistence — catches up missed runs after tab reopen
 const sched = scheduler({
@@ -413,7 +416,7 @@ const sched = scheduler({
 Two built-in implementations:
 
 ```ts
-import { createMemoryStore, createLocalStorageStore } from "@valentinkolb/sync/browser";
+import { createMemoryStore, createLocalStorageStore } from "@valentinkolb/sync-browser";
 
 createMemoryStore()              // default — fast, lost on refresh
 createLocalStorageStore()        // persistent — survives tab close (~5MB limit)
@@ -435,6 +438,8 @@ interface Store {
 
 ## Development
 
+This is a Bun workspace monorepo:
+
 ```bash
 git clone https://github.com/valentinkolb/sync.git
 cd sync && bun install
@@ -444,38 +449,28 @@ Server tests require a Redis-compatible server on port 6399:
 
 ```bash
 docker run -d --name valkey -p 6399:6379 valkey/valkey:latest
-bun test --preload ./tests/preload.ts   # server integration tests
-bun run test:fault                       # fault-tolerance suites
-bun run test:all                         # all server tests
+cd packages/sync && bun test --preload ./tests/preload.ts
 ```
 
 Browser tests run without Redis:
 
 ```bash
-bun run test:browser                     # all browser tests (~210 tests)
+cd packages/sync-browser && bun test
 ```
 
 ### Project structure
 
 ```
-src/
-  ratelimit.ts       # Sliding window rate limiter
-  mutex.ts           # Distributed lock
-  queue.ts           # Durable work queue
-  topic.ts           # Pub/sub with consumer groups
-  job.ts             # Job processing (queue + topic)
-  scheduler.ts       # Distributed cron (job + mutex)
-  registry.ts        # Typed registry with prefix queries and CAS
-  ephemeral.ts       # TTL-based ephemeral store
-  retry.ts           # Transport-aware retry utility
-  internal/          # Cron parsing, job/topic helpers (pure JS, shared)
-  browser/           # Browser-compatible in-memory implementations
-    store.ts         # Store interface + MemoryStore
-    internal/        # sleep, emitter, event-log, id utilities
-    *.ts             # One file per module (same API as server)
-tests/               # Server integration + unit tests (require Redis)
-tests/browser/       # Browser tests (no Redis needed)
-skills/              # Agent skills with per-feature API references
+packages/
+  sync/                  # @valentinkolb/sync (server, Redis)
+    index.ts
+    src/                 # Module implementations
+    tests/               # Integration + unit tests (require Redis)
+  sync-browser/          # @valentinkolb/sync-browser (browser, in-memory)
+    index.ts
+    src/                 # Module implementations
+    tests/               # Browser tests (no Redis)
+skills/                  # Agent skills with per-feature API references
 ```
 
 ### Guidelines
@@ -484,7 +479,39 @@ skills/              # Agent skills with per-feature API references
 - Browser: JS single-threading provides atomicity — no locks needed.
 - All modules follow the `moduleName({ id, ...config })` factory pattern.
 - Validate at boundaries, trust internal data.
-- Server tests go in `tests/`. Browser tests go in `tests/browser/`.
+
+## Differences between server and browser
+
+The two packages target fundamentally different environments. While the factory signatures and method names are the same, there are semantic differences worth understanding.
+
+### Consistency & scope
+
+| | Server (`@valentinkolb/sync`) | Browser (`@valentinkolb/sync-browser`) |
+|---|---|---|
+| **Scope** | Multi-process, multi-pod | Single tab |
+| **Atomicity** | Redis Lua scripts — atomic across all clients | JS single-threading — atomic within one tab, no cross-tab coordination |
+| **Mutex** | True distributed lock across pods | In-tab async coordination only. Useful for serializing concurrent `fetch()` calls or IndexedDB writes, not for cross-tab locking |
+| **Topic consumer groups** | Real consumer groups with pending entry tracking, load-balanced across consumers, `commit()` advances group cursor | Simplified: each reader tracks its own cursor, `commit()` is a no-op. Two readers in the same group both see all events |
+| **Job durability** | State survives process restarts (Redis-backed) | State lives in JS heap — lost on page refresh unless scheduler uses a persistent store |
+| **Scheduler leader election** | Real leader election across pods via mutex | Trivially succeeds (single tab = always leader) |
+
+### State persistence
+
+| | Server | Browser |
+|---|---|---|
+| **Default** | Redis — survives restarts | `MemoryStore` — lost on refresh |
+| **Persistent option** | n/a (Redis is always persistent) | `createLocalStorageStore()` — survives tab close, ~5MB limit, main-thread only |
+| **Custom backends** | n/a | Implement the `Store` interface for IndexedDB, sessionStorage, etc. |
+
+The browser scheduler persists `lastRunAt` timestamps in the store. On tab reopen, `register()` reads the persisted timestamp and applies the misfire policy (skip / catch_up_one / catch_up_all) to catch up missed runs. Cron expression, handler, input, and misfire policy always come from code — only `lastRunAt` is persisted.
+
+### Other differences
+
+- **Hashing**: long identifiers (>128 chars) in ratelimit/mutex use SHA-256 on server, djb2 on browser. Different hash = different key — don't mix environments for the same logical resource.
+- **Blocking reads**: server uses dedicated Redis connections (`BRPOPLPUSH`, `XREAD BLOCK`). Browser uses `Promise`-based event emitters with `setTimeout` for timeouts.
+- **TTL precision**: server relies on Redis key expiry (millisecond precision). Browser uses `setTimeout` which may be throttled in background tabs (~1s minimum in most browsers). Misfire policies compensate for this.
+- **Transport retries**: server `stream({ wait: true })` auto-retries transient Redis connection errors. Browser streams don't retry since there is no network involved.
+- **`localStorage` caveats**: `LocalStorageStore` is synchronous and main-thread only. It may throw `SecurityError` in sandboxed iframes or private browsing modes. It does not coordinate TTL timers across tabs — two tabs with the same store prefix can interfere.
 
 ## License
 

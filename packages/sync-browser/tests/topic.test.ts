@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { z } from "zod";
-import { topic } from "../../src/browser/topic";
-import { createMemoryStore } from "../../src/browser/store";
+import { topic } from "../src/topic";
+import { createMemoryStore } from "../src/store";
 
 // ==========================
 // pub + recv basics

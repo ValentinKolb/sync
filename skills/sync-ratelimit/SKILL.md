@@ -1,6 +1,6 @@
 ---
 name: sync-ratelimit
-description: "Use this skill when working with @valentinkolb/sync rate limiting in Bun/TypeScript: creating per-identifier sliding-window limiters, choosing check() vs checkOrThrow(), handling RateLimitError with resetIn/Retry-After headers, tuning window size, and reasoning about Redis key layout. Also works in the browser via `@valentinkolb/sync/browser` with an in-memory store — same API, no Redis needed."
+description: "Use this skill when working with @valentinkolb/sync rate limiting in Bun/TypeScript: creating per-identifier sliding-window limiters, choosing check() vs checkOrThrow(), handling RateLimitError with resetIn/Retry-After headers, tuning window size, and reasoning about Redis key layout. Also works in the browser via `@valentinkolb/sync-browser` with an in-memory store — same API, no Redis needed."
 ---
 
 # Sync RateLimit
@@ -25,7 +25,7 @@ Atomic sliding-window rate limiter. Server version uses Redis Lua, browser versi
 ## Browser
 
 ```ts
-import { ratelimit, RateLimitError } from "@valentinkolb/sync/browser";
+import { ratelimit, RateLimitError } from "@valentinkolb/sync-browser";
 ```
 
 Same API. The `store` config option lets you inject a custom store (default: `MemoryStore`). Use `createLocalStorageStore()` for persistence across tab reloads. Browser-specific notes:

@@ -3,7 +3,7 @@
 ## Browser
 
 ```ts
-import { registry, RegistryCapacityError, RegistryPayloadTooLargeError } from "@valentinkolb/sync/browser";
+import { registry, RegistryCapacityError, RegistryPayloadTooLargeError } from "@valentinkolb/sync-browser";
 
 const reg = registry({
   id: "services",

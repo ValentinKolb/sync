@@ -3,7 +3,7 @@
 ## Browser
 
 ```ts
-import { job } from "@valentinkolb/sync/browser";
+import { job } from "@valentinkolb/sync-browser";
 
 const worker = job({
   id: "process-data",

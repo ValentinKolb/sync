@@ -1,0 +1,29 @@
+{
+  "name": "@valentinkolb/sync-browser",
+  "version": "3.0.1",
+  "description": "Browser-compatible sync primitives — in-memory ratelimit, mutex, queue, topic, job, scheduler, registry, ephemeral, retry",
+  "module": "index.ts",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./index.ts",
+    "./ratelimit": "./src/ratelimit.ts",
+    "./mutex": "./src/mutex.ts",
+    "./queue": "./src/queue.ts",
+    "./topic": "./src/topic.ts",
+    "./job": "./src/job.ts",
+    "./scheduler": "./src/scheduler.ts",
+    "./ephemeral": "./src/ephemeral.ts",
+    "./registry": "./src/registry.ts",
+    "./retry": "./src/retry.ts",
+    "./store": "./src/store.ts"
+  },
+  "scripts": {
+    "test": "bun test tests/*.test.ts",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "peerDependencies": {
+    "typescript": "^5",
+    "zod": "^4"
+  }
+}

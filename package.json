@@ -1,36 +1,16 @@
 {
-  "name": "@valentinkolb/sync",
-  "version": "3.0.1",
-  "description": "Distributed sync primitives for TypeScript and Bun (ratelimit, mutex, queue, topic, job, scheduler, registry, ephemeral, retry)",
-  "module": "index.ts",
-  "type": "module",
-  "sideEffects": false,
-  "exports": {
-    ".": "./index.ts",
-    "./browser": "./src/browser/index.ts",
-    "./browser/ratelimit": "./src/browser/ratelimit.ts",
-    "./browser/mutex": "./src/browser/mutex.ts",
-    "./browser/queue": "./src/browser/queue.ts",
-    "./browser/topic": "./src/browser/topic.ts",
-    "./browser/job": "./src/browser/job.ts",
-    "./browser/scheduler": "./src/browser/scheduler.ts",
-    "./browser/ephemeral": "./src/browser/ephemeral.ts",
-    "./browser/registry": "./src/browser/registry.ts",
-    "./browser/retry": "./src/browser/retry.ts",
-    "./browser/store": "./src/browser/store.ts"
-  },
+  "name": "sync-workspace",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
-    "test": "bun test --preload ./tests/preload.ts",
-    "test:fault": "bun test --preload ./tests/preload.ts tests/fault-mutex.test.ts tests/fault-queue.test.ts tests/fault-jobs.test.ts tests/fault-scheduler.test.ts",
-    "test:all": "bun test --preload ./tests/preload.ts tests/*.test.ts",
-    "test:browser": "bun test tests/browser/*.test.ts"
-  },
-  "peerDependencies": {
-    "typescript": "^5",
-    "zod": "^4"
+    "test": "bun run --filter '*' test",
+    "typecheck": "bun run --filter '*' typecheck"
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "typescript": "^5",
     "zod": "^4.0.0"
   }
 }

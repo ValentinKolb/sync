@@ -3,7 +3,7 @@
 ## Browser
 
 ```ts
-import { ephemeral, EphemeralCapacityError, EphemeralPayloadTooLargeError } from "@valentinkolb/sync/browser";
+import { ephemeral, EphemeralCapacityError, EphemeralPayloadTooLargeError } from "@valentinkolb/sync-browser";
 
 const store = ephemeral({
   id: "presence",

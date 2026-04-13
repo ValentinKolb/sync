@@ -1,6 +1,6 @@
 ---
 name: sync-topic
-description: "Use this skill when implementing event streams with @valentinkolb/sync topic: publishing typed events with idempotency, consumer-group processing with commit for at-least-once delivery, live replay from any cursor, retention tuning, and multi-tenant stream isolation. Also use when choosing between topic (pub/sub events) vs queue (work distribution). Also works in the browser via `@valentinkolb/sync/browser` as an in-memory event bus — same API, no Redis needed."
+description: "Use this skill when implementing event streams with @valentinkolb/sync topic: publishing typed events with idempotency, consumer-group processing with commit for at-least-once delivery, live replay from any cursor, retention tuning, and multi-tenant stream isolation. Also use when choosing between topic (pub/sub events) vs queue (work distribution). Also works in the browser via `@valentinkolb/sync-browser` as an in-memory event bus — same API, no Redis needed."
 ---
 
 # Sync Topic
@@ -31,7 +31,7 @@ Typed event streams. Server version uses Redis Streams, browser version uses an 
 ## Browser
 
 ```ts
-import { topic } from "@valentinkolb/sync/browser";
+import { topic } from "@valentinkolb/sync-browser";
 ```
 
 Same API. Browser-specific notes:

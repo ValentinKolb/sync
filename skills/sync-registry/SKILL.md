@@ -1,6 +1,6 @@
 ---
 name: sync-registry
-description: "Use this skill when implementing typed service/config registries with @valentinkolb/sync registry: exact-key lookups, Redis-native prefix listing, compare-and-swap updates, optional TTL-backed liveness via touch(), snapshot-plus-cursor cache hydration, scoped change-stream readers for keys/prefixes/whole registry, and tombstone retention for expired entries. Also use when choosing between registry (name-addressable, CAS, prefix queries) vs ephemeral (TTL-only, simpler). Also works in the browser via `@valentinkolb/sync/browser` with in-memory state — same API, no Redis needed."
+description: "Use this skill when implementing typed service/config registries with @valentinkolb/sync registry: exact-key lookups, Redis-native prefix listing, compare-and-swap updates, optional TTL-backed liveness via touch(), snapshot-plus-cursor cache hydration, scoped change-stream readers for keys/prefixes/whole registry, and tombstone retention for expired entries. Also use when choosing between registry (name-addressable, CAS, prefix queries) vs ephemeral (TTL-only, simpler). Also works in the browser via `@valentinkolb/sync-browser` with in-memory state — same API, no Redis needed."
 ---
 
 # Sync Registry
@@ -40,7 +40,7 @@ On `overflow`, re-list and restart.
 ## Browser
 
 ```ts
-import { registry, RegistryCapacityError } from "@valentinkolb/sync/browser";
+import { registry, RegistryCapacityError } from "@valentinkolb/sync-browser";
 ```
 
 Same API (upsert/touch/remove/get/list/cas/reader). Browser-specific notes:

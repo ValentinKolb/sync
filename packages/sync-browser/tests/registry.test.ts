@@ -4,7 +4,7 @@ import {
   registry,
   RegistryCapacityError,
   RegistryPayloadTooLargeError,
-} from "../../src/browser/registry";
+} from "../src/registry";
 
 const schema = z.object({ name: z.string() });
 

@@ -3,7 +3,7 @@
 ## Browser
 
 ```ts
-import { scheduler, job, createLocalStorageStore } from "@valentinkolb/sync/browser";
+import { scheduler, job, createLocalStorageStore } from "@valentinkolb/sync-browser";
 
 const cleanupJob = job({ id: "cleanup", schema, process: handler });
 

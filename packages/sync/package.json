@@ -1,0 +1,20 @@
+{
+  "name": "@valentinkolb/sync",
+  "version": "3.0.2",
+  "description": "Distributed sync primitives for TypeScript and Bun — ratelimit, mutex, queue, topic, job, scheduler, registry, ephemeral, retry",
+  "module": "index.ts",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "bun test --preload ./tests/preload.ts",
+    "test:fault": "bun test --preload ./tests/preload.ts tests/fault-*.test.ts",
+    "test:all": "bun test --preload ./tests/preload.ts tests/*.test.ts",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "peerDependencies": {
+    "typescript": "^5",
+    "zod": "^4"
+  }
+}

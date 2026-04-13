@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
-import { mutex, LockError } from "../../src/browser/mutex";
-import { createMemoryStore } from "../../src/browser/store";
+import { mutex, LockError } from "../src/mutex";
+import { createMemoryStore } from "../src/store";
 
 // ==========================
 // Basic acquire / release
@@ -296,7 +296,7 @@ test("withLock releases lock even on error", async () => {
 // ==========================
 
 test("two mutex instances with shared store coordinate", async () => {
-  const { createMemoryStore } = await import("../../src/browser/store");
+  const { createMemoryStore } = await import("../src/store");
   const sharedStore = createMemoryStore();
   const m1 = mutex({ id: "shared", prefix: "test:mx", store: sharedStore, retryCount: 0 });
   const m2 = mutex({ id: "shared", prefix: "test:mx", store: sharedStore, retryCount: 0 });
@@ -321,7 +321,7 @@ test("two mutex instances with shared store coordinate", async () => {
 // ==========================
 
 test("release with stale lock value is a no-op after re-acquisition", async () => {
-  const { createMemoryStore } = await import("../../src/browser/store");
+  const { createMemoryStore } = await import("../src/store");
   const sharedStore = createMemoryStore();
   const m = mutex({ id: "stale", prefix: "test:mx", store: sharedStore, defaultTtl: 100, retryCount: 0 });
 
@@ -346,7 +346,7 @@ test("release with stale lock value is a no-op after re-acquisition", async () =
 });
 
 test("extend with stale lock value returns false after re-acquisition", async () => {
-  const { createMemoryStore } = await import("../../src/browser/store");
+  const { createMemoryStore } = await import("../src/store");
   const sharedStore = createMemoryStore();
   const m = mutex({ id: "stale-ext", prefix: "test:mx", store: sharedStore, defaultTtl: 100, retryCount: 0 });
 

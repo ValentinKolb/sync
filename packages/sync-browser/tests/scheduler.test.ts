@@ -1,7 +1,7 @@
 import { test, expect } from "bun:test";
 import { z } from "zod";
-import { scheduler } from "../../src/browser/scheduler";
-import { job } from "../../src/browser/job";
+import { scheduler } from "../src/scheduler";
+import { job } from "../src/job";
 
 // ==========================
 // Helpers
@@ -626,7 +626,7 @@ test("strict handlers: missing handler causes dispatch skip and leadership relin
 // ==========================
 
 test("register resumes from persisted lastRunAt (simulates tab reopen)", async () => {
-  const { createMemoryStore } = await import("../../src/browser/store");
+  const { createMemoryStore } = await import("../src/store");
 
   // Shared store simulates persistence across "tab sessions"
   const persistentStore = createMemoryStore();
@@ -712,7 +712,7 @@ test("register resumes from persisted lastRunAt (simulates tab reopen)", async (
 });
 
 test("register with changed cron uses new cron from code (code = source of truth)", async () => {
-  const { createMemoryStore } = await import("../../src/browser/store");
+  const { createMemoryStore } = await import("../src/store");
   const persistentStore = createMemoryStore();
   const schedId = uid("cron-change");
 
@@ -901,7 +901,7 @@ test("stop is idempotent", async () => {
 });
 
 test("unregister cleans up persisted lastRunAt from store", async () => {
-  const { createMemoryStore } = await import("../../src/browser/store");
+  const { createMemoryStore } = await import("../src/store");
   const persistentStore = createMemoryStore();
   const schedId = uid("unreg-persist");
   const w = makeWorker(uid("unreg-worker"));

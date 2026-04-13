@@ -2,7 +2,7 @@ import { mutex, type Lock } from "./mutex";
 import { type Store, createMemoryStore } from "./store";
 import { retry } from "./retry";
 import { sleep } from "./internal/sleep";
-import { assertValidTimeZone, nextCronTimestamp, type MisfirePolicy } from "../internal/cron";
+import { assertValidTimeZone, nextCronTimestamp, type MisfirePolicy } from "./internal/cron";
 
 const DEFAULT_PREFIX = "sync:scheduler";
 const DAY_MS = 24 * 60 * 60 * 1000;

@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, describe } from "bun:test";
-import { MemoryStore } from "../../src/browser/store";
+import { MemoryStore } from "../src/store";
 
 let store: MemoryStore;
 
@@ -240,7 +240,7 @@ const createLocalStorageMock = () => {
   } as unknown as Storage;
 };
 
-import { LocalStorageStore, createLocalStorageStore } from "../../src/browser/store";
+import { LocalStorageStore, createLocalStorageStore } from "../src/store";
 
 // We need to polyfill localStorage for Bun
 const originalLocalStorage = globalThis.localStorage;

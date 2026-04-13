@@ -1,6 +1,6 @@
 ---
 name: sync-job
-description: "Use this skill when implementing durable background jobs with @valentinkolb/sync job: defining typed process handlers with ctx.step/ctx.heartbeat/ctx.signal, submit/join/cancel flows, idempotent submission via key, retries with exponential backoff, lease timeouts, and per-job event streams for audit. Also use when choosing between job (durable execution with state) vs queue (simple work distribution). Also works in the browser via `@valentinkolb/sync/browser` with in-memory state — same API, no Redis needed."
+description: "Use this skill when implementing durable background jobs with @valentinkolb/sync job: defining typed process handlers with ctx.step/ctx.heartbeat/ctx.signal, submit/join/cancel flows, idempotent submission via key, retries with exponential backoff, lease timeouts, and per-job event streams for audit. Also use when choosing between job (durable execution with state) vs queue (simple work distribution). Also works in the browser via `@valentinkolb/sync-browser` with in-memory state — same API, no Redis needed."
 ---
 
 # Sync Job
@@ -44,7 +44,7 @@ process: async ({ ctx, input }) => {
 ## Browser
 
 ```ts
-import { job } from "@valentinkolb/sync/browser";
+import { job } from "@valentinkolb/sync-browser";
 ```
 
 Same API (submit/join/cancel/events/stop). Browser-specific notes:
