@@ -356,6 +356,128 @@ test("triggerNow dispatches job and increments metrics", async () => {
   }
 });
 
+test("triggerNow does not alter persisted lastRunAt", async () => {
+  const { createMemoryStore } = await import("../src/store");
+  const persistentStore = createMemoryStore();
+  const schedId = uid("manual-state");
+  const schedulerId = uid("manual-state-inst");
+  const worker = makeWorker(uid("manual-state-worker"));
+  const lastRunKey = `sync:scheduler:${schedulerId}:lastRun:${schedId}`;
+  const originalLastRunAt = Date.UTC(2026, 0, 1, 4, 0, 0);
+
+  persistentStore.set(lastRunKey, originalLastRunAt);
+
+  const s = scheduler({
+    id: schedulerId,
+    dispatch: { tickMs: 50 },
+    leader: { leaseMs: 2000, heartbeatMs: 200 },
+    store: persistentStore,
+  });
+
+  try {
+    await s.register({
+      id: schedId,
+      cron: "0 4 * * *",
+      tz: "UTC",
+      job: worker,
+      input: { run: true },
+      misfire: "catch_up_one",
+    });
+
+    await s.triggerNow({ id: schedId });
+
+    const persisted = persistentStore.get(lastRunKey) as { registeredAt: number; lastRunAt?: number };
+    expect(persisted.registeredAt).toBe(originalLastRunAt);
+    expect(persisted.lastRunAt).toBe(originalLastRunAt);
+  } finally {
+    await s.stop();
+    worker.stop();
+  }
+});
+
+test("register catches up a missed first run after tab reopen", async () => {
+  const { createMemoryStore } = await import("../src/store");
+  const originalNow = Date.now;
+  let fakeNow = Date.UTC(2026, 0, 1, 22, 30, 0);
+  Date.now = (): number => fakeNow;
+
+  const persistentStore = createMemoryStore();
+  const schedulerId = uid("first-missed-inst");
+  const schedId = uid("first-missed");
+  const stateKey = `sync:scheduler:${schedulerId}:lastRun:${schedId}`;
+  let runs = 0;
+
+  const worker = job({
+    id: uid("first-missed-worker"),
+    schema: taskSchema,
+    process: async () => {
+      runs += 1;
+      return true;
+    },
+  });
+
+  const s1 = scheduler({
+    id: schedulerId,
+    dispatch: { tickMs: 20 },
+    leader: { leaseMs: 500, heartbeatMs: 50 },
+    store: persistentStore,
+  });
+
+  let s2: ReturnType<typeof scheduler> | null = null;
+
+  try {
+    await s1.register({
+      id: schedId,
+      cron: "0 4 * * *",
+      tz: "UTC",
+      job: worker,
+      input: { run: true },
+      misfire: "catch_up_one",
+    });
+
+    const persistedBefore = persistentStore.get(stateKey) as { registeredAt: number; lastRunAt?: number };
+    expect(persistedBefore.registeredAt).toBe(fakeNow);
+    expect(persistedBefore.lastRunAt).toBeUndefined();
+
+    await s1.stop();
+
+    fakeNow = Date.UTC(2026, 0, 2, 10, 0, 0);
+
+    s2 = scheduler({
+      id: schedulerId,
+      dispatch: { tickMs: 20 },
+      leader: { leaseMs: 500, heartbeatMs: 50 },
+      store: persistentStore,
+    });
+
+    await s2.register({
+      id: schedId,
+      cron: "0 4 * * *",
+      tz: "UTC",
+      job: worker,
+      input: { run: true },
+      misfire: "catch_up_one",
+    });
+
+    const info = await s2.get({ id: schedId });
+    expect(info).not.toBeNull();
+    expect(info!.nextRunAt).toBe(Date.UTC(2026, 0, 2, 4, 0, 0));
+    expect(info!.nextRunAt).toBeLessThan(Date.now());
+
+    s2.start();
+    await waitUntil(() => runs === 1, 3_000);
+
+    const persistedAfter = persistentStore.get(stateKey) as { registeredAt: number; lastRunAt?: number };
+    expect(persistedAfter.registeredAt).toBe(Date.UTC(2026, 0, 1, 22, 30, 0));
+    expect(persistedAfter.lastRunAt).toBe(Date.UTC(2026, 0, 2, 4, 0, 0));
+  } finally {
+    Date.now = originalNow;
+    if (s2) await s2.stop();
+    await s1.stop();
+    worker.stop();
+  }
+});
+
 // ==========================
 // 12. register with different misfire policies stores correctly
 // ==========================
@@ -632,15 +754,17 @@ test("register resumes from persisted lastRunAt (simulates tab reopen)", async (
   const persistentStore = createMemoryStore();
   const schedId = uid("resume-sched");
   const workerId = uid("resume-worker");
+  const schedulerId = uid("resume-inst");
+  const stateKey = `sync:scheduler:${schedulerId}:lastRun:${schedId}`;
 
-  // --- Session 1: register, trigger, stop ---
+  // --- Session 1: register, persist prior scheduled run, stop ---
   const w1 = job({
     id: workerId,
     schema: taskSchema,
     process: async () => true,
   });
   const s1 = scheduler({
-    id: uid("resume-inst"),
+    id: schedulerId,
     dispatch: { tickMs: 50 },
     leader: { leaseMs: 2000, heartbeatMs: 200 },
     store: persistentStore,
@@ -655,19 +779,19 @@ test("register resumes from persisted lastRunAt (simulates tab reopen)", async (
     misfire: "catch_up_one",
   });
 
-  // Manual trigger to simulate a successful run
-  await s1.triggerNow({ id: schedId });
+  // Simulate the last successful scheduled run being persisted before tab close.
+  persistentStore.set(stateKey, Date.now() - 6 * 60 * 60 * 1000);
   await s1.stop();
   w1.stop();
 
-  // Verify lastRunAt was persisted
-  const lastRun = persistentStore.get(`sync:scheduler:${s1.id}:lastRun:${schedId}`) as number;
+  // Verify legacy numeric lastRunAt was persisted
+  const lastRun = persistentStore.get(stateKey) as number;
   expect(lastRun).toBeGreaterThan(0);
 
   // --- Simulate time passing (tab closed for 2 days) ---
   // Overwrite the persisted lastRunAt to 48 hours ago — guarantees multiple missed 6h slots
   const twoDaysAgo = Date.now() - 48 * 60 * 60 * 1000;
-  persistentStore.set(`sync:scheduler:${s1.id}:lastRun:${schedId}`, twoDaysAgo);
+  persistentStore.set(stateKey, twoDaysAgo);
 
   // --- Session 2: new scheduler, same store ---
   const w2 = job({
@@ -676,7 +800,7 @@ test("register resumes from persisted lastRunAt (simulates tab reopen)", async (
     process: async () => true,
   });
   const s2 = scheduler({
-    id: s1.id, // same scheduler ID!
+    id: schedulerId, // same scheduler ID!
     dispatch: { tickMs: 50 },
     leader: { leaseMs: 2000, heartbeatMs: 200 },
     store: persistentStore,
@@ -724,7 +848,7 @@ test("register with changed cron uses new cron from code (code = source of truth
 
   const sid = uid("cron-change-inst");
 
-  // Session 1: register with every-6h cron, trigger to persist lastRunAt
+  // Session 1: register with every-6h cron so scheduler state is persisted
   const s1 = scheduler({
     id: sid,
     dispatch: { tickMs: 50 },
@@ -737,7 +861,6 @@ test("register with changed cron uses new cron from code (code = source of truth
     job: w,
     input: { run: true },
   });
-  await s1.triggerNow({ id: schedId });
   await s1.stop();
 
   // Session 2: same schedule ID but DIFFERENT cron (every 12h)
@@ -919,9 +1042,8 @@ test("unregister cleans up persisted lastRunAt from store", async () => {
       job: w,
       input: { run: true },
     });
-    await s.triggerNow({ id: schedId });
 
-    // Verify lastRunAt was persisted
+    // Register should persist scheduler state immediately.
     const keys = persistentStore.keys(`sync:scheduler:${sid}:lastRun:`);
     expect(keys.length).toBeGreaterThan(0);
 

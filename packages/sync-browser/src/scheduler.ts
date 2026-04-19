@@ -55,6 +55,13 @@ type StoredSchedule = {
   lastDispatchError?: string;
 };
 
+type PersistedScheduleState = {
+  version: 1;
+  registeredAt: number;
+  lastRunAt?: number;
+  updatedAt: number;
+};
+
 type DispatchPlan = {
   slots: number[];
   nextRunAt: number;
@@ -101,7 +108,7 @@ export type SchedulerConfig = {
   };
   strictHandlers?: boolean;
   onMetric?: (metric: SchedulerMetric) => void;
-  /** Optional store for persisting lastRunAt timestamps across tab reloads.
+  /** Optional store for persisting scheduler state across tab reloads.
    *  Default: MemoryStore (state lost on refresh).
    *  Pass a localStorage-backed store to survive tab closes. */
   store?: Store;
@@ -258,7 +265,60 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const strictHandlers = config.strictHandlers ?? DEFAULT_STRICT_HANDLERS;
   const store = config.store ?? createMemoryStore();
 
-  const lastRunKey = (scheduleId: string): string => `${prefix}:${config.id}:lastRun:${scheduleId}`;
+  // Keep the legacy key path for backwards compatibility. Older versions stored a
+  // bare number here; newer versions store a small scheduler state object.
+  const scheduleStateKey = (scheduleId: string): string => `${prefix}:${config.id}:lastRun:${scheduleId}`;
+
+  const readPersistedScheduleState = (scheduleId: string): PersistedScheduleState | null => {
+    const raw = store.get(scheduleStateKey(scheduleId));
+    if (raw === undefined) return null;
+
+    if (typeof raw === "number" && Number.isFinite(raw)) {
+      return {
+        version: 1,
+        registeredAt: raw,
+        lastRunAt: raw,
+        updatedAt: raw,
+      };
+    }
+
+    if (!raw || typeof raw !== "object") return null;
+
+    const value = raw as Record<string, unknown>;
+    const registeredAt = value.registeredAt;
+    if (typeof registeredAt !== "number" || !Number.isFinite(registeredAt)) return null;
+
+    const lastRunAt = value.lastRunAt;
+    const updatedAt = value.updatedAt;
+    return {
+      version: 1,
+      registeredAt,
+      ...(typeof lastRunAt === "number" && Number.isFinite(lastRunAt) ? { lastRunAt } : {}),
+      updatedAt: typeof updatedAt === "number" && Number.isFinite(updatedAt) ? updatedAt : registeredAt,
+    };
+  };
+
+  const writePersistedScheduleState = (
+    scheduleId: string,
+    patch: {
+      registeredAt?: number;
+      lastRunAt?: number;
+      updatedAt?: number;
+    },
+  ): PersistedScheduleState => {
+    const current = readPersistedScheduleState(scheduleId);
+    const nextState: PersistedScheduleState = {
+      version: 1,
+      registeredAt: patch.registeredAt ?? current?.registeredAt ?? Date.now(),
+      updatedAt: patch.updatedAt ?? Date.now(),
+    };
+    const nextLastRunAt = patch.lastRunAt ?? current?.lastRunAt;
+    if (nextLastRunAt !== undefined) {
+      nextState.lastRunAt = nextLastRunAt;
+    }
+    store.set(scheduleStateKey(scheduleId), nextState);
+    return nextState;
+  };
 
   // Share a single mutex store across scheduler instances with the same ID
   // so that leader election actually coordinates between them.
@@ -498,7 +558,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         schedule.nextRunAt = plan.nextRunAt;
         schedule.updatedAt = Date.now();
         if (plan.slots.length > 0) {
-          store.set(lastRunKey(schedule.id), plan.slots[plan.slots.length - 1]!);
+          writePersistedScheduleState(schedule.id, {
+            lastRunAt: plan.slots[plan.slots.length - 1]!,
+            updatedAt: Date.now(),
+          });
         }
         continue;
       }
@@ -573,8 +636,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
           schedule.nextRunAt = nextCronTimestamp(schedule.cron, schedule.tz, lastSubmittedSlotTs);
           schedule.updatedAt = Date.now();
           scheduleToJobId.set(schedule.id, schedule.jobId);
-          // Persist lastRunAt so we can catch up after tab reopen
-          store.set(lastRunKey(schedule.id), lastSubmittedSlotTs);
+          writePersistedScheduleState(schedule.id, {
+            lastRunAt: lastSubmittedSlotTs,
+            updatedAt: Date.now(),
+          });
         }
         break;
       }
@@ -583,9 +648,12 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       schedule.nextRunAt = plan.nextRunAt;
       schedule.updatedAt = Date.now();
       scheduleToJobId.set(schedule.id, schedule.jobId);
-      // Persist lastRunAt — use the last slot from the plan (or now if no slots)
+      // Persist the last handled cron slot so tab reopen can resume accurately.
       if (plan.slots.length > 0) {
-        store.set(lastRunKey(schedule.id), plan.slots[plan.slots.length - 1]!);
+        writePersistedScheduleState(schedule.id, {
+          lastRunAt: plan.slots[plan.slots.length - 1]!,
+          updatedAt: Date.now(),
+        });
       }
     }
   };
@@ -628,12 +696,13 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     const maxCatchUpRuns = Math.max(1, cfg.maxCatchUpRuns ?? DEFAULT_MAX_CATCH_UP_RUNS);
 
     // Code is the source of truth for schedule definition.
-    // The store only persists lastRunAt so we can catch up after tab reopen.
-    const persistedLastRunAt = store.get(lastRunKey(cfg.id)) as number | undefined;
+    // The store only persists scheduler state so we can catch up after tab reopen.
+    const persistedState = readPersistedScheduleState(cfg.id);
 
-    // Compute nextRunAt: if we have a persisted lastRunAt, resume from there.
-    // Otherwise start fresh from now.
-    const resumeFrom = persistedLastRunAt ?? nowMs;
+    // Resume from the last handled cron slot when available. If the schedule has
+    // never run yet, fall back to the first time we registered it so the first
+    // missed run can still be caught up after a tab reopen.
+    const resumeFrom = persistedState?.lastRunAt ?? persistedState?.registeredAt ?? nowMs;
     const firstRunAt = nextCronTimestamp(cfg.cron, tz, resumeFrom);
 
     const existing = schedules.get(cfg.id);
@@ -655,8 +724,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
     // If re-registering in the same session with unchanged cron/tz AND
     // no persisted lastRunAt to recover from, keep the in-memory state.
-    // Persisted lastRunAt takes priority (cross-session recovery).
-    if (!persistedLastRunAt && existing && existing.cron === cfg.cron && existing.tz === tz) {
+    // Persisted scheduler state takes priority for cross-session recovery.
+    if (!persistedState?.lastRunAt && existing && existing.cron === cfg.cron && existing.tz === tz) {
       stored.nextRunAt = existing.nextRunAt;
       stored.consecutiveDispatchFailures = existing.consecutiveDispatchFailures;
       stored.lastFailedSlotTs = existing.lastFailedSlotTs;
@@ -671,6 +740,11 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
     const previousJobId = scheduleToJobId.get(cfg.id);
     scheduleToJobId.set(cfg.id, cfg.job.id);
+
+    writePersistedScheduleState(cfg.id, {
+      registeredAt: persistedState?.registeredAt ?? existing?.createdAt ?? nowMs,
+      updatedAt: nowMs,
+    });
 
     // Cleanup old job handler if no longer referenced
     if (previousJobId && previousJobId !== cfg.job.id) {
@@ -704,7 +778,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     const jobId = scheduleToJobId.get(cfg.id);
     schedules.delete(cfg.id);
     scheduleToJobId.delete(cfg.id);
-    store.del(lastRunKey(cfg.id));
+    store.del(scheduleStateKey(cfg.id));
 
     safeMetric(config.onMetric, {
       type: "schedule_unregistered",
@@ -764,8 +838,6 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         requireLeadership: false,
       });
       metricsState.triggerSubmitted += 1;
-      // Persist lastRunAt for manual triggers too
-      store.set(lastRunKey(schedule.id), Date.now());
       safeMetric(config.onMetric, {
         type: "trigger_submitted",
         ts: Date.now(),
