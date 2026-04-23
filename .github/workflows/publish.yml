@@ -41,8 +41,18 @@ jobs:
       - name: Run browser tests
         run: cd packages/sync-browser && bun test tests/*.test.ts
 
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile --registry=https://registry.npmjs.org
+      - name: Typecheck + parity
+        run: bun run typecheck
+
   publish-sync:
-    needs: [test-server, test-browser]
+    needs: [test-server, test-browser, parity]
     if: startsWith(github.ref, 'refs/tags/sync-v')
     runs-on: ubuntu-latest
     permissions:
@@ -75,7 +85,7 @@ jobs:
           {
             "name": "@valentinkolb/sync",
             "version": "$VERSION",
-            "description": "Distributed sync primitives for TypeScript and Bun",
+            "description": "Distributed sync primitives for TypeScript and Bun — ratelimit, mutex, queue, topic, job, scheduler, ephemeral, retry",
             "main": "index.js",
             "module": "index.js",
             "types": "index.d.ts",
@@ -86,10 +96,7 @@ jobs:
                 "types": "./index.d.ts"
               }
             },
-            "peerDependencies": {
-              "zod": "^4"
-            },
-            "keywords": ["bun", "redis", "ratelimit", "mutex", "jobs", "queue", "distributed"],
+            "keywords": ["bun", "redis", "valkey", "ratelimit", "mutex", "jobs", "queue", "topic", "scheduler", "ephemeral", "distributed"],
             "author": "Valentin Kolb",
             "license": "MIT",
             "repository": {
