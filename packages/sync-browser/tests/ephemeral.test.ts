@@ -4,18 +4,16 @@ import {
   EphemeralCapacityError,
   EphemeralPayloadTooLargeError,
 } from "../src/ephemeral";
-import { z } from "zod";
 
 // ==========================
 // Helpers
 // ==========================
 
-const schema = z.object({ status: z.string() });
+type TestValue = { status: string };
 
-const makeStore = (overrides?: Parameters<typeof ephemeral>[0]) =>
-  ephemeral({
+const makeStore = (overrides?: Parameters<typeof ephemeral<TestValue>>[0]) =>
+  ephemeral<TestValue>({
     id: "test",
-    schema,
     ttlMs: 2000,
     ...overrides,
   });
@@ -53,7 +51,7 @@ describe("upsert", () => {
   });
 
   test("custom ttlMs per upsert overrides default", async () => {
-    const store = makeStore({ id: "ttl-override", schema, ttlMs: 5000 });
+    const store = makeStore({ id: "ttl-override", ttlMs: 5000 });
     const entry = await store.upsert({
       key: "user1",
       value: { status: "online" },
@@ -130,7 +128,7 @@ describe("remove", () => {
 
 describe("TTL expiry", () => {
   test("entry disappears after ttlMs", async () => {
-    const store = makeStore({ id: "ttl-expiry", schema, ttlMs: 100 });
+    const store = makeStore({ id: "ttl-expiry", ttlMs: 100 });
     await store.upsert({ key: "temp", value: { status: "fleeting" } });
 
     const snapBefore = await store.snapshot();
@@ -183,7 +181,7 @@ describe("capacity limit", () => {
   test("EphemeralCapacityError thrown when maxEntries reached", async () => {
     const store = makeStore({
       id: "cap-test",
-      schema,
+      
       ttlMs: 2000,
       limits: { maxEntries: 2 },
     });
@@ -209,7 +207,7 @@ describe("payload size limit", () => {
   test("EphemeralPayloadTooLargeError thrown for oversized payload", async () => {
     const store = makeStore({
       id: "payload-test",
-      schema,
+      
       ttlMs: 2000,
       limits: { maxPayloadBytes: 32 },
     });
@@ -288,7 +286,7 @@ describe("reader", () => {
   });
 
   test("receives expire events after TTL", async () => {
-    const store = makeStore({ id: "expire-reader", schema, ttlMs: 100 });
+    const store = makeStore({ id: "expire-reader", ttlMs: 100 });
 
     const reader = store.reader({ after: "0" });
 
@@ -328,7 +326,6 @@ describe("reader", () => {
 test("different tenants are isolated", async () => {
   const store = ephemeral({
     id: `tenant-iso-${Date.now()}`,
-    schema: z.object({ status: z.string() }),
     ttlMs: 5000,
   });
 
@@ -347,7 +344,6 @@ test("different tenants are isolated", async () => {
 test("reader recv with wait false returns null when no events pending", async () => {
   const store = ephemeral({
     id: `reader-empty-${Date.now()}`,
-    schema: z.object({ status: z.string() }),
     ttlMs: 5000,
   });
   const reader = store.reader();
@@ -362,7 +358,6 @@ test("reader recv with wait false returns null when no events pending", async ()
 test("reader receives overflow event when cursor falls behind", async () => {
   const store = ephemeral({
     id: `overflow-${Date.now()}`,
-    schema: z.object({ status: z.string() }),
     ttlMs: 60_000,
     limits: { eventMaxLen: 3 }, // very small event log
   });
@@ -387,21 +382,9 @@ test("reader receives overflow event when cursor falls behind", async () => {
   expect(event).not.toBeNull();
 });
 
-test("upsert validates schema and rejects invalid data", async () => {
-  const store = ephemeral({
-    id: `schema-${Date.now()}`,
-    schema: z.object({ status: z.string() }),
-    ttlMs: 5_000,
-  });
-  await expect(
-    store.upsert({ key: "k", value: { status: 123 } as any })
-  ).rejects.toThrow();
-});
-
 test("empty key throws", async () => {
   const store = ephemeral({
     id: `empty-key-${Date.now()}`,
-    schema: z.object({ status: z.string() }),
     ttlMs: 5_000,
   });
   await expect(
@@ -413,8 +396,99 @@ test("ttlMs <= 0 on factory throws", () => {
   expect(() =>
     ephemeral({
       id: `bad-ttl-${Date.now()}`,
-      schema: z.object({ s: z.string() }),
       ttlMs: 0,
     })
   ).toThrow("ttlMs must be > 0");
+});
+
+// ==========================
+// Prefix filter — snapshot
+// ==========================
+
+describe("prefix filter", () => {
+  test("snapshot with prefix returns only matching entries", async () => {
+    const store = ephemeral<{ v: number }>({
+      id: `prefix-snap-${Date.now()}`,
+      ttlMs: 5_000,
+    });
+
+    await store.upsert({ key: "apps/backend", value: { v: 1 } });
+    await store.upsert({ key: "apps/frontend", value: { v: 2 } });
+    await store.upsert({ key: "services/cache", value: { v: 3 } });
+
+    const appsOnly = await store.snapshot({ prefix: "apps/" });
+    expect(appsOnly.entries.map((e) => e.key).sort()).toEqual(["apps/backend", "apps/frontend"]);
+
+    const servicesOnly = await store.snapshot({ prefix: "services/" });
+    expect(servicesOnly.entries).toHaveLength(1);
+    expect(servicesOnly.entries[0]?.key).toBe("services/cache");
+
+    const all = await store.snapshot();
+    expect(all.entries).toHaveLength(3);
+
+    const empty = await store.snapshot({ prefix: "none/" });
+    expect(empty.entries).toHaveLength(0);
+  });
+
+  test("snapshot prefix respects tenantId isolation", async () => {
+    const store = ephemeral<{ v: number }>({
+      id: `prefix-tenant-${Date.now()}`,
+      ttlMs: 5_000,
+    });
+
+    await store.upsert({ tenantId: "t1", key: "apps/a", value: { v: 1 } });
+    await store.upsert({ tenantId: "t2", key: "apps/a", value: { v: 99 } });
+
+    const t1 = await store.snapshot({ tenantId: "t1", prefix: "apps/" });
+    expect(t1.entries).toHaveLength(1);
+    expect(t1.entries[0]?.value.v).toBe(1);
+
+    const t2 = await store.snapshot({ tenantId: "t2", prefix: "apps/" });
+    expect(t2.entries).toHaveLength(1);
+    expect(t2.entries[0]?.value.v).toBe(99);
+  });
+
+  test("reader with prefix only yields events for matching keys", async () => {
+    const store = ephemeral<{ v: number }>({
+      id: `prefix-reader-${Date.now()}`,
+      ttlMs: 5_000,
+    });
+
+    const r = store.reader({ prefix: "apps/" });
+
+    const p1 = r.recv({ wait: true, timeoutMs: 500 });
+    await store.upsert({ key: "apps/a", value: { v: 1 } });
+    const ev1 = await p1;
+    expect(ev1?.type).toBe("upsert");
+    if (ev1?.type === "upsert") expect(ev1.entry.key).toBe("apps/a");
+
+    // Non-matching upsert: reader should skip and wait for next matching
+    const p2 = r.recv({ wait: true, timeoutMs: 500 });
+    await store.upsert({ key: "services/cache", value: { v: 2 } });
+    await store.upsert({ key: "apps/b", value: { v: 3 } });
+    const ev2 = await p2;
+    expect(ev2?.type).toBe("upsert");
+    if (ev2?.type === "upsert") expect(ev2.entry.key).toBe("apps/b");
+  });
+
+  test("reader without prefix yields all events (baseline)", async () => {
+    const store = ephemeral<{ v: number }>({
+      id: `noprefix-reader-${Date.now()}`,
+      ttlMs: 5_000,
+    });
+
+    const r = store.reader();
+
+    const p1 = r.recv({ wait: true, timeoutMs: 500 });
+    await store.upsert({ key: "apps/a", value: { v: 1 } });
+    const ev1 = await p1;
+    expect(ev1?.type).toBe("upsert");
+    if (ev1?.type === "upsert") expect(ev1.entry.key).toBe("apps/a");
+
+    const p2 = r.recv({ wait: true, timeoutMs: 500 });
+    await store.upsert({ key: "services/cache", value: { v: 2 } });
+    const ev2 = await p2;
+    expect(ev2?.type).toBe("upsert");
+    if (ev2?.type === "upsert") expect(ev2.entry.key).toBe("services/cache");
+  });
 });

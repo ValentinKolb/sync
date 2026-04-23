@@ -1,6 +1,5 @@
 import { beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { z } from "zod";
 import { queue } from "../index";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -21,7 +20,6 @@ test("concurrent ack/nack/touch on same delivery — exactly one ack or nack suc
     const q = queue({
       id: uid("race-trio"),
       prefix: "test:fq",
-      schema: z.object({ v: z.number() }),
     });
 
     await q.send({ data: { v: round } });
@@ -50,7 +48,6 @@ test("multiple readers racing on same queue — each message delivered exactly o
   const q = queue({
     id: uid("multi-reader"),
     prefix: "test:fq",
-    schema: z.object({ idx: z.number() }),
   });
 
   const count = 50;
@@ -83,7 +80,6 @@ test("maintenance handles delayed expiry, lease expiry, and max deliveries in on
   const q = queue({
     id: uid("maint-combo"),
     prefix: "test:fq",
-    schema: z.object({ id: z.string() }),
     delivery: { maxDeliveries: 2, defaultLeaseMs: 40 },
     limits: { maxMessageAgeMs: 200 },
   });
@@ -136,7 +132,6 @@ test("idempotency key expiry at send time allows new message", async () => {
   const q = queue({
     id: uid("idem-boundary"),
     prefix: "test:fq",
-    schema: z.object({ v: z.number() }),
   });
 
   const first = await q.send({ data: { v: 1 }, idempotencyKey: "k", idempotencyTtlMs: 50 });
@@ -163,7 +158,6 @@ test("concurrent sends with same idempotency key during TTL expiry boundary", as
   const q = queue({
     id: uid("idem-race-boundary"),
     prefix: "test:fq",
-    schema: z.object({ v: z.number() }),
   });
 
   // Set a very short TTL
@@ -209,7 +203,6 @@ test("recv skips message with corrupted payload and does not block queue", async
   const q = queue({
     id: qId,
     prefix: "test:fq",
-    schema: z.object({ v: z.number() }),
   });
 
   // Send a valid message to get a message ID
@@ -242,7 +235,6 @@ test("many delayed messages becoming due at once are all eventually delivered", 
   const q = queue({
     id: uid("burst"),
     prefix: "test:fq",
-    schema: z.object({ idx: z.number() }),
   });
 
   const count = 30;
@@ -279,7 +271,6 @@ test("touch after ack returns false", async () => {
   const q = queue({
     id: uid("touch-after-ack"),
     prefix: "test:fq",
-    schema: z.object({ v: z.number() }),
   });
 
   await q.send({ data: { v: 1 } });
@@ -294,7 +285,6 @@ test("touch after nack returns false", async () => {
   const q = queue({
     id: uid("touch-after-nack"),
     prefix: "test:fq",
-    schema: z.object({ v: z.number() }),
   });
 
   await q.send({ data: { v: 1 } });
@@ -318,7 +308,6 @@ test("message that ages out while in delayed queue goes to DLQ", async () => {
   const q = queue({
     id: qId,
     prefix: "test:fq",
-    schema: z.object({ v: z.number() }),
     limits: { maxMessageAgeMs: 60 },
   });
 
@@ -352,7 +341,6 @@ test("nacked message is redelivered after all ready messages", async () => {
   const q = queue({
     id: uid("nack-order"),
     prefix: "test:fq",
-    schema: z.object({ seq: z.number() }),
   });
 
   await q.send({ data: { seq: 1 } });
@@ -384,7 +372,6 @@ test("rapid lease expiry cycle — message survives multiple lease expirations",
   const q = queue({
     id: uid("lease-cycle"),
     prefix: "test:fq",
-    schema: z.object({ v: z.number() }),
     delivery: { maxDeliveries: 5, defaultLeaseMs: 30 },
   });
 

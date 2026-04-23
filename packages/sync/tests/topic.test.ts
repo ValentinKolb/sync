@@ -1,6 +1,5 @@
 import { beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { z } from "zod";
 import { topic } from "../index";
 
 beforeEach(async () => {
@@ -14,7 +13,6 @@ test("pub + reader.recv + commit", async () => {
   const t = topic({
     id: "orders",
     prefix: "test:t",
-    schema: z.object({ type: z.string(), orderId: z.string() }),
   });
 
   await t.pub({ data: { type: "order.confirmed", orderId: "o1" } });
@@ -31,7 +29,6 @@ test("different groups consume same event independently", async () => {
   const t = topic({
     id: "events",
     prefix: "test:t",
-    schema: z.object({ value: z.number() }),
   });
 
   await t.pub({ data: { value: 7 } });
@@ -49,7 +46,6 @@ test("reader.stream consumes available events", async () => {
   const t = topic({
     id: "stream",
     prefix: "test:t",
-    schema: z.object({ idx: z.number() }),
   });
 
   await t.pub({ data: { idx: 1 } });
@@ -70,7 +66,6 @@ test("reader() defaults to default group", async () => {
   const t = topic({
     id: "default-group",
     prefix: "test:t",
-    schema: z.object({ ok: z.boolean() }),
   });
 
   const reader = t.reader();
@@ -81,7 +76,6 @@ test("live receives newly published event", async () => {
   const t = topic({
     id: "live",
     prefix: "test:t",
-    schema: z.object({ n: z.number() }),
   });
 
   const iterator = t.live({ timeoutMs: 1_000 })[Symbol.asyncIterator]();
@@ -103,7 +97,6 @@ test("reader.recv returns null when no event exists", async () => {
   const t = topic({
     id: "empty",
     prefix: "test:t",
-    schema: z.object({ id: z.string() }),
   });
 
   const message = await t.reader("none").recv({ wait: false });
@@ -114,7 +107,6 @@ test("pub idempotency key deduplicates events", async () => {
   const t = topic({
     id: "idempotency",
     prefix: "test:t",
-    schema: z.object({ id: z.string() }),
   });
 
   const a = await t.pub({ data: { id: "a" }, idempotencyKey: "k" });
@@ -135,7 +127,6 @@ test("commit can only acknowledge once", async () => {
   const t = topic({
     id: "commit-once",
     prefix: "test:t",
-    schema: z.object({ n: z.number() }),
   });
 
   await t.pub({ data: { n: 1 } });
@@ -149,7 +140,6 @@ test("live stops when signal is aborted", async () => {
   const t = topic({
     id: "live-abort",
     prefix: "test:t",
-    schema: z.object({ n: z.number() }),
   });
 
   const ac = new AbortController();
@@ -174,7 +164,6 @@ test("reader.stream stops when signal is aborted", async () => {
   const t = topic({
     id: "stream-abort",
     prefix: "test:t",
-    schema: z.object({ v: z.number() }),
   });
 
   await t.pub({ data: { v: 10 } });
@@ -197,7 +186,6 @@ test("parallel pub with same idempotency key deduplicates", async () => {
   const t = topic({
     id: "parallel-idem",
     prefix: "test:t",
-    schema: z.object({ id: z.string() }),
   });
 
   const results = await Promise.all(
@@ -222,7 +210,6 @@ test("uncommitted message is redelivered to same group", async () => {
   const t = topic({
     id: "redeliver",
     prefix: "test:t",
-    schema: z.object({ v: z.number() }),
   });
 
   await t.pub({ data: { v: 42 } });
@@ -247,7 +234,6 @@ test("tenant isolation separates topic streams", async () => {
   const t = topic({
     id: "tenant-iso",
     prefix: "test:t",
-    schema: z.object({ value: z.string() }),
   });
 
   await t.pub({ tenantId: "t1", data: { value: "alpha" } });
@@ -274,7 +260,6 @@ test("payload exceeding size limit is rejected on pub", async () => {
   const t = topic({
     id: "pub-limit",
     prefix: "test:t",
-    schema: z.object({ data: z.string() }),
     limits: { payloadBytes: 64 },
   });
 
@@ -289,29 +274,10 @@ test("payload exceeding size limit is rejected on pub", async () => {
   expect((thrown as Error).message).toContain("payload exceeds limit");
 });
 
-test("pub rejects data that fails schema validation", async () => {
-  const t = topic({
-    id: "pub-validate",
-    prefix: "test:t",
-    schema: z.object({ count: z.number().min(0) }),
-  });
-
-  let thrown: unknown = null;
-  try {
-    // @ts-expect-error intentional invalid type
-    await t.pub({ data: { count: "not-a-number" } });
-  } catch (error) {
-    thrown = error;
-  }
-
-  expect(thrown).not.toBeNull();
-});
-
 test("meta and orderingKey are preserved through pub/recv", async () => {
   const t = topic({
     id: "meta-ordering",
     prefix: "test:t",
-    schema: z.object({ v: z.number() }),
   });
 
   await t.pub({
@@ -334,7 +300,6 @@ test("live cursor advances correctly across multiple events", async () => {
   const t = topic({
     id: "live-cursor",
     prefix: "test:t",
-    schema: z.object({ n: z.number() }),
   });
 
   await t.pub({ data: { n: 1 } });
@@ -356,7 +321,6 @@ test("idempotency key expires after ttl on pub", async () => {
   const t = topic({
     id: "idem-ttl",
     prefix: "test:t",
-    schema: z.object({ v: z.number() }),
   });
 
   const a = await t.pub({ data: { v: 1 }, idempotencyKey: "expire-me", idempotencyTtlMs: 40 });
@@ -378,7 +342,6 @@ test("live can replay from explicit cursor", async () => {
   const t = topic({
     id: "live-after",
     prefix: "test:t",
-    schema: z.object({ value: z.number() }),
   });
 
   await t.pub({ data: { value: 9 } });
@@ -402,7 +365,6 @@ test("two consumers in same group split messages without duplicates", async () =
   const t = topic({
     id: "same-group-split",
     prefix: "test:t",
-    schema: z.object({ idx: z.number() }),
   });
 
   const count = 20;
@@ -433,7 +395,6 @@ test("rapid burst during live iteration — no duplicates or gaps", async () => 
   const t = topic({
     id: "live-burst",
     prefix: "test:t",
-    schema: z.object({ n: z.number() }),
   });
 
   const ac = new AbortController();
@@ -469,7 +430,6 @@ test("concurrent first-recv on new group does not throw", async () => {
   const t = topic({
     id: "concurrent-group-create",
     prefix: "test:t",
-    schema: z.object({ v: z.number() }),
   });
 
   await t.pub({ data: { v: 1 } });

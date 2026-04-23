@@ -1,29 +1,15 @@
-import { beforeEach, expect, test } from "bun:test";
+import { beforeEach, afterEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { z } from "zod";
-import { job, scheduler } from "../index";
+import { scheduler, type Scheduler } from "../index";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 
-const waitUntil = async (predicate: () => boolean, timeoutMs = 5_000): Promise<void> => {
+const waitFor = async (pred: () => boolean | Promise<boolean>, timeoutMs = 5_000, pollMs = 20): Promise<void> => {
   const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (predicate()) return;
-    await Bun.sleep(20);
+  while (!(await pred())) {
+    if (Date.now() - start > timeoutMs) throw new Error(`waitFor timed out after ${timeoutMs}ms`);
+    await Bun.sleep(pollMs);
   }
-  throw new Error("waitUntil timeout");
-};
-
-const forceScheduleDue = async (schedulerId: string, scheduleId: string, nextRunAt: number): Promise<void> => {
-  const key = `sync:scheduler:${schedulerId}:schedule:${scheduleId}`;
-  const raw = await redis.get(key);
-  if (!raw) throw new Error(`missing schedule key ${key}`);
-  const parsed = JSON.parse(raw);
-  parsed.nextRunAt = nextRunAt;
-  parsed.updatedAt = Date.now();
-  await redis.send("SET", [key, JSON.stringify(parsed)]);
-  await redis.send("ZADD", [`sync:scheduler:${schedulerId}:due`, String(nextRunAt), scheduleId]);
-  await redis.send("SADD", [`sync:scheduler:${schedulerId}:index`, scheduleId]);
 };
 
 beforeEach(async () => {
@@ -31,1423 +17,492 @@ beforeEach(async () => {
   if (Array.isArray(keys) && keys.length > 0) {
     await redis.send("DEL", keys as string[]);
   }
-
-  const jobKeys = await redis.send("KEYS", ["sync:job:*"]);
-  if (Array.isArray(jobKeys) && jobKeys.length > 0) {
-    await redis.send("DEL", jobKeys as string[]);
-  }
 });
 
-test("register is idempotent for duplicate schedule ids", async () => {
-  const schedulerId = uid("sched-idem");
-  const worker = job({
-    id: uid("sched-idem-job"),
-    schema: z.object({ n: z.number() }),
-    process: async () => "ok",
+let activeSchedulers: Scheduler[] = [];
+afterEach(async () => {
+  await Promise.all(activeSchedulers.map((s) => s.stop()));
+  activeSchedulers = [];
+});
+
+const makeScheduler = (id: string, overrides?: Partial<Parameters<typeof scheduler>[0]>): Scheduler => {
+  const s = scheduler({
+    id,
+    leader: { leaseMs: 1_000, heartbeatMs: 100 },
+    dispatch: { tickMs: 100 },
+    ...overrides,
+  });
+  activeSchedulers.push(s);
+  return s;
+};
+
+// ==========================
+// create / get / list / delete
+// ==========================
+
+test("create registers a schedule; get and list return it", async () => {
+  const s = makeScheduler(uid("basic"));
+  await s.create({
+    id: "daily",
+    cron: "0 3 * * *",
+    tz: "Europe/Berlin",
+    process: async () => {},
   });
 
-  const s = scheduler({ id: schedulerId });
-  try {
-    const a = await s.register({
-      id: "sync-cleanup",
-      cron: "*/5 * * * *",
-      tz: "Europe/Berlin",
-      job: worker,
-      input: { n: 1 },
-    });
-    const b = await s.register({
-      id: "sync-cleanup",
-      cron: "*/5 * * * *",
-      tz: "Europe/Berlin",
-      job: worker,
-      input: { n: 1 },
-    });
+  const info = await s.get({ id: "daily" });
+  expect(info).not.toBeNull();
+  expect(info?.id).toBe("daily");
+  expect(info?.cron).toBe("0 3 * * *");
+  expect(info?.tz).toBe("Europe/Berlin");
+  expect(info?.runNumber).toBe(0);
+  expect(info?.failureCount).toBe(0);
+  expect(info?.nextRunAt).toBeGreaterThan(Date.now());
 
-    expect(a.created).toBe(true);
-    expect(b.created).toBe(false);
-    expect(b.updated).toBe(true);
-
-    const info = await s.get({ id: "sync-cleanup" });
-    expect(info).not.toBeNull();
-    expect(info?.id).toBe("sync-cleanup");
-
-    const all = await s.list();
-    expect(all.length).toBe(1);
-    expect(all[0].id).toBe("sync-cleanup");
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
+  const all = await s.list();
+  expect(all).toHaveLength(1);
+  expect(all[0]?.id).toBe("daily");
 });
 
-test("register upserts existing schedule without unregister gap", async () => {
-  const schedulerId = uid("sched-upsert");
-  const worker = job({
-    id: uid("sched-upsert-job"),
-    schema: z.object({ n: z.number() }),
-    process: async () => "ok",
+test("create is idempotent by id; second call updates", async () => {
+  const s = makeScheduler(uid("idempotent"));
+
+  const first = await s.create({
+    id: "x",
+    cron: "0 * * * *",
+    tz: "UTC",
+    process: async () => {},
+  });
+  expect(first.created).toBe(true);
+  expect(first.updated).toBe(false);
+
+  const second = await s.create({
+    id: "x",
+    cron: "0 * * * *",
+    tz: "UTC",
+    process: async () => {},
+  });
+  expect(second.created).toBe(false);
+  expect(second.updated).toBe(true);
+
+  const all = await s.list();
+  expect(all).toHaveLength(1);
+});
+
+test("create with invalid cron throws", async () => {
+  const s = makeScheduler(uid("invalid-cron"));
+  await expect(
+    s.create({
+      id: "x",
+      cron: "not a cron",
+      process: async () => {},
+    }),
+  ).rejects.toThrow();
+});
+
+test("create with invalid tz throws", async () => {
+  const s = makeScheduler(uid("invalid-tz"));
+  await expect(
+    s.create({
+      id: "x",
+      cron: "0 * * * *",
+      tz: "Mars/Olympus_Mons",
+      process: async () => {},
+    }),
+  ).rejects.toThrow();
+});
+
+test("delete removes schedule; get returns null; list excludes it", async () => {
+  const s = makeScheduler(uid("delete"));
+  await s.create({ id: "x", cron: "0 * * * *", process: async () => {} });
+  await s.delete({ id: "x" });
+
+  const info = await s.get({ id: "x" });
+  expect(info).toBeNull();
+
+  const all = await s.list();
+  expect(all).toHaveLength(0);
+});
+
+test("delete on non-existent schedule is a no-op", async () => {
+  const s = makeScheduler(uid("delete-nonexistent"));
+  await s.delete({ id: "ghost" });
+});
+
+// ==========================
+// runNow
+// ==========================
+
+test("runNow invokes process and increments runNumber", async () => {
+  const s = makeScheduler(uid("runnow"));
+  let runs = 0;
+  let seenRunNumber = -1;
+
+  await s.create({
+    id: "manual",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async ({ ctx }) => {
+      runs += 1;
+      seenRunNumber = ctx.runNumber;
+    },
   });
 
-  const s = scheduler({ id: schedulerId });
-  try {
-    const a = await s.register({
-      id: "sync-upsert",
-      cron: "*/5 * * * *",
-      tz: "UTC",
-      job: worker,
-      input: { n: 1 },
-    });
-    expect(a.created).toBe(true);
+  await s.runNow({ id: "manual" });
+  expect(runs).toBe(1);
+  expect(seenRunNumber).toBe(1);
 
-    const before = await s.get({ id: "sync-upsert" });
-    expect(before).not.toBeNull();
-
-    const b = await s.register({
-      id: "sync-upsert",
-      cron: "*/10 * * * *",
-      tz: "UTC",
-      job: worker,
-      input: { n: 2 },
-    });
-
-    expect(b.created).toBe(false);
-    expect(b.updated).toBe(true);
-
-    const after = await s.get({ id: "sync-upsert" });
-    expect(after).not.toBeNull();
-    expect(after!.cron).toBe("*/10 * * * *");
-    expect(after!.nextRunAt).toBeGreaterThan(Date.now() - 1_000);
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
+  await s.runNow({ id: "manual" });
+  expect(runs).toBe(2);
+  expect(seenRunNumber).toBe(2);
 });
 
-test("two scheduler instances dispatch a due slot only once", async () => {
-  const schedulerId = uid("sched-dual");
+test("runNow does not advance nextRunAt (regular cron continues)", async () => {
+  const s = makeScheduler(uid("runnow-preserves-next"));
+  await s.create({
+    id: "m",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async () => {},
+  });
+
+  const before = (await s.get({ id: "m" }))!.nextRunAt;
+  await s.runNow({ id: "m" });
+  const after = (await s.get({ id: "m" }))!.nextRunAt;
+
+  expect(after).toBe(before);
+});
+
+test("runNow rejects for unknown schedule", async () => {
+  const s = makeScheduler(uid("runnow-missing"));
+  await expect(s.runNow({ id: "ghost" })).rejects.toThrow("not found");
+});
+
+// ==========================
+// dispatch loop & cron
+// ==========================
+
+test("scheduler dispatches due schedules via tick loop", async () => {
+  const s = makeScheduler(uid("dispatch"));
   let runs = 0;
 
-  const worker = job({
-    id: uid("sched-dual-job"),
-    schema: z.object({ task: z.string() }),
-    process: async () => {
-      runs += 1;
-      return "ok";
-    },
-  });
-
-  const cfg = {
-    id: schedulerId,
-    leader: { leaseMs: 400, heartbeatMs: 100 },
-    dispatch: { tickMs: 30, batchSize: 50 },
-  };
-
-  const s1 = scheduler(cfg);
-  const s2 = scheduler(cfg);
-
-  try {
-    await s1.register({
-      id: "shared-sync",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: worker,
-      input: { task: "sync" },
-    });
-    await s2.register({
-      id: "shared-sync",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: worker,
-      input: { task: "sync" },
-    });
-
-    await forceScheduleDue(schedulerId, "shared-sync", Date.now() - 60_000);
-
-    s1.start();
-    s2.start();
-
-    await waitUntil(() => runs === 1, 4_000);
-    await Bun.sleep(200);
-    expect(runs).toBe(1);
-  } finally {
-    await s1.stop();
-    await s2.stop();
-    worker.stop();
-  }
-});
-
-test("leadership failover keeps scheduling alive when one node stops", async () => {
-  const schedulerId = uid("sched-failover");
-  let runs = 0;
-
-  const worker = job({
-    id: uid("sched-failover-job"),
-    schema: z.object({ v: z.number() }),
-    process: async () => {
-      runs += 1;
-      return "ok";
-    },
-  });
-
-  const cfg = {
-    id: schedulerId,
-    leader: { leaseMs: 500, heartbeatMs: 100 },
-    dispatch: { tickMs: 30, batchSize: 20 },
-  };
-
-  const s1 = scheduler(cfg);
-  const s2 = scheduler(cfg);
-
-  try {
-    await s1.register({
-      id: "periodic-sync",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: worker,
-      input: { v: 1 },
-    });
-    await s2.register({
-      id: "periodic-sync",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: worker,
-      input: { v: 1 },
-    });
-
-    await forceScheduleDue(schedulerId, "periodic-sync", Date.now() - 120_000);
-
-    s1.start();
-    s2.start();
-    await waitUntil(() => runs === 1, 4_000);
-
-    const firstLeader = s1.metrics().isLeader ? s1 : s2;
-    await firstLeader.stop();
-
-    await forceScheduleDue(schedulerId, "periodic-sync", Date.now() - 180_000);
-    await waitUntil(() => runs === 2, 4_000);
-  } finally {
-    await s1.stop();
-    await s2.stop();
-    worker.stop();
-  }
-});
-
-test("misfire skip does not catch up overdue executions", async () => {
-  const schedulerId = uid("sched-skip");
-  let runs = 0;
-
-  const worker = job({
-    id: uid("sched-skip-job"),
-    schema: z.object({ id: z.string() }),
-    process: async () => {
-      runs += 1;
-      return "ok";
-    },
-  });
-
-  const s = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 400, heartbeatMs: 100 },
-    dispatch: { tickMs: 30, batchSize: 20 },
-  });
-
-  try {
-    await s.register({
-      id: "cleanup",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "skip",
-      job: worker,
-      input: { id: "x" },
-    });
-
-    await forceScheduleDue(schedulerId, "cleanup", Date.now() - 6 * 60_000);
-
-    s.start();
-    await Bun.sleep(350);
-    expect(runs).toBe(0);
-
-    const info = await s.get({ id: "cleanup" });
-    expect(info).not.toBeNull();
-    expect(info!.nextRunAt).toBeGreaterThan(Date.now());
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
-});
-
-test("misfire catch_up_one catches up only one overdue run", async () => {
-  const schedulerId = uid("sched-catch-one");
-  let runs = 0;
-
-  const worker = job({
-    id: uid("sched-catch-one-job"),
-    schema: z.object({ id: z.string() }),
-    process: async () => {
-      runs += 1;
-      return "ok";
-    },
-  });
-
-  const s = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 400, heartbeatMs: 100 },
-    dispatch: { tickMs: 30, batchSize: 20 },
-  });
-
-  try {
-    await s.register({
-      id: "sync",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: worker,
-      input: { id: "y" },
-    });
-
-    await forceScheduleDue(schedulerId, "sync", Date.now() - 12 * 60_000);
-
-    s.start();
-    await waitUntil(() => runs === 1, 4_000);
-    await Bun.sleep(300);
-    expect(runs).toBe(1);
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
-});
-
-test("catch_up_all dispatches multiple overdue slots and respects maxCatchUpRuns", async () => {
-  const schedulerId = uid("sched-catch-all");
-  let runs = 0;
-
-  const worker = job({
-    id: uid("sched-catch-all-job"),
-    schema: z.object({ id: z.string() }),
-    process: async () => {
-      runs += 1;
-      return "ok";
-    },
-  });
-
-  const s = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 5_000, heartbeatMs: 500 },
-    dispatch: { tickMs: 200, batchSize: 20 },
-  });
-
-  try {
-    await s.register({
-      id: "sync-all",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_all",
-      maxCatchUpRuns: 3,
-      job: worker,
-      input: { id: "z" },
-    });
-
-    await forceScheduleDue(schedulerId, "sync-all", Date.now() - 10 * 60_000);
-
-    s.start();
-    await Bun.sleep(120);
-    await s.stop();
-    expect(runs).toBe(3);
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
-});
-
-test("register rejects invalid cron expression", async () => {
-  const s = scheduler({ id: uid("sched-bad-cron") });
-  const worker = job({
-    id: uid("sched-bad-cron-job"),
-    schema: z.object({ ok: z.boolean() }),
-    process: async () => "ok",
-  });
-
-  try {
-    let thrown: unknown = null;
-    try {
-      await s.register({
-        id: "bad-cron",
-        cron: "* * *",
-        tz: "UTC",
-        job: worker,
-        input: { ok: true },
-      });
-    } catch (error) {
-      thrown = error;
-    }
-    expect(thrown).not.toBeNull();
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
-});
-
-test("unregister removes schedule from storage and stops dispatch", async () => {
-  const schedulerId = uid("sched-unreg");
-  let runs = 0;
-
-  const worker = job({
-    id: uid("sched-unreg-job"),
-    schema: z.object({ id: z.string() }),
-    process: async () => {
-      runs += 1;
-      return "ok";
-    },
-  });
-
-  const s = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 400, heartbeatMs: 100 },
-    dispatch: { tickMs: 30, batchSize: 20 },
-  });
-
-  try {
-    await s.register({
-      id: "cleanup-unreg",
-      cron: "* * * * *",
-      tz: "UTC",
-      job: worker,
-      input: { id: "u" },
-    });
-    await s.unregister({ id: "cleanup-unreg" });
-
-    expect(await s.get({ id: "cleanup-unreg" })).toBeNull();
-    expect((await s.list()).length).toBe(0);
-
-    // Even if someone manually re-adds due entry, scheduler should clean it up.
-    await redis.send("ZADD", [`sync:scheduler:${schedulerId}:due`, String(Date.now() - 60_000), "cleanup-unreg"]);
-
-    s.start();
-    await Bun.sleep(250);
-    expect(runs).toBe(0);
-
-    const due = await redis.send("ZRANGE", [`sync:scheduler:${schedulerId}:due`, "0", "-1"]);
-    expect(Array.isArray(due) ? due.includes("cleanup-unreg") : false).toBe(false);
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
-});
-
-test("register rejects invalid timezone", async () => {
-  const s = scheduler({ id: uid("sched-bad-tz") });
-  const worker = job({
-    id: uid("sched-bad-tz-job"),
-    schema: z.object({ ok: z.boolean() }),
-    process: async () => "ok",
-  });
-
-  try {
-    let thrown: unknown = null;
-    try {
-      await s.register({
-        id: "bad-tz",
-        cron: "* * * * *",
-        tz: "Not/A_Real_Timezone",
-        job: worker,
-        input: { ok: true },
-      });
-    } catch (error) {
-      thrown = error;
-    }
-
-    expect(thrown).not.toBeNull();
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
-});
-
-test("register validates input via job handle before persisting schedule", async () => {
-  const schedulerId = uid("sched-input-validate");
-  const s = scheduler({ id: schedulerId });
-  const worker = job({
-    id: uid("sched-input-validate-job"),
-    schema: z.object({ count: z.number().int().min(1) }),
-    process: async () => "ok",
-  });
-
-  try {
-    let thrown: unknown = null;
-    try {
-      await s.register({
-        id: "bad-input",
-        cron: "* * * * *",
-        tz: "UTC",
-        job: worker,
-        // @ts-expect-error intentional invalid payload
-        input: { count: 0 },
-      });
-    } catch (error) {
-      thrown = error;
-    }
-
-    expect(thrown).not.toBeNull();
-    expect(await s.get({ id: "bad-input" })).toBeNull();
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
-});
-
-test("cron day-of-week range 1-7 is accepted", async () => {
-  const s = scheduler({ id: uid("sched-dow-range") });
-  const worker = job({
-    id: uid("sched-dow-range-job"),
-    schema: z.object({ ok: z.boolean() }),
-    process: async () => "ok",
-  });
-
-  try {
-    const result = await s.register({
-      id: "dow-1-7",
-      cron: "0 0 * * 1-7",
-      tz: "UTC",
-      job: worker,
-      input: { ok: true },
-    });
-    expect(result.created).toBe(true);
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
-});
-
-test("scheduler retries transient submit failures before success", async () => {
-  const schedulerId = uid("sched-retry-submit");
-  let attempts = 0;
-  const submittedKeys: string[] = [];
-
-  const flakyJob = {
-    id: uid("sched-retry-submit-job"),
-    validateInput: (_input: unknown): void => {},
-    submit: async (cfg: { key?: string; keyTtlMs?: number; at?: number; delayMs?: number; input: unknown; meta?: Record<string, unknown> }): Promise<string> => {
-      attempts += 1;
-      if (cfg.key) submittedKeys.push(cfg.key);
-      if (attempts < 3) throw new Error("transient");
-      return "ok";
-    },
-  };
-
-  const s = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 600, heartbeatMs: 100 },
-    dispatch: {
-      tickMs: 30,
-      submitRetries: 3,
-      submitBackoffBaseMs: 10,
-      submitBackoffMaxMs: 30,
-      maxSubmitsPerTick: 5,
-    },
-  });
-
-  try {
-    await s.register({
-      id: "retry-me",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: flakyJob,
-      input: { ok: true },
-    });
-    await forceScheduleDue(schedulerId, "retry-me", Date.now() - 2 * 60_000);
-    s.start();
-
-    await waitUntil(() => attempts >= 3, 4_000);
-    const m = s.metrics();
-    expect(m.dispatchSubmitted).toBe(1);
-    expect(m.dispatchRetried).toBe(2);
-    expect(submittedKeys.length).toBeGreaterThanOrEqual(3);
-  } finally {
-    await s.stop();
-  }
-});
-
-test("scheduler writes dispatch failures to dlq after retries exhausted", async () => {
-  const schedulerId = uid("sched-dlq");
-  let attempts = 0;
-
-  const brokenJob = {
-    id: uid("sched-dlq-job"),
-    validateInput: (_input: unknown): void => {},
-    submit: async (_cfg: { key?: string; keyTtlMs?: number; at?: number; delayMs?: number; input: unknown; meta?: Record<string, unknown> }): Promise<string> => {
-      attempts += 1;
-      throw new Error("always-fail");
-    },
-  };
-
-  const s = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 600, heartbeatMs: 100 },
-    dispatch: {
-      tickMs: 30,
-      submitRetries: 1,
-      submitBackoffBaseMs: 10,
-      submitBackoffMaxMs: 20,
-      dlqMaxEntries: 10,
-    },
-  });
-
-  try {
-    await s.register({
-      id: "dlq-me",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: brokenJob,
-      input: { ok: true },
-    });
-    await forceScheduleDue(schedulerId, "dlq-me", Date.now() - 60_000);
-    s.start();
-
-    await waitUntil(() => s.metrics().dispatchDlq >= 1, 4_000);
-    expect(attempts).toBeGreaterThanOrEqual(2); // initial + retry
-
-    const dlq = await redis.send("LRANGE", [`sync:scheduler:${schedulerId}:dispatch:dlq`, "0", "-1"]);
-    expect(Array.isArray(dlq)).toBe(true);
-    expect((dlq as string[]).length).toBeGreaterThanOrEqual(1);
-    const entry = JSON.parse(String((dlq as string[])[0]));
-    expect(entry.scheduleId).toBe("dlq-me");
-  } finally {
-    await s.stop();
-  }
-});
-
-test("scheduler advances schedule after repeated deterministic failures", async () => {
-  const schedulerId = uid("sched-advance-failures");
-  let attempts = 0;
-
-  const badInputJob = {
-    id: uid("sched-advance-failures-job"),
-    validateInput: (_input: unknown): void => {},
-    submit: async (_cfg: { key?: string; keyTtlMs?: number; at?: number; delayMs?: number; input: unknown; meta?: Record<string, unknown> }): Promise<string> => {
-      attempts += 1;
-      const err = new Error("invalid input shape");
-      err.name = "ZodError";
-      throw err;
-    },
-  };
-
-  const s = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 700, heartbeatMs: 100 },
-    dispatch: {
-      tickMs: 30,
-      submitRetries: 0,
-      maxConsecutiveDispatchFailures: 2,
-    },
-  });
-
-  try {
-    await s.register({
-      id: "fail-advance",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: badInputJob,
-      input: { ok: false },
-    });
-    const before = await s.get({ id: "fail-advance" });
-    expect(before).not.toBeNull();
-    const forcedDueTs = Date.now() - 60_000;
-    await forceScheduleDue(schedulerId, "fail-advance", forcedDueTs);
-    s.start();
-
-    await waitUntil(() => s.metrics().dispatchDlq >= 1, 4_000);
-    const after = await s.get({ id: "fail-advance" });
-    expect(after).not.toBeNull();
-    expect(after!.nextRunAt).toBeGreaterThan(forcedDueTs);
-    expect(attempts).toBeGreaterThanOrEqual(1);
-  } finally {
-    await s.stop();
-  }
-});
-
-test("strictHandlers causes leader without handlers to yield", async () => {
-  const schedulerId = uid("sched-strict-handlers");
-  let runs = 0;
-
-  const worker = job({
-    id: uid("sched-strict-handlers-job"),
-    schema: z.object({ id: z.string() }),
-    process: async () => {
-      runs += 1;
-      return "ok";
-    },
-  });
-
-  const withoutHandlers = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 500, heartbeatMs: 100 },
-    dispatch: { tickMs: 40 },
-    strictHandlers: true,
-  });
-
-  const withHandlers = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 500, heartbeatMs: 100 },
-    dispatch: { tickMs: 40 },
-    strictHandlers: true,
-  });
-
-  try {
-    await withHandlers.register({
-      id: "strict-sync",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: worker,
-      input: { id: "a" },
-    });
-
-    await forceScheduleDue(schedulerId, "strict-sync", Date.now() - 60_000);
-
-    withoutHandlers.start();
-    withHandlers.start();
-
-    await waitUntil(() => runs === 1, 5_000);
-    expect(runs).toBe(1);
-  } finally {
-    await withoutHandlers.stop();
-    await withHandlers.stop();
-    worker.stop();
-  }
-});
-
-test("catch_up_all with maxSubmitsPerTick drains overdue slots across ticks", async () => {
-  const schedulerId = uid("sched-budget-drain");
-  let runs = 0;
-
-  const worker = job({
-    id: uid("sched-budget-drain-job"),
-    schema: z.object({ id: z.string() }),
-    process: async () => {
-      runs += 1;
-      return "ok";
-    },
-  });
-
-  const s = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 800, heartbeatMs: 100 },
-    dispatch: {
-      tickMs: 40,
-      maxSubmitsPerTick: 2,
-    },
-  });
-
-  try {
-    await s.register({
-      id: "budgeted-catchup",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_all",
-      maxCatchUpRuns: 6,
-      job: worker,
-      input: { id: "b" },
-    });
-
-    await forceScheduleDue(schedulerId, "budgeted-catchup", Date.now() - 8 * 60_000);
-    s.start();
-    await waitUntil(() => runs >= 6, 6_000);
-    expect(runs).toBe(6);
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
-});
-
-test("non-deterministic dispatch failures advance after configured failure threshold", async () => {
-  const schedulerId = uid("sched-failure-threshold");
-  let attempts = 0;
-
-  const flaky = {
-    id: uid("sched-failure-threshold-job"),
-    validateInput: (_input: unknown): void => {},
-    submit: async (_cfg: { key?: string; keyTtlMs?: number; at?: number; delayMs?: number; input: unknown; meta?: Record<string, unknown> }): Promise<string> => {
-      attempts += 1;
-      throw new Error("network-timeout-ish");
-    },
-  };
-
-  const s = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 800, heartbeatMs: 100 },
-    dispatch: {
-      tickMs: 30,
-      submitRetries: 0,
-      maxConsecutiveDispatchFailures: 3,
-    },
-  });
-
-  try {
-    await s.register({
-      id: "flaky-threshold",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: flaky,
-      input: { v: 1 },
-    });
-
-    await forceScheduleDue(schedulerId, "flaky-threshold", Date.now() - 60_000);
-    const before = await s.get({ id: "flaky-threshold" });
-    expect(before).not.toBeNull();
-
-    s.start();
-    await waitUntil(() => attempts >= 3, 6_000);
-    await waitUntil(() => {
-      const m = s.metrics();
-      return m.dispatchDlq >= 3;
-    }, 6_000);
-
-    const after = await s.get({ id: "flaky-threshold" });
-    expect(after).not.toBeNull();
-    expect(after!.nextRunAt).toBeGreaterThan(before!.nextRunAt);
-  } finally {
-    await s.stop();
-  }
-});
-
-test("register upsert can switch job handler for existing schedule id", async () => {
-  const schedulerId = uid("sched-switch-job");
-  let aRuns = 0;
-  let bRuns = 0;
-
-  const jobA = job({
-    id: uid("sched-switch-job-a"),
-    schema: z.object({ id: z.string() }),
-    process: async () => {
-      aRuns += 1;
-      return "a";
-    },
-  });
-
-  const jobB = job({
-    id: uid("sched-switch-job-b"),
-    schema: z.object({ id: z.string() }),
-    process: async () => {
-      bRuns += 1;
-      return "b";
-    },
-  });
-
-  const s = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 800, heartbeatMs: 100 },
-    dispatch: { tickMs: 30 },
-  });
-
-  try {
-    await s.register({
-      id: "switchable",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: jobA,
-      input: { id: "x" },
-    });
-
-    await s.register({
-      id: "switchable",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: jobB,
-      input: { id: "x" },
-    });
-
-    await forceScheduleDue(schedulerId, "switchable", Date.now() - 60_000);
-    s.start();
-
-    await waitUntil(() => bRuns === 1, 4_000);
-    expect(aRuns).toBe(0);
-    expect(bRuns).toBe(1);
-  } finally {
-    await s.stop();
-    jobA.stop();
-    jobB.stop();
-  }
-});
-
-test("strictHandlers false keeps scheduler running but skips missing handlers", async () => {
-  const schedulerId = uid("sched-non-strict");
-  let runs = 0;
-  const worker = job({
-    id: uid("sched-non-strict-job"),
-    schema: z.object({ v: z.number() }),
-    process: async () => {
-      runs += 1;
-      return "ok";
-    },
-  });
-  const s = scheduler({
-    id: schedulerId,
-    strictHandlers: false,
-    leader: { leaseMs: 700, heartbeatMs: 100 },
-    dispatch: { tickMs: 30, batchSize: 1 },
-  });
-
-  // Insert a schedule directly without registering handler on this instance.
-  const scheduleId = "missing-handler";
-  const now = Date.now();
-  const scheduleKey = `sync:scheduler:${schedulerId}:schedule:${scheduleId}`;
-  const schedule = {
-    id: scheduleId,
+  await s.create({
+    id: "tick",
     cron: "* * * * *",
     tz: "UTC",
-    misfire: "catch_up_one",
-    maxCatchUpRuns: 1,
-    jobId: "unregistered-job-id",
-    input: { v: 1 },
-    createdAt: now,
-    updatedAt: now,
-    nextRunAt: now - 60_000,
-    consecutiveDispatchFailures: 0,
-  };
-
-  try {
-    await redis.send("SET", [scheduleKey, JSON.stringify(schedule)]);
-    await redis.send("ZADD", [`sync:scheduler:${schedulerId}:due`, String(schedule.nextRunAt), scheduleId]);
-    await redis.send("SADD", [`sync:scheduler:${schedulerId}:index`, scheduleId]);
-
-    await s.register({
-      id: "valid-handler",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: worker,
-      input: { v: 1 },
-    });
-    await forceScheduleDue(schedulerId, "valid-handler", Date.now() - 60_000);
-
-    s.start();
-    await waitUntil(() => s.metrics().dispatchSkipped >= 1, 4_000);
-    await waitUntil(() => runs >= 1, 4_000);
-
-    expect(s.metrics().isLeader).toBe(true);
-    expect(runs).toBe(1);
-
-    const advanced = await s.get({ id: scheduleId });
-    expect(advanced).not.toBeNull();
-    expect(advanced!.nextRunAt).toBeGreaterThan(Date.now() - 1_000);
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
-});
-
-test("chaos: scheduler recovers from intermittent redis read failures", async () => {
-  const schedulerId = uid("sched-chaos-redis");
-  let runs = 0;
-
-  const worker = job({
-    id: uid("sched-chaos-redis-job"),
-    schema: z.object({ id: z.string() }),
     process: async () => {
       runs += 1;
-      return "ok";
     },
   });
 
-  const s = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 900, heartbeatMs: 120 },
-    dispatch: { tickMs: 30, submitRetries: 1 },
-  });
+  const keyPrefix = `sync:scheduler:${s.id}`;
+  const raw = await redis.get(`${keyPrefix}:schedule:tick`);
+  const parsed = JSON.parse(raw as string);
+  parsed.nextRunAt = Date.now() - 1000;
+  await redis.set(`${keyPrefix}:schedule:tick`, JSON.stringify(parsed));
+  await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed.nextRunAt), "tick"]);
 
-  const redisObj = redis as unknown as { send: (...args: unknown[]) => Promise<unknown> };
-  const originalSend = redisObj.send;
-  let injected = 0;
-  redisObj.send = async (...args: unknown[]) => {
-    const cmd = String(args[0] ?? "");
-    if (cmd === "ZRANGEBYSCORE" && injected < 4) {
-      injected += 1;
-      throw new Error("injected redis timeout");
-    }
-    return await originalSend.call(redis, ...args);
-  };
-
-  try {
-    await s.register({
-      id: "chaos-redis",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: worker,
-      input: { id: "r" },
-    });
-    await forceScheduleDue(schedulerId, "chaos-redis", Date.now() - 60_000);
-
-    s.start();
-    await waitUntil(() => runs === 1, 8_000);
-    expect(s.metrics().tickErrors).toBeGreaterThanOrEqual(1);
-  } finally {
-    redisObj.send = originalSend;
-    await s.stop();
-    worker.stop();
-  }
+  s.start();
+  await waitFor(() => runs >= 1, 5_000);
+  expect(runs).toBeGreaterThanOrEqual(1);
 });
 
-test("chaos: rapid leader churn across three instances keeps slot execution single", async () => {
-  const schedulerId = uid("sched-chaos-churn");
+test("nextRunAt advances after successful dispatch", async () => {
+  const s = makeScheduler(uid("advance"));
   let runs = 0;
 
-  const worker = job({
-    id: uid("sched-chaos-churn-job"),
-    schema: z.object({ id: z.string() }),
+  await s.create({
+    id: "a",
+    cron: "* * * * *",
+    tz: "UTC",
     process: async () => {
       runs += 1;
-      return "ok";
     },
   });
 
-  const cfg = {
-    id: schedulerId,
-    leader: { leaseMs: 350, heartbeatMs: 80 },
-    dispatch: { tickMs: 20 },
-  };
+  const keyPrefix = `sync:scheduler:${s.id}`;
+  const raw = await redis.get(`${keyPrefix}:schedule:a`);
+  const parsed = JSON.parse(raw as string);
+  parsed.nextRunAt = Date.now() - 1000;
+  await redis.set(`${keyPrefix}:schedule:a`, JSON.stringify(parsed));
+  await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed.nextRunAt), "a"]);
 
-  const a = scheduler(cfg);
-  const b = scheduler(cfg);
-  const c = scheduler(cfg);
+  s.start();
+  await waitFor(() => runs >= 1, 5_000);
+  await Bun.sleep(200);
 
-  try {
-    await a.register({
-      id: "churn",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: worker,
-      input: { id: "x" },
-    });
-    await b.register({
-      id: "churn",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: worker,
-      input: { id: "x" },
-    });
-    await c.register({
-      id: "churn",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "catch_up_one",
-      job: worker,
-      input: { id: "x" },
-    });
-
-    await forceScheduleDue(schedulerId, "churn", Date.now() - 60_000);
-    a.start();
-    b.start();
-    c.start();
-
-    // Introduce churn by rapidly cycling one instance.
-    for (let i = 0; i < 6; i++) {
-      await Bun.sleep(40);
-      await b.stop();
-      b.start();
-    }
-
-    await waitUntil(() => runs === 1, 6_000);
-    expect(runs).toBe(1);
-  } finally {
-    await a.stop();
-    await b.stop();
-    await c.stop();
-    worker.stop();
-  }
+  const info = await s.get({ id: "a" });
+  expect(info?.nextRunAt).toBeGreaterThan(Date.now());
 });
 
-test("chaos: forward clock jump with skip policy does not replay backlog", async () => {
-  const schedulerId = uid("sched-chaos-clock");
+// ==========================
+// ctx.reschedule
+// ==========================
+
+test("ctx.reschedule in after overrides cron advance", async () => {
+  const s = makeScheduler(uid("reschedule"));
   let runs = 0;
 
-  const worker = job({
-    id: uid("sched-chaos-clock-job"),
-    schema: z.object({ id: z.string() }),
+  await s.create({
+    id: "r",
+    cron: "0 3 * * *",
+    tz: "UTC",
     process: async () => {
       runs += 1;
-      return "ok";
+    },
+    after: async ({ ctx }) => {
+      if (ctx.runNumber === 1) ctx.reschedule({ delayMs: 100 });
     },
   });
 
-  const s = scheduler({
-    id: schedulerId,
-    leader: { leaseMs: 800, heartbeatMs: 100 },
-    dispatch: { tickMs: 25 },
-  });
+  s.start();
+  await s.runNow({ id: "r" });
+  expect(runs).toBe(1);
 
-  const realNow = Date.now;
-  const base = realNow();
-  let shifted = false;
-  Date.now = () => (shifted ? base + 2 * 60 * 60 * 1000 : realNow());
+  const info1 = await s.get({ id: "r" });
+  expect(info1!.nextRunAt).toBeLessThan(Date.now() + 300);
 
-  try {
-    await s.register({
-      id: "clock-jump",
-      cron: "* * * * *",
-      tz: "UTC",
-      misfire: "skip",
-      job: worker,
-      input: { id: "clk" },
-    });
-
-    await forceScheduleDue(schedulerId, "clock-jump", base - 60_000);
-    shifted = true;
-    s.start();
-    await Bun.sleep(300);
-
-    expect(runs).toBe(0);
-    const info = await s.get({ id: "clock-jump" });
-    expect(info).not.toBeNull();
-    expect(info!.nextRunAt).toBeGreaterThan(base + 2 * 60 * 60 * 1000 - 1_000);
-  } finally {
-    Date.now = realNow;
-    await s.stop();
-    worker.stop();
-  }
+  await waitFor(() => runs >= 2, 3_000);
+  expect(runs).toBe(2);
 });
 
-test("triggerNow submits immediately without start and forwards stored input/meta", async () => {
-  const schedulerId = uid("sched-trigger-now");
-  const captured: Array<{
-    input: unknown;
-    key?: string;
-    at?: number;
-    meta?: Record<string, unknown>;
-  }> = [];
-
-  const manualJob = {
-    id: uid("sched-trigger-now-job"),
-    validateInput: (_input: unknown): void => {},
-    submit: async (cfg: {
-      key?: string;
-      keyTtlMs?: number;
-      at?: number;
-      delayMs?: number;
-      input: unknown;
-      meta?: Record<string, unknown>;
-    }): Promise<string> => {
-      captured.push({
-        input: cfg.input,
-        key: cfg.key,
-        at: cfg.at,
-        meta: cfg.meta,
-      });
-      return "manual-job-1";
-    },
-  };
-
-  const s = scheduler({ id: schedulerId });
-  try {
-    await s.register({
-      id: "cleanup-now",
-      cron: "0 * * * *",
-      tz: "UTC",
-      job: manualJob,
-      input: { scope: "tmp" },
-      meta: { owner: "ops" },
-    });
-
-    const before = await s.get({ id: "cleanup-now" });
-    const jobId = await s.triggerNow({ id: "cleanup-now", key: "req-1" });
-    const after = await s.get({ id: "cleanup-now" });
-
-    expect(jobId).toBe("manual-job-1");
-    expect(before).not.toBeNull();
-    expect(after).not.toBeNull();
-    expect(after!.nextRunAt).toBe(before!.nextRunAt);
-    expect(captured.length).toBe(1);
-    expect(captured[0].input).toEqual({ scope: "tmp" });
-    expect(captured[0].key).toBe("manual:cleanup-now:req-1");
-    expect(captured[0].at).toBeUndefined();
-    expect(captured[0].meta).toEqual({
-      owner: "ops",
-      scheduleId: "cleanup-now",
-      schedulerId,
-      scheduleTrigger: "manual",
-      scheduleManualKey: "req-1",
-    });
-    expect("scheduleSlotTs" in (captured[0].meta ?? {})).toBe(false);
-    expect(s.metrics().triggerSubmitted).toBe(1);
-  } finally {
-    await s.stop();
-  }
-});
-
-test("triggerNow deduplicates repeated calls with the same key", async () => {
-  const schedulerId = uid("sched-trigger-dedupe");
+test("ctx.reschedule on success triggers immediate re-run (polling pattern)", async () => {
+  const s = makeScheduler(uid("polling"));
   let runs = 0;
 
-  const worker = job({
-    id: uid("sched-trigger-dedupe-job"),
-    schema: z.object({ id: z.string() }),
-    process: async ({ input }) => {
+  await s.create({
+    id: "p",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async () => {
       runs += 1;
-      return input.id;
+      return { hasMore: runs < 3 };
+    },
+    after: async ({ ctx }) => {
+      if (ctx.data?.hasMore) ctx.reschedule({ delayMs: 30 });
     },
   });
 
-  const s = scheduler({ id: schedulerId });
-  try {
-    await s.register({
-      id: "dedupe-me",
-      cron: "0 * * * *",
-      tz: "UTC",
-      job: worker,
-      input: { id: "same" },
-    });
-
-    const [first, second] = await Promise.all([
-      s.triggerNow({ id: "dedupe-me", key: "req-42" }),
-      s.triggerNow({ id: "dedupe-me", key: "req-42" }),
-    ]);
-
-    expect(first).toBe(second);
-    const terminal = await worker.join({ id: first, timeoutMs: 5_000 });
-    expect(terminal.status).toBe("completed");
-    expect(runs).toBe(1);
-    expect(s.metrics().triggerSubmitted).toBe(2);
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
+  s.start();
+  await s.runNow({ id: "p" });
+  await waitFor(() => runs >= 3, 5_000);
+  await Bun.sleep(200);
+  expect(runs).toBe(3);
 });
 
-test("triggerNow keeps job completion alive after scheduler stop", async () => {
-  const schedulerId = uid("sched-trigger-stop");
+// ==========================
+// failureCount
+// ==========================
 
-  const worker = job({
-    id: uid("sched-trigger-stop-job"),
-    schema: z.object({ v: z.number() }),
-    process: async ({ input }) => {
-      await Bun.sleep(50);
-      return input.v * 2;
+test("failureCount increments on failure and resets on success", async () => {
+  const s = makeScheduler(uid("failurecount"));
+  const seen: number[] = [];
+  let succeedNext = false;
+
+  await s.create({
+    id: "f",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async ({ ctx }) => {
+      seen.push(ctx.failureCount);
+      if (!succeedNext) throw new Error("fail");
+    },
+    after: async ({ ctx }) => {
+      if (ctx.error) ctx.reschedule({ delayMs: 30 });
     },
   });
 
-  const s = scheduler({ id: schedulerId });
-  try {
-    await s.register({
-      id: "stop-safe",
-      cron: "0 * * * *",
-      tz: "UTC",
-      job: worker,
-      input: { v: 21 },
-    });
+  s.start();
+  await s.runNow({ id: "f" });
+  await waitFor(() => seen.length >= 2, 5_000);
 
-    const jobId = await s.triggerNow({ id: "stop-safe" });
-    await s.stop();
-    const terminal = await worker.join({ id: jobId, timeoutMs: 5_000 });
+  expect(seen[0]).toBe(0);
+  expect(seen[1]).toBe(1);
 
-    expect(terminal.status).toBe("completed");
-    expect(terminal.result).toBe(42);
-  } finally {
-    await s.stop();
-    worker.stop();
-  }
+  succeedNext = true;
+  await waitFor(() => seen.length >= 3, 3_000);
+  await Bun.sleep(200);
+
+  const info = await s.get({ id: "f" });
+  expect(info?.failureCount).toBe(0);
 });
 
-test("triggerNow rejects when the local scheduler instance lacks the handler", async () => {
-  const schedulerId = uid("sched-trigger-missing-handler");
-  const metrics: string[] = [];
+test("ctx.runNumber is 1-indexed and monotonic", async () => {
+  const s = makeScheduler(uid("runnumber"));
+  const seen: number[] = [];
 
-  const worker = job({
-    id: uid("sched-trigger-missing-handler-job"),
-    schema: z.object({ id: z.string() }),
-    process: async () => "ok",
-  });
-
-  const owner = scheduler({ id: schedulerId });
-  const other = scheduler({
-    id: schedulerId,
-    onMetric: (metric) => {
-      if (metric.type === "trigger_rejected") metrics.push(metric.reason);
+  await s.create({
+    id: "n",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async ({ ctx }) => {
+      seen.push(ctx.runNumber);
     },
   });
 
-  try {
-    await owner.register({
-      id: "shared",
-      cron: "0 * * * *",
-      tz: "UTC",
-      job: worker,
-      input: { id: "x" },
-    });
+  await s.runNow({ id: "n" });
+  await s.runNow({ id: "n" });
+  await s.runNow({ id: "n" });
 
-    await expect(other.triggerNow({ id: "shared" })).rejects.toThrow("missing local handler");
-    expect(other.metrics().triggerRejected).toBe(1);
-    expect(metrics).toEqual(["missing_handler"]);
-  } finally {
-    await owner.stop();
-    await other.stop();
-    worker.stop();
-  }
+  expect(seen).toEqual([1, 2, 3]);
+
+  const info = await s.get({ id: "n" });
+  expect(info?.runNumber).toBe(3);
 });
 
-test("triggerNow rejects corrupt stored schedules", async () => {
-  const schedulerId = uid("sched-trigger-invalid");
-  const s = scheduler({ id: schedulerId });
-  try {
-    await redis.send("SET", [`sync:scheduler:${schedulerId}:schedule:broken`, "{oops"]);
+test("runNumber preserved across re-registration with same cron", async () => {
+  const s = makeScheduler(uid("rn-preserved"));
 
-    await expect(s.triggerNow({ id: "broken" })).rejects.toThrow("invalid schedule broken");
-    expect(s.metrics().triggerRejected).toBe(1);
-  } finally {
-    await s.stop();
-  }
+  await s.create({ id: "p", cron: "0 3 * * *", tz: "UTC", process: async () => {} });
+  await s.runNow({ id: "p" });
+  await s.runNow({ id: "p" });
+
+  await s.create({ id: "p", cron: "0 3 * * *", tz: "UTC", process: async () => {} });
+
+  const info = await s.get({ id: "p" });
+  expect(info?.runNumber).toBe(2);
 });
 
-test("triggerNow retries submit failures and reports final failure metrics", async () => {
-  const schedulerId = uid("sched-trigger-retry");
-  let attempts = 0;
+test("runNumber preserved but failureCount reset when cron changes", async () => {
+  const s = makeScheduler(uid("rn-preserved-cron-change"));
 
-  const flakyJob = {
-    id: uid("sched-trigger-retry-job"),
-    validateInput: (_input: unknown): void => {},
-    submit: async (_cfg: {
-      key?: string;
-      keyTtlMs?: number;
-      at?: number;
-      delayMs?: number;
-      input: unknown;
-      meta?: Record<string, unknown>;
-    }): Promise<string> => {
-      attempts += 1;
-      throw new Error("always-fail");
+  await s.create({ id: "p", cron: "0 3 * * *", tz: "UTC", process: async () => {} });
+  await s.runNow({ id: "p" });
+  await s.runNow({ id: "p" });
+
+  await s.create({ id: "p", cron: "0 4 * * *", tz: "UTC", process: async () => {} });
+
+  const info = await s.get({ id: "p" });
+  expect(info?.runNumber).toBe(2);
+  expect(info?.failureCount).toBe(0);
+});
+
+// ==========================
+// metric()
+// ==========================
+
+test("metric() reflects dispatches, failures, reschedules", async () => {
+  const s = makeScheduler(uid("metrics"));
+
+  await s.create({
+    id: "ok",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async () => {},
+  });
+  await s.create({
+    id: "bad",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async () => {
+      throw new Error("bad");
     },
-  };
-
-  const s = scheduler({
-    id: schedulerId,
-    dispatch: {
-      submitRetries: 2,
-      submitBackoffBaseMs: 10,
-      submitBackoffMaxMs: 20,
+  });
+  await s.create({
+    id: "retrying",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async ({ ctx }) => {
+      if (ctx.failureCount < 1) throw new Error("retry me");
+    },
+    after: async ({ ctx }) => {
+      if (ctx.error && ctx.failureCount < 1) ctx.reschedule({ delayMs: 10 });
     },
   });
 
-  try {
-    await s.register({
-      id: "retry-me-now",
-      cron: "0 * * * *",
-      tz: "UTC",
-      job: flakyJob,
-      input: { ok: true },
-    });
+  s.start();
+  await s.runNow({ id: "ok" });
+  await s.runNow({ id: "bad" });
+  await s.runNow({ id: "retrying" });
 
-    await expect(s.triggerNow({ id: "retry-me-now" })).rejects.toThrow("always-fail");
-    expect(attempts).toBe(3);
-    expect(s.metrics().triggerFailed).toBe(1);
-    expect(s.metrics().triggerSubmitted).toBe(0);
-  } finally {
-    await s.stop();
-  }
+  await Bun.sleep(300);
+
+  const m = s.metric();
+  expect(m.dispatches).toBeGreaterThanOrEqual(2);
+  expect(m.failures).toBeGreaterThanOrEqual(1);
+  expect(m.reschedules).toBeGreaterThanOrEqual(1);
+
+  m.dispatches = 9999;
+  expect(s.metric().dispatches).not.toBe(9999);
 });
 
-test("triggerNow does not retry zod-like failures", async () => {
-  const schedulerId = uid("sched-trigger-zod");
-  let attempts = 0;
+test("ctx.metric is live reference inside after", async () => {
+  const s = makeScheduler(uid("ctx-metric"));
+  let seen: number = -1;
 
-  const brokenJob = {
-    id: uid("sched-trigger-zod-job"),
-    validateInput: (_input: unknown): void => {},
-    submit: async (_cfg: {
-      key?: string;
-      keyTtlMs?: number;
-      at?: number;
-      delayMs?: number;
-      input: unknown;
-      meta?: Record<string, unknown>;
-    }): Promise<string> => {
-      attempts += 1;
-      const err = new Error("bad input");
-      err.name = "ZodError";
-      throw err;
-    },
-  };
-
-  const s = scheduler({
-    id: schedulerId,
-    dispatch: {
-      submitRetries: 5,
-      submitBackoffBaseMs: 10,
-      submitBackoffMaxMs: 20,
+  await s.create({
+    id: "m",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async () => {},
+    after: async ({ ctx }) => {
+      seen = ctx.metric.dispatches;
     },
   });
 
-  try {
-    await s.register({
-      id: "bad-input-now",
-      cron: "0 * * * *",
-      tz: "UTC",
-      job: brokenJob,
-      input: { ok: true },
-    });
+  await s.runNow({ id: "m" });
+  expect(seen).toBe(0);
 
-    await expect(s.triggerNow({ id: "bad-input-now" })).rejects.toThrow("bad input");
-    expect(attempts).toBe(1);
-    expect(s.metrics().triggerFailed).toBe(1);
-  } finally {
-    await s.stop();
-  }
+  await Bun.sleep(50);
+  expect(s.metric().dispatches).toBe(1);
 });
 
-test("triggerNow may still submit successfully when unregister races after schedule read", async () => {
-  const schedulerId = uid("sched-trigger-unregister-race");
-  let releaseSubmit: (() => void) | null = null;
-  let submitEntered = false;
+// ==========================
+// leader election
+// ==========================
 
-  const gate = new Promise<void>((resolve) => {
-    releaseSubmit = resolve;
+test("metric.isLeader flips to true after start", async () => {
+  const s = makeScheduler(uid("leader"));
+  expect(s.metric().isLeader).toBe(false);
+
+  s.start();
+  await waitFor(() => s.metric().isLeader, 3_000);
+  expect(s.metric().isLeader).toBe(true);
+  expect(s.metric().leaderChanges).toBeGreaterThanOrEqual(1);
+
+  await s.stop();
+  expect(s.metric().isLeader).toBe(false);
+});
+
+test("only one of two schedulers with same id is leader at a time", async () => {
+  const schedId = uid("leader-election");
+  const s1 = makeScheduler(schedId);
+  const s2 = makeScheduler(schedId);
+
+  s1.start();
+  s2.start();
+
+  await waitFor(() => s1.metric().isLeader || s2.metric().isLeader, 3_000);
+
+  const s1Leader = s1.metric().isLeader;
+  const s2Leader = s2.metric().isLeader;
+  expect(s1Leader !== s2Leader).toBe(true);
+});
+
+// ==========================
+// after error swallow
+// ==========================
+
+test("errors thrown in after do not crash the scheduler", async () => {
+  const s = makeScheduler(uid("after-throws"));
+  let processed = 0;
+
+  await s.create({
+    id: "e",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async () => {
+      processed += 1;
+    },
+    after: async () => {
+      throw new Error("after threw");
+    },
   });
 
-  const jobHandle = {
-    id: uid("sched-trigger-unregister-race-job"),
-    validateInput: (_input: unknown): void => {},
-    submit: async (_cfg: {
-      key?: string;
-      keyTtlMs?: number;
-      at?: number;
-      delayMs?: number;
-      input: unknown;
-      meta?: Record<string, unknown>;
-    }): Promise<string> => {
-      submitEntered = true;
-      await gate;
-      return "race-job-1";
-    },
-  };
+  await s.runNow({ id: "e" });
+  await s.runNow({ id: "e" });
 
-  const s = scheduler({ id: schedulerId });
-  try {
-    await s.register({
-      id: "race",
-      cron: "0 * * * *",
-      tz: "UTC",
-      job: jobHandle,
-      input: { ok: true },
-    });
+  expect(processed).toBe(2);
 
-    const pending = s.triggerNow({ id: "race" });
-    await waitUntil(() => submitEntered, 2_000);
-    await s.unregister({ id: "race" });
-    releaseSubmit?.();
-
-    await expect(pending).resolves.toBe("race-job-1");
-    expect(await s.get({ id: "race" })).toBeNull();
-  } finally {
-    await s.stop();
-  }
+  const info = await s.get({ id: "e" });
+  expect(info?.runNumber).toBe(2);
 });

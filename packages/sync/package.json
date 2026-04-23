@@ -1,7 +1,7 @@
 {
   "name": "@valentinkolb/sync",
-  "version": "4.0.0",
-  "description": "Distributed sync primitives for TypeScript and Bun — ratelimit, mutex, queue, topic, job, scheduler, registry, ephemeral, retry",
+  "version": "5.0.0",
+  "description": "Distributed sync primitives for TypeScript and Bun — ratelimit, mutex, queue, topic, job, scheduler, ephemeral, retry",
   "module": "index.ts",
   "type": "module",
   "exports": {
@@ -14,7 +14,6 @@
     "typecheck": "bunx tsc --noEmit"
   },
   "peerDependencies": {
-    "typescript": "^5",
-    "zod": "^4"
+    "typescript": "^5"
   }
 }

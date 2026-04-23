@@ -1,5 +1,4 @@
 import { redis, RedisClient } from "bun";
-import type { z } from "zod";
 import { fieldArrayToObject, parseFirstStreamEntry, type ParsedEntry } from "./internal/topic-utils";
 import { isRetryableTransportError, retry } from "./retry";
 
@@ -317,9 +316,8 @@ export class EphemeralPayloadTooLargeError extends Error {
   }
 }
 
-export type EphemeralConfig<TSchema extends z.ZodTypeAny> = {
+export type EphemeralConfig<T = unknown> = {
   id: string;
-  schema: TSchema;
   ttlMs: number;
   tenantId?: string;
   limits?: {
@@ -384,8 +382,8 @@ export type EphemeralStore<T> = {
   upsert(cfg: EphemeralUpsertConfig<T>): Promise<EphemeralEntry<T>>;
   touch(cfg: EphemeralTouchConfig): Promise<{ ok: boolean; version?: string; expiresAt?: number }>;
   remove(cfg: EphemeralRemoveConfig): Promise<boolean>;
-  snapshot(cfg?: { tenantId?: string }): Promise<EphemeralSnapshot<T>>;
-  reader(cfg?: { after?: string; tenantId?: string }): EphemeralReader<T>;
+  snapshot(cfg?: { tenantId?: string; prefix?: string }): Promise<EphemeralSnapshot<T>>;
+  reader(cfg?: { after?: string; tenantId?: string; prefix?: string }): EphemeralReader<T>;
 };
 
 type EphemeralKeys = {
@@ -426,8 +424,8 @@ const assertLogicalKey = (value: string): void => {
   if (bytes > MAX_KEY_BYTES) throw new Error(`key exceeds max length (${MAX_KEY_BYTES} bytes)`);
 };
 
-export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<TSchema>): EphemeralStore<z.infer<TSchema>> => {
-  type TData = z.infer<TSchema>;
+export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
+  type TData = T;
 
   if (!Number.isFinite(config.ttlMs) || config.ttlMs <= 0) {
     throw new Error("ttlMs must be > 0");
@@ -462,13 +460,10 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
 
   const parseStoredEntry = (raw: string): EphemeralEntry<TData> | null => {
     try {
-      const parsed = JSON.parse(raw) as StoredEntry<unknown>;
-      const validated = config.schema.safeParse(parsed.data);
-      if (!validated.success) return null;
-
+      const parsed = JSON.parse(raw) as StoredEntry<TData>;
       return {
         key: parsed.key,
-        value: validated.data,
+        value: parsed.data,
         version: String(parsed.version),
         updatedAt: Number(parsed.updatedAt),
         expiresAt: Number(parsed.expiresAt),
@@ -483,9 +478,7 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
     if (!rawPayload) return null;
 
     try {
-      const payload = JSON.parse(rawPayload) as unknown;
-      const parsed = config.schema.safeParse(payload);
-      if (!parsed.success) return null;
+      const payload = JSON.parse(rawPayload) as TData;
 
       const updatedAt = parseOptionalNumber(entry.fields.updatedAt);
       const expiresAt = parseOptionalNumber(entry.fields.expiresAt);
@@ -496,7 +489,7 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
         cursor: entry.id,
         entry: {
           key: entry.fields.key ?? "",
-          value: parsed.data,
+          value: payload,
           version: entry.fields.version ?? "",
           updatedAt,
           expiresAt,
@@ -609,10 +602,7 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
       throw new Error("ttlMs must be > 0");
     }
 
-    const parsed = config.schema.safeParse(cfg.value);
-    if (!parsed.success) throw parsed.error;
-
-    const payloadRaw = JSON.stringify(parsed.data);
+    const payloadRaw = JSON.stringify(cfg.value);
     const payloadBytes = textEncoder.encode(payloadRaw).byteLength;
     if (payloadBytes > maxPayloadBytes) {
       throw new EphemeralPayloadTooLargeError(`payload exceeds limit (${maxPayloadBytes} bytes)`);
@@ -682,7 +672,7 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
     return Number(raw) > 0;
   };
 
-  const snapshot = async (cfg: { tenantId?: string } = {}): Promise<EphemeralSnapshot<TData>> => {
+  const snapshot = async (cfg: { tenantId?: string; prefix?: string } = {}): Promise<EphemeralSnapshot<TData>> => {
     const tenantId = resolveTenant(cfg.tenantId);
     const keys = keysForTenant(tenantId);
 
@@ -690,10 +680,12 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
 
     const rawEntries = await redis.hvals(keys.state);
     const entries: EphemeralEntry<TData>[] = [];
+    const prefix = cfg.prefix;
 
     for (const raw of rawEntries) {
       const parsed = parseStoredEntry(String(raw));
       if (!parsed) continue;
+      if (prefix && !parsed.key.startsWith(prefix)) continue;
       entries.push(parsed);
     }
 
@@ -705,9 +697,23 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
     };
   };
 
-  const reader = (readerCfg: { after?: string; tenantId?: string } = {}): EphemeralReader<TData> => {
+  const reader = (readerCfg: { after?: string; tenantId?: string; prefix?: string } = {}): EphemeralReader<TData> => {
     const tenantId = resolveTenant(readerCfg.tenantId);
     const keys = keysForTenant(tenantId);
+    const prefix = readerCfg.prefix;
+
+    const eventKey = (event: EphemeralEvent<TData>): string | null => {
+      if (event.type === "upsert") return event.entry.key;
+      if (event.type === "overflow") return null;
+      return event.key;
+    };
+
+    const matchesPrefix = (event: EphemeralEvent<TData>): boolean => {
+      if (!prefix) return true;
+      const key = eventKey(event);
+      if (key === null) return true; // overflow always passes
+      return key.startsWith(prefix);
+    };
 
     let cursor = readerCfg.after ?? "$";
     let overflowPending: EphemeralEvent<TData> | null = null;
@@ -772,32 +778,39 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
       const wait = cfg.wait ?? true;
       const timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-      const args = wait
-        ? ["COUNT", "1", "BLOCK", timeoutMs.toString(), "STREAMS", keys.events, cursor]
-        : ["COUNT", "1", "STREAMS", keys.events, cursor];
+      // Loop internally to skip prefix-mismatched events without returning null
+      // prematurely. Only meaningful when `prefix` is set; otherwise one pass.
+      while (true) {
+        if (cfg.signal?.aborted) return null;
 
-      const result = cfg.signal
-        ? await blockingReadWithTemporaryClient(args, cfg.signal)
-        : wait
-          ? await (async (): Promise<unknown> => {
-              const client = await ensureBlockingClient();
+        const args = wait
+          ? ["COUNT", "1", "BLOCK", timeoutMs.toString(), "STREAMS", keys.events, cursor]
+          : ["COUNT", "1", "STREAMS", keys.events, cursor];
 
-              try {
-                return await client.send("XREAD", args);
-              } catch (error) {
-                resetBlockingClient();
-                throw asError(error);
-              }
-            })()
-          : await redis.send("XREAD", args);
+        const result = cfg.signal
+          ? await blockingReadWithTemporaryClient(args, cfg.signal)
+          : wait
+            ? await (async (): Promise<unknown> => {
+                const client = await ensureBlockingClient();
 
-      const entry = parseFirstStreamEntry(result);
-      if (!entry) return null;
+                try {
+                  return await client.send("XREAD", args);
+                } catch (error) {
+                  resetBlockingClient();
+                  throw asError(error);
+                }
+              })()
+            : await redis.send("XREAD", args);
 
-      cursor = entry.id;
-      const parsed = parseEvent(entry);
-      if (!parsed) return null;
-      return parsed;
+        const entry = parseFirstStreamEntry(result);
+        if (!entry) return null;
+
+        cursor = entry.id;
+        const parsed = parseEvent(entry);
+        if (!parsed) continue;
+        if (!matchesPrefix(parsed)) continue;
+        return parsed;
+      }
     };
 
     const stream = async function* (cfg: EphemeralRecvConfig = {}): AsyncIterable<EphemeralEvent<TData>> {
@@ -805,14 +818,15 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
       try {
         while (!cfg.signal?.aborted) {
           const event = wait
-            ? await retry(
-                async () => await recv(cfg),
-                {
-                  attempts: Number.POSITIVE_INFINITY,
-                  signal: cfg.signal,
-                  retryIf: isRetryableTransportError,
+            ? await retry({
+                run: () => recv(cfg),
+                after: ({ ctx }) => {
+                  if (ctx.error && isRetryableTransportError(ctx.error)) {
+                    ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
+                  }
                 },
-              )
+                signal: cfg.signal,
+              })
             : await recv(cfg);
           if (event) {
             yield event;

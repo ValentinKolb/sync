@@ -2,7 +2,15 @@
 export { createMemoryStore, createLocalStorageStore, MemoryStore, LocalStorageStore, type Store } from "./src/store";
 
 // Retry
-export { retry, isRetryableTransportError, DEFAULT_RETRY_OPTIONS, type RetryOptions } from "./src/retry";
+export {
+  retry,
+  isRetryableTransportError,
+  expBackoff,
+  type BackoffOptions,
+  type RetryCtx,
+  type RetryAfterCtx,
+  type RetryConfig,
+} from "./src/retry";
 
 // Ratelimit
 export { ratelimit, RateLimitError, type RateLimiter, type RateLimitResult, type RateLimitConfig } from "./src/ratelimit";
@@ -51,40 +59,16 @@ export {
   type EphemeralReader,
 } from "./src/ephemeral";
 
-// Registry
-export {
-  registry,
-  RegistryCapacityError,
-  RegistryPayloadTooLargeError,
-  type Registry,
-  type RegistryConfig,
-  type RegistryUpsertConfig,
-  type RegistryTouchConfig,
-  type RegistryRemoveConfig,
-  type RegistryGetConfig,
-  type RegistryListConfig,
-  type RegistryCasConfig,
-  type RegistryEntry,
-  type RegistrySnapshot,
-  type RegistryRecvConfig,
-  type RegistryEvent,
-  type RegistryReader,
-} from "./src/registry";
-
 // Job
 export {
   job,
   type JobId,
-  type JobStatus,
-  type JobTerminal,
-  type SubmitOptions,
-  type JoinOptions,
-  type CancelOptions,
-  type JobEvent,
-  type JobEvents,
-  type JobContext,
+  type JobCtx,
+  type JobAfterCtx,
+  type JobConfig,
   type JobHandle,
-  type JobDefinition,
+  type JobMetrics,
+  type SubmitConfig,
 } from "./src/job";
 
 // Scheduler
@@ -92,11 +76,9 @@ export {
   scheduler,
   type Scheduler,
   type SchedulerConfig,
-  type SchedulerRegisterConfig,
-  type SchedulerUnregisterConfig,
-  type SchedulerTriggerNowConfig,
-  type SchedulerGetConfig,
   type SchedulerInfo,
-  type SchedulerMetric,
-  type SchedulerMetricsSnapshot,
+  type SchedulerMetrics,
+  type ScheduleConfig,
+  type ScheduleCtx,
+  type ScheduleAfterCtx,
 } from "./src/scheduler";

@@ -1,4 +1,3 @@
-import type { z } from "zod";
 import { Emitter } from "./internal/emitter";
 import { randomId } from "./internal/id";
 import { sleep } from "./internal/sleep";
@@ -22,9 +21,8 @@ const textEncoder = new TextEncoder();
 // Types
 // ==========================
 
-export type QueueConfig<TSchema extends z.ZodTypeAny> = {
+export type QueueConfig<T = unknown> = {
   id: string;
-  schema: TSchema;
   tenantId?: string;
   prefix?: string;
   ordering?: {
@@ -131,8 +129,8 @@ type QueueState = {
 // Queue Factory
 // ==========================
 
-export const queue = <TSchema extends z.ZodTypeAny>(config: QueueConfig<TSchema>): Queue<z.infer<TSchema>> => {
-  type TData = z.infer<TSchema>;
+export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
+  type TData = T;
 
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
@@ -251,10 +249,7 @@ export const queue = <TSchema extends z.ZodTypeAny>(config: QueueConfig<TSchema>
     const tenantId = resolveTenant(sendCfg.tenantId);
     const state = getState(tenantId);
 
-    const parsed = config.schema.safeParse(sendCfg.data);
-    if (!parsed.success) throw parsed.error;
-
-    const payloadRaw = JSON.stringify(parsed.data);
+    const payloadRaw = JSON.stringify(sendCfg.data);
     const payloadBytes = textEncoder.encode(payloadRaw).byteLength;
     if (payloadBytes > maxPayloadBytes) {
       throw new Error(`payload exceeds limit (${maxPayloadBytes} bytes)`);
@@ -270,7 +265,7 @@ export const queue = <TSchema extends z.ZodTypeAny>(config: QueueConfig<TSchema>
 
     const messageId = String(++state.seq);
     const msg: StoredMessage<TData> = {
-      data: parsed.data,
+      data: sendCfg.data,
       orderingKey: sendCfg.orderingKey,
       meta: sendCfg.meta,
       enqueuedAt: Date.now(),
@@ -379,15 +374,6 @@ export const queue = <TSchema extends z.ZodTypeAny>(config: QueueConfig<TSchema>
       msg: StoredMessage,
       delivery: DeliveryMeta,
     ): QueueReceived<TData> | null => {
-      const parsed = config.schema.safeParse(msg.data);
-      if (!parsed.success) {
-        // Invalid schema — discard
-        state.deliveries.delete(deliveryId);
-        state.leases.delete(deliveryId);
-        state.messages.delete(messageId);
-        return null;
-      }
-
       let settled = false;
 
       const ack = async (): Promise<boolean> => {
@@ -440,7 +426,7 @@ export const queue = <TSchema extends z.ZodTypeAny>(config: QueueConfig<TSchema>
       };
 
       return {
-        data: parsed.data,
+        data: msg.data as TData,
         messageId,
         deliveryId,
         attempt: msg.attempt,
