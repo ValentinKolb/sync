@@ -1,18 +1,13 @@
-import { z, type ZodTypeAny } from "zod";
 import { queue, type Queue } from "./queue";
-import { topic, type Topic } from "./topic";
+import { expBackoff, type BackoffOptions } from "./retry";
 import { sleep } from "./internal/sleep";
-import {
-  computeRetryDelay,
-  isTerminalStatus,
-} from "./internal/job-utils";
 
 const DEFAULT_PREFIX = "sync:job";
+const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_LEASE_MS = 30_000;
 const DEFAULT_WORKER_RECV_TIMEOUT_MS = 1_000;
-const DEFAULT_MAX_ATTEMPTS = 1;
-const DAY_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_STATE_RETENTION_MS = 7 * DAY_MS;
+const DEFAULT_KEY_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_KEY_TTL_MS = 30 * DAY_MS;
 
 // ==========================
 // Types
@@ -20,241 +15,152 @@ const DEFAULT_STATE_RETENTION_MS = 7 * DAY_MS;
 
 export type JobId = string;
 
-export type JobStatus = "completed" | "failed" | "cancelled" | "timed_out";
-
-export type JobTerminal<Result = unknown> = {
-  id: JobId;
-  status: JobStatus;
-  result?: Result;
-  error?: {
-    message: string;
-    code?: string;
-  };
-  finishedAt: number;
+export type JobMetrics = {
+  dispatches: number;
+  failures: number;
+  reschedules: number;
 };
 
-export type SubmitOptions = {
-  key?: string;
+export type JobCtx<Input = void> = {
+  jobId: JobId;
+  key: string;
+  input: Input;
+  failureCount: number;
+  readonly duration: number;
+  signal: AbortSignal;
+  heartbeat(cfg?: { leaseMs?: number }): Promise<void>;
+};
+
+export type JobAfterCtx<Input = void, Result = unknown> = JobCtx<Input> & {
+  data?: Result;
+  error?: Error;
+  reschedule(cfg?: { delayMs?: number }): void;
+  expBackoff(cfg?: BackoffOptions): number;
+  metric: JobMetrics;
+};
+
+export type SubmitConfig<Input = void> = {
+  key: string;
   keyTtlMs?: number;
   delayMs?: number;
   at?: number;
-  maxAttempts?: number;
-  backoff?: {
-    kind: "fixed" | "exp";
-    baseMs: number;
-    maxMs?: number;
-  };
   leaseMs?: number;
   meta?: Record<string, unknown>;
-};
+} & (Input extends void ? { input?: Input } : { input: Input });
 
-export type JoinOptions = {
-  timeoutMs?: number;
-};
-
-export type CancelOptions = {
-  reason?: string;
-};
-
-export type JobEvent =
-  | { type: "submitted"; id: JobId; ts: number }
-  | { type: "started"; id: JobId; runId: string; attempt: number; ts: number }
-  | { type: "heartbeat"; id: JobId; runId: string; ts: number }
-  | { type: "retry"; id: JobId; runId: string; nextAt: number; reason?: string; ts: number }
-  | { type: "completed"; id: JobId; ts: number }
-  | { type: "failed"; id: JobId; reason?: string; ts: number }
-  | { type: "cancelled"; id: JobId; reason?: string; ts: number };
-
-export type JobEvents = Pick<Topic<JobEvent>, "reader" | "live">;
-
-export type JobContext = {
-  step<T>(cfg: { id: string; run: () => Promise<T> | T }): Promise<T>;
-  heartbeat(cfg?: { leaseMs?: number }): Promise<void>;
-  signal: AbortSignal;
-};
-
-export type JobHandle<Input, Result = unknown> = {
+export type JobConfig<Input = void, Result = unknown> = {
   id: string;
-  submit(cfg: { input: Input } & SubmitOptions): Promise<JobId>;
-  validateInput(input: unknown): void;
-  join(cfg: { id: JobId } & JoinOptions): Promise<JobTerminal<Result>>;
-  cancel(cfg: { id: JobId } & CancelOptions): Promise<void>;
-  events(id: JobId): JobEvents;
+  prefix?: string;
+  defaults?: {
+    leaseMs?: number;
+    keyTtlMs?: number;
+  };
+  process: (cfg: { ctx: JobCtx<Input> }) => Promise<Result> | Result;
+  after?: (cfg: { ctx: JobAfterCtx<Input, Result> }) => Promise<void> | void;
+};
+
+export type JobHandle<Input = void> = {
+  id: string;
+  submit(cfg: SubmitConfig<Input>): Promise<JobId>;
+  metric(): JobMetrics;
   stop(): void;
 };
 
-export type JobDefinition<TSchema extends ZodTypeAny, Result = unknown> = {
-  id: string;
-  schema: TSchema;
-  defaults?: Omit<SubmitOptions, "key" | "delayMs" | "at" | "meta">;
-  process: (cfg: { ctx: JobContext; input: z.infer<TSchema> }) => Promise<Result> | Result;
-};
-
 // ==========================
-// Internal Types
+// Internal
 // ==========================
 
 type WorkPayload = {
-  id: JobId;
-  input: unknown;
-  maxAttempts: number;
-  backoff?: {
-    kind: "fixed" | "exp";
-    baseMs: number;
-    maxMs?: number;
-  };
+  jobId: JobId;
+  key: string;
+  input?: unknown;
+  keyTtlMs: number;
   leaseMs: number;
   meta?: Record<string, unknown>;
 };
 
-type InternalState<Result> = {
-  id: JobId;
-  status: "submitted" | "running" | JobStatus;
-  attempts: number;
-  updatedAt: number;
-  finishedAt?: number;
-  result?: Result;
-  error?: {
-    message: string;
-    code?: string;
-  };
+type IdempotencyEntry = {
+  jobId: JobId;
+  expiresAt: number;
 };
 
-const workPayloadSchema = z.object({
-  id: z.string(),
-  input: z.unknown(),
-  maxAttempts: z.number().int().min(1),
-  backoff: z
-    .object({
-      kind: z.enum(["fixed", "exp"]),
-      baseMs: z.number().int().min(0),
-      maxMs: z.number().int().min(0).optional(),
-    })
-    .optional(),
-  leaseMs: z.number().int().min(1),
-  meta: z.record(z.string(), z.unknown()).optional(),
-});
-
-const now = (): number => Date.now();
-
-const activeWorkers = new Map<string, AbortController>();
-const activeJobRuns = new Map<string, AbortController>();
-
-// Module-level shared stores keyed by definition ID.
-// This ensures multiple job() calls with the same definition.id share state,
-// matching the server behavior where Redis provides the shared state.
 type SharedJobState = {
-  stateStore: Map<string, InternalState<unknown>>;
-  idempotencyStore: Map<string, { jobId: string; expiresAt: number }>;
+  idempotency: Map<string, IdempotencyEntry>;
   workQueue: Queue<WorkPayload>;
-  topicCache: Map<string, Topic<JobEvent>>;
+  metrics: JobMetrics;
   seq: number;
 };
-const sharedJobStates = new Map<string, SharedJobState>();
 
-const getSharedState = (definitionId: string): SharedJobState => {
-  let shared = sharedJobStates.get(definitionId);
+const sharedStates = new Map<string, SharedJobState>();
+const activeWorkers = new Map<string, AbortController>();
+
+const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
+
+const getSharedState = (id: string, prefix: string, defaultLeaseMs: number): SharedJobState => {
+  const key = `${prefix}:${id}`;
+  let shared = sharedStates.get(key);
   if (!shared) {
     shared = {
-      stateStore: new Map(),
-      idempotencyStore: new Map(),
-      workQueue: queue({
-        id: `${definitionId}:work`,
-        prefix: `${DEFAULT_PREFIX}:queue`,
-        schema: workPayloadSchema,
+      idempotency: new Map(),
+      workQueue: queue<WorkPayload>({
+        id: `${id}:work`,
+        prefix: `${prefix}:queue`,
         delivery: {
-          defaultLeaseMs: DEFAULT_LEASE_MS,
+          defaultLeaseMs,
           maxDeliveries: Number.MAX_SAFE_INTEGER,
         },
-      }) as unknown as Queue<WorkPayload>,
-      topicCache: new Map(),
+      }),
+      metrics: {
+        dispatches: 0,
+        failures: 0,
+        reschedules: 0,
+      },
       seq: 0,
     };
-    sharedJobStates.set(definitionId, shared);
+    sharedStates.set(key, shared);
   }
   return shared;
 };
 
 // ==========================
-// Job Factory
+// Factory
 // ==========================
 
-export const job = <TSchema extends ZodTypeAny, Result = unknown>(
-  definition: JobDefinition<TSchema, Result>,
-): JobHandle<z.infer<TSchema>, Result> => {
-  type Input = z.infer<TSchema>;
+export const job = <Input = void, Result = unknown>(
+  config: JobConfig<Input, Result>,
+): JobHandle<Input> => {
+  const prefix = config.prefix ?? DEFAULT_PREFIX;
+  const workerId = `${prefix}:${config.id}`;
+  const defaultLeaseMs = Math.max(1, config.defaults?.leaseMs ?? DEFAULT_LEASE_MS);
+  const defaultKeyTtlMs = Math.min(
+    MAX_KEY_TTL_MS,
+    Math.max(1_000, config.defaults?.keyTtlMs ?? DEFAULT_KEY_TTL_MS),
+  );
 
-  const prefix = DEFAULT_PREFIX;
-  const workerId = `${prefix}:${definition.id}`;
-  const runningJobKey = (jobId: JobId): string => `${workerId}:run:${jobId}`;
+  const shared = getSharedState(config.id, prefix, defaultLeaseMs);
+  const metrics = shared.metrics;
 
-  // Shared state across all handles with the same definition.id
-  const shared = getSharedState(definition.id);
-  const stateStore = shared.stateStore as Map<string, InternalState<Result>>;
-  const idempotencyStore = shared.idempotencyStore;
-  const workQueue = shared.workQueue;
-  const topicCache = shared.topicCache;
-
-  const eventsTopicFor = (jobId: JobId): Topic<JobEvent> => {
-    let cached = topicCache.get(jobId);
-    if (cached) return cached;
-    cached = topic({
-      id: `${definition.id}:${jobId}:events`,
-      prefix: `${prefix}:events`,
-      schema: z.any(),
-      retentionMs: 7 * DAY_MS,
-    }) as unknown as Topic<JobEvent>;
-    topicCache.set(jobId, cached);
-    return cached;
+  const sweepExpiredKeys = (): void => {
+    const now = Date.now();
+    for (const [k, v] of shared.idempotency) {
+      if (now >= v.expiresAt) shared.idempotency.delete(k);
+    }
   };
 
-  const emitEvent = async (jobId: JobId, event: JobEvent): Promise<void> => {
-    await eventsTopicFor(jobId).pub({ data: event });
+  const claimKey = (key: string, keyTtlMs: number): { jobId: JobId; isNew: boolean } => {
+    sweepExpiredKeys();
+    const existing = shared.idempotency.get(key);
+    if (existing && Date.now() < existing.expiresAt) {
+      return { jobId: existing.jobId, isNew: false };
+    }
+    const jobId = String(++shared.seq);
+    shared.idempotency.set(key, { jobId, expiresAt: Date.now() + keyTtlMs });
+    return { jobId, isNew: true };
   };
 
-  const readState = (jobId: JobId): InternalState<Result> | null => {
-    return stateStore.get(jobId) ?? null;
+  const releaseKey = (key: string): void => {
+    shared.idempotency.delete(key);
   };
-
-  const writeState = (state: InternalState<Result>): void => {
-    stateStore.set(state.id, { ...state });
-  };
-
-  const writeStateIfAbsent = (state: InternalState<Result>): boolean => {
-    if (stateStore.has(state.id)) return false;
-    stateStore.set(state.id, { ...state });
-    return true;
-  };
-
-  /** CAS: write final state, return "ok" | "cancelled" | "missing" */
-  const writeFinalState = (state: InternalState<Result>): "ok" | "cancelled" | "missing" => {
-    const existing = stateStore.get(state.id);
-    if (!existing) return "missing";
-    if (existing.status === "cancelled") return "cancelled";
-    if (isTerminalStatus(existing.status)) return "missing";
-    stateStore.set(state.id, { ...state });
-    // Schedule cleanup of terminal state
-    setTimeout(() => {
-      const current = stateStore.get(state.id);
-      if (current && (current.status === "completed" || current.status === "failed" || current.status === "cancelled" || current.status === "timed_out")) {
-        stateStore.delete(state.id);
-      }
-    }, DEFAULT_STATE_RETENTION_MS);
-    return "ok";
-  };
-
-  /** CAS: write cancelled state only if not already terminal */
-  const writeCancelledState = (state: InternalState<Result>): boolean => {
-    const existing = stateStore.get(state.id);
-    if (!existing) return false;
-    if (isTerminalStatus(existing.status)) return false;
-    stateStore.set(state.id, { ...state });
-    return true;
-  };
-
-  // ==========================
-  // Worker
-  // ==========================
 
   const startWorker = (): void => {
     if (activeWorkers.has(workerId)) return;
@@ -265,206 +171,88 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
       try {
         while (!workerAc.signal.aborted) {
           try {
-            const message = await workQueue.recv({
+            const message = await shared.workQueue.recv({
               wait: true,
               timeoutMs: DEFAULT_WORKER_RECV_TIMEOUT_MS,
-              leaseMs: DEFAULT_LEASE_MS,
+              leaseMs: defaultLeaseMs,
             });
 
             if (!message) continue;
 
-            const payload = message.data as WorkPayload;
-            let state = readState(payload.id);
+            const payload = message.data;
+            const attempt = message.attempt;
+            const failureCount = attempt - 1;
+            const startedAt = Date.now();
+            const jobAc = new AbortController();
 
-            if (!state) {
-              writeStateIfAbsent({
-                id: payload.id,
-                status: "submitted",
-                attempts: 0,
-                updatedAt: now(),
+            const makeCtx = (): JobCtx<Input> => {
+              const ctx = {
+                jobId: payload.jobId,
+                key: payload.key,
+                input: payload.input as Input,
+                failureCount,
+                signal: jobAc.signal,
+                heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
+                  await message.touch({ leaseMs: cfg?.leaseMs ?? payload.leaseMs });
+                },
+              } as JobCtx<Input>;
+              Object.defineProperty(ctx, "duration", {
+                get: () => Date.now() - startedAt,
+                enumerable: true,
               });
-              state = readState(payload.id);
-              if (!state) {
-                await message.nack({ delayMs: 250, reason: "state_missing_recover_failed" });
-                continue;
+              return ctx;
+            };
+
+            const ctx = makeCtx();
+
+            let result: Result | undefined;
+            let error: Error | undefined;
+            try {
+              result = await Promise.resolve(config.process({ ctx }));
+            } catch (err) {
+              jobAc.abort();
+              error = asError(err);
+            }
+
+            // Build after ctx
+            let rescheduleRequested: { delayMs?: number } | null = null;
+            const afterCtx: JobAfterCtx<Input, Result> = Object.create(ctx) as JobAfterCtx<Input, Result>;
+            if (error) afterCtx.error = error;
+            if (!error) afterCtx.data = result;
+            afterCtx.reschedule = (rcfg?: { delayMs?: number }): void => {
+              rescheduleRequested = { delayMs: rcfg?.delayMs };
+            };
+            afterCtx.expBackoff = (bcfg?: BackoffOptions): number => expBackoff(failureCount + 1, bcfg);
+            afterCtx.metric = metrics;
+
+            if (config.after) {
+              try {
+                await Promise.resolve(config.after({ ctx: afterCtx }));
+              } catch {
+                // after errors are swallowed
               }
             }
 
-            if (state.status === "cancelled" || isTerminalStatus(state.status)) {
-              await message.ack();
+            if (rescheduleRequested) {
+              const nacked = await message.nack({
+                delayMs: (rescheduleRequested as { delayMs?: number }).delayMs ?? 0,
+                reason: "reschedule",
+                error: error?.message,
+              });
+              metrics.reschedules += 1;
+              if (!nacked) continue;
               continue;
             }
 
-            const attempt = message.attempt;
-            const runId = message.deliveryId;
-            const startedAt = now();
+            // Terminal: ack + release key
+            const acked = await message.ack();
+            if (!acked) continue;
+            releaseKey(payload.key);
 
-            writeState({
-              ...state,
-              status: "running",
-              attempts: attempt,
-              updatedAt: startedAt,
-            });
-
-            await emitEvent(payload.id, {
-              type: "started",
-              id: payload.id,
-              runId,
-              attempt,
-              ts: startedAt,
-            });
-
-            await message.touch({ leaseMs: payload.leaseMs });
-
-            const jobAc = new AbortController();
-            const jobRunKey = runningJobKey(payload.id);
-            activeJobRuns.set(jobRunKey, jobAc);
-
-            try {
-              let leaseDeadline = Date.now() + payload.leaseMs;
-
-              const ctx: JobContext = {
-                signal: jobAc.signal,
-                step: async <T>(cfg: { id: string; run: () => Promise<T> | T }): Promise<T> => {
-                  return await Promise.resolve(cfg.run());
-                },
-                heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
-                  const extendMs = cfg?.leaseMs ?? payload.leaseMs;
-                  leaseDeadline = Date.now() + extendMs;
-                  await message.touch({ leaseMs: extendMs });
-                  await emitEvent(payload.id, {
-                    type: "heartbeat",
-                    id: payload.id,
-                    runId,
-                    ts: now(),
-                  });
-                },
-              };
-
-              const inputParsed = definition.schema.safeParse(payload.input);
-              if (!inputParsed.success) {
-                throw inputParsed.error;
-              }
-
-              const processPromise = Promise.resolve(definition.process({ ctx, input: inputParsed.data as Input }));
-
-              // Resettable timeout that respects heartbeat extensions
-              const result = await new Promise<Result>((resolve, reject) => {
-                let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-
-                const checkTimeout = (): void => {
-                  const remaining = leaseDeadline - Date.now();
-                  if (remaining <= 0) {
-                    const err = new Error("job execution timed out");
-                    err.name = "JobTimeoutError";
-                    reject(err);
-                    return;
-                  }
-                  timeoutHandle = setTimeout(checkTimeout, Math.min(remaining, 1000));
-                };
-
-                checkTimeout();
-                processPromise.then(resolve, reject).finally(() => {
-                  if (timeoutHandle) clearTimeout(timeoutHandle);
-                });
-              });
-
-              const latest = readState(payload.id);
-              if (latest?.status === "cancelled") {
-                jobAc.abort();
-                await message.ack();
-                continue;
-              }
-
-              const acked = await message.ack();
-              if (!acked) continue;
-
-              const finishedAt = now();
-              const writeResult = writeFinalState({
-                id: payload.id,
-                status: "completed",
-                attempts: attempt,
-                updatedAt: finishedAt,
-                finishedAt,
-                result: result as Result,
-              });
-              if (writeResult !== "ok") continue;
-
-              await emitEvent(payload.id, {
-                type: "completed",
-                id: payload.id,
-                ts: finishedAt,
-              });
-            } catch (error) {
-              jobAc.abort();
-              const err = error instanceof Error ? error : new Error(String(error));
-              const timedOut = err.name === "JobTimeoutError";
-              const canRetry = attempt < payload.maxAttempts;
-
-              if (canRetry) {
-                const delayMs = computeRetryDelay(payload.backoff, attempt);
-                const nextAt = now() + delayMs;
-
-                const nacked = await message.nack({
-                  delayMs,
-                  reason: timedOut ? "timed_out" : "error",
-                  error: err.message,
-                });
-
-                if (!nacked) continue;
-
-                const latestState = readState(payload.id);
-                if (latestState?.status === "cancelled") continue;
-
-                writeState({
-                  id: payload.id,
-                  status: "submitted",
-                  attempts: attempt,
-                  updatedAt: now(),
-                });
-
-                await emitEvent(payload.id, {
-                  type: "retry",
-                  id: payload.id,
-                  runId,
-                  nextAt,
-                  reason: err.message,
-                  ts: now(),
-                });
-
-                continue;
-              }
-
-              const acked = await message.ack();
-              if (!acked) continue;
-
-              const finishedAt = now();
-              const status: JobStatus = timedOut ? "timed_out" : "failed";
-
-              const writeResult = writeFinalState({
-                id: payload.id,
-                status,
-                attempts: attempt,
-                updatedAt: finishedAt,
-                finishedAt,
-                error: {
-                  message: err.message,
-                  code: timedOut ? "TIMEOUT" : undefined,
-                },
-              });
-              if (writeResult !== "ok") continue;
-
-              await emitEvent(payload.id, {
-                type: "failed",
-                id: payload.id,
-                reason: err.message,
-                ts: finishedAt,
-              });
-            } finally {
-              const active = activeJobRuns.get(jobRunKey);
-              if (active === jobAc) {
-                activeJobRuns.delete(jobRunKey);
-              }
+            if (error) {
+              metrics.failures += 1;
+            } else {
+              metrics.dispatches += 1;
             }
           } catch {
             if (workerAc.signal.aborted) break;
@@ -480,201 +268,41 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
     })();
   };
 
-  // ==========================
-  // submit
-  // ==========================
-
-  const submit = async (cfg: { input: Input } & SubmitOptions): Promise<JobId> => {
+  const submit = async (cfg: SubmitConfig<Input>): Promise<JobId> => {
+    if (!cfg.key) throw new Error("submit: key is required");
     startWorker();
 
-    const parsed = definition.schema.safeParse(cfg.input);
-    if (!parsed.success) throw parsed.error;
+    const leaseMs = Math.max(1, cfg.leaseMs ?? defaultLeaseMs);
+    const keyTtlMs = Math.min(MAX_KEY_TTL_MS, Math.max(1_000, cfg.keyTtlMs ?? defaultKeyTtlMs));
+    const delayMs = cfg.at !== undefined ? Math.max(0, cfg.at - Date.now()) : Math.max(0, cfg.delayMs ?? 0);
 
-    const maxAttempts = Math.max(1, cfg.maxAttempts ?? definition.defaults?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS);
-    const leaseMs = Math.max(1, cfg.leaseMs ?? definition.defaults?.leaseMs ?? DEFAULT_LEASE_MS);
-    const backoff = cfg.backoff ?? definition.defaults?.backoff;
-    const delayMs = cfg.at !== undefined ? Math.max(0, cfg.at - now()) : Math.max(0, cfg.delayMs ?? 0);
-    const keyTtlMs = Math.max(1_000, cfg.keyTtlMs ?? DEFAULT_STATE_RETENTION_MS);
-
-    // Lazy cleanup of expired idempotency entries
-    const nowMs = Date.now();
-    for (const [k, v] of idempotencyStore) {
-      if (nowMs >= v.expiresAt) idempotencyStore.delete(k);
-    }
-
-    let jobId: string;
-    let isNewSubmission = true;
-
-    if (cfg.key) {
-      // Idempotency check
-      const existing = idempotencyStore.get(cfg.key);
-      if (existing && Date.now() < existing.expiresAt) {
-        jobId = existing.jobId;
-        isNewSubmission = false;
-      } else {
-        jobId = String(++shared.seq);
-        idempotencyStore.set(cfg.key, { jobId, expiresAt: Date.now() + keyTtlMs });
-      }
-    } else {
-      jobId = String(++shared.seq);
-    }
-
-    const submittedState: InternalState<Result> = {
-      id: jobId,
-      status: "submitted",
-      attempts: 0,
-      updatedAt: now(),
-    };
+    const { jobId, isNew } = claimKey(cfg.key, keyTtlMs);
+    if (!isNew) return jobId;
 
     const payload: WorkPayload = {
-      id: jobId,
-      input: parsed.data,
-      maxAttempts,
-      backoff,
+      jobId,
+      key: cfg.key,
+      input: (cfg as { input?: Input }).input,
+      keyTtlMs,
       leaseMs,
       meta: cfg.meta,
     };
 
-    if (!isNewSubmission) {
-      const existingState = readState(jobId);
-      if (existingState) return jobId;
-    }
-
-    await workQueue.send({
-      data: payload,
-      delayMs,
-      idempotencyKey: cfg.key,
-      idempotencyTtlMs: keyTtlMs,
-      meta: cfg.meta,
-    });
-
-    const wrote = writeStateIfAbsent(submittedState);
-    if (wrote) {
-      await emitEvent(jobId, {
-        type: "submitted",
-        id: jobId,
-        ts: now(),
+    try {
+      await shared.workQueue.send({
+        data: payload,
+        delayMs,
+        meta: cfg.meta,
       });
+    } catch (error) {
+      releaseKey(cfg.key);
+      throw error;
     }
 
     return jobId;
   };
 
-  // ==========================
-  // join
-  // ==========================
-
-  const join = async (cfg: { id: JobId } & JoinOptions): Promise<JobTerminal<Result>> => {
-    const state = readState(cfg.id);
-    if (state && isTerminalStatus(state.status)) {
-      return {
-        id: cfg.id,
-        status: state.status,
-        result: state.result,
-        error: state.error,
-        finishedAt: state.finishedAt ?? state.updatedAt,
-      };
-    }
-
-    const ac = new AbortController();
-    let timeout: ReturnType<typeof setTimeout> | null = null;
-
-    if (cfg.timeoutMs !== undefined) {
-      timeout = setTimeout(() => ac.abort(), cfg.timeoutMs);
-    }
-
-    try {
-      for await (const event of eventsTopicFor(cfg.id).live({
-        after: "0",
-        signal: ac.signal,
-        timeoutMs: cfg.timeoutMs ?? 30_000,
-      })) {
-        if (
-          event.data.type === "completed" ||
-          event.data.type === "failed" ||
-          event.data.type === "cancelled"
-        ) {
-          const finalState = readState(cfg.id);
-          if (finalState && isTerminalStatus(finalState.status)) {
-            return {
-              id: cfg.id,
-              status: finalState.status,
-              result: finalState.result,
-              error: finalState.error,
-              finishedAt: finalState.finishedAt ?? finalState.updatedAt,
-            };
-          }
-        }
-      }
-    } catch {
-      // aborted or timed out
-    } finally {
-      if (timeout) clearTimeout(timeout);
-    }
-
-    // One final check
-    const finalState = readState(cfg.id);
-    if (finalState && isTerminalStatus(finalState.status)) {
-      return {
-        id: cfg.id,
-        status: finalState.status,
-        result: finalState.result,
-        error: finalState.error,
-        finishedAt: finalState.finishedAt ?? finalState.updatedAt,
-      };
-    }
-
-    return {
-      id: cfg.id,
-      status: "timed_out",
-      error: {
-        message: "join timed out",
-        code: "JOIN_TIMEOUT",
-      },
-      finishedAt: now(),
-    };
-  };
-
-  // ==========================
-  // cancel
-  // ==========================
-
-  const cancel = async (cfg: { id: JobId } & CancelOptions): Promise<void> => {
-    const existing = readState(cfg.id);
-    if (!existing) return;
-    if (isTerminalStatus(existing.status)) return;
-
-    const finishedAt = now();
-    const wrote = writeCancelledState({
-      id: cfg.id,
-      status: "cancelled",
-      attempts: existing.attempts,
-      updatedAt: finishedAt,
-      finishedAt,
-      error: cfg.reason
-        ? { message: cfg.reason, code: "CANCELLED" }
-        : undefined,
-    });
-    if (!wrote) return;
-
-    activeJobRuns.get(runningJobKey(cfg.id))?.abort();
-
-    await emitEvent(cfg.id, {
-      type: "cancelled",
-      id: cfg.id,
-      reason: cfg.reason,
-      ts: finishedAt,
-    });
-  };
-
-  // ==========================
-  // events / stop
-  // ==========================
-
-  const events = (id: JobId): JobEvents => {
-    const t = eventsTopicFor(id);
-    return { reader: t.reader, live: t.live };
-  };
+  const metric = (): JobMetrics => ({ ...metrics });
 
   const stop = (): void => {
     const ac = activeWorkers.get(workerId);
@@ -685,15 +313,9 @@ export const job = <TSchema extends ZodTypeAny, Result = unknown>(
   };
 
   return {
-    id: definition.id,
+    id: config.id,
     submit,
-    validateInput: (input: unknown): void => {
-      const parsed = definition.schema.safeParse(input);
-      if (!parsed.success) throw parsed.error;
-    },
-    join,
-    cancel,
-    events,
+    metric,
     stop,
   };
 };

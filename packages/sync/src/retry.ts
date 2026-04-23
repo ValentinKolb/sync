@@ -1,14 +1,35 @@
 import { sleep } from "bun";
 
-export type RetryOptions = {
-  attempts?: number;
-  minDelayMs?: number;
-  maxDelayMs?: number;
-  factor?: number;
+// ==========================
+// Types
+// ==========================
+
+export type BackoffOptions = {
+  baseMs?: number;
+  maxMs?: number;
   jitter?: number;
-  signal?: AbortSignal;
-  retryIf?: (error: unknown) => boolean;
 };
+
+export type RetryCtx = {
+  attempt: number;
+};
+
+export type RetryAfterCtx<T = unknown> = RetryCtx & {
+  data?: T;
+  error?: Error;
+  reschedule(cfg?: { delayMs?: number }): void;
+  expBackoff(cfg?: BackoffOptions): number;
+};
+
+export type RetryConfig<T = unknown> = {
+  run: (cfg: { ctx: RetryCtx }) => Promise<T> | T;
+  after?: (cfg: { ctx: RetryAfterCtx<T> }) => Promise<void> | void;
+  signal?: AbortSignal;
+};
+
+// ==========================
+// Helpers
+// ==========================
 
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
 
@@ -52,19 +73,17 @@ export const isRetryableTransportError = (error: unknown): boolean => {
   );
 };
 
-export const DEFAULT_RETRY_OPTIONS = {
-  attempts: 8,
-  minDelayMs: 100,
-  maxDelayMs: 2_000,
-  factor: 2,
-  jitter: 0.2,
-  retryIf: isRetryableTransportError,
-} as const;
-
-const computeDelayMs = (attempt: number, opts: Required<Pick<RetryOptions, "minDelayMs" | "maxDelayMs" | "factor" | "jitter">>): number => {
-  const base = opts.minDelayMs * opts.factor ** Math.max(0, attempt - 1);
-  const capped = Math.min(opts.maxDelayMs, base);
-  const spread = capped * opts.jitter;
+/**
+ * Compute exponential backoff delay in ms for a given attempt (1-indexed).
+ * Defaults: baseMs=100, maxMs=2_000, jitter=0.2 (±20%).
+ */
+export const expBackoff = (attempt: number, cfg?: BackoffOptions): number => {
+  const baseMs = Math.max(0, cfg?.baseMs ?? 100);
+  const maxMs = Math.max(baseMs, cfg?.maxMs ?? 2_000);
+  const jitter = Math.min(1, Math.max(0, cfg?.jitter ?? 0.2));
+  const raw = baseMs * 2 ** Math.max(0, attempt - 1);
+  const capped = Math.min(maxMs, raw);
+  const spread = capped * jitter;
   const jittered = capped + (Math.random() * 2 - 1) * spread;
   return Math.max(0, Math.floor(jittered));
 };
@@ -93,30 +112,52 @@ const sleepWithSignal = async (delayMs: number, signal?: AbortSignal): Promise<v
   });
 };
 
-export const retry = async <T>(
-  fn: (attempt: number) => Promise<T> | T,
-  opts: RetryOptions = {},
-): Promise<T> => {
-  const attempts = Math.max(1, opts.attempts ?? DEFAULT_RETRY_OPTIONS.attempts);
-  const minDelayMs = Math.max(0, opts.minDelayMs ?? DEFAULT_RETRY_OPTIONS.minDelayMs);
-  const maxDelayMs = Math.max(minDelayMs, opts.maxDelayMs ?? DEFAULT_RETRY_OPTIONS.maxDelayMs);
-  const factor = Math.max(1, opts.factor ?? DEFAULT_RETRY_OPTIONS.factor);
-  const jitter = Math.min(1, Math.max(0, opts.jitter ?? DEFAULT_RETRY_OPTIONS.jitter));
-  const retryIf = opts.retryIf ?? DEFAULT_RETRY_OPTIONS.retryIf;
+// ==========================
+// retry()
+// ==========================
 
-  for (let attempt = 1; attempt <= attempts; attempt++) {
-    if (opts.signal?.aborted) throw createAbortError();
+export const retry = async <T>(config: RetryConfig<T>): Promise<T> => {
+  let attempt = 0;
 
+  while (true) {
+    if (config.signal?.aborted) throw createAbortError();
+    attempt += 1;
+
+    const ctx: RetryCtx = { attempt };
+
+    let result: T | undefined;
+    let error: Error | undefined;
     try {
-      return await fn(attempt);
-    } catch (error) {
-      if (attempt >= attempts) throw error;
-      if (!retryIf(error)) throw error;
-
-      const delayMs = computeDelayMs(attempt, { minDelayMs, maxDelayMs, factor, jitter });
-      await sleepWithSignal(delayMs, opts.signal);
+      result = await Promise.resolve(config.run({ ctx }));
+    } catch (err) {
+      error = asError(err);
     }
-  }
 
-  throw new Error("unreachable retry state");
+    let rescheduleRequested: { delayMs?: number } | null = null;
+    const afterCtx: RetryAfterCtx<T> = Object.create(ctx) as RetryAfterCtx<T>;
+    if (error) afterCtx.error = error;
+    if (!error) afterCtx.data = result;
+    afterCtx.reschedule = (rcfg?: { delayMs?: number }): void => {
+      rescheduleRequested = { delayMs: rcfg?.delayMs };
+    };
+    afterCtx.expBackoff = (bcfg?: BackoffOptions): number => expBackoff(attempt, bcfg);
+
+    if (config.after) {
+      try {
+        await Promise.resolve(config.after({ ctx: afterCtx }));
+      } catch {
+        // after errors swallowed — fall through to terminal decision
+      }
+    }
+
+    if (rescheduleRequested) {
+      const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
+      await sleepWithSignal(delayMs, config.signal);
+      continue;
+    }
+
+    // Terminal
+    if (error) throw error;
+    return result as T;
+  }
 };

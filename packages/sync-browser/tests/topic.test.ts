@@ -1,5 +1,4 @@
 import { test, expect } from "bun:test";
-import { z } from "zod";
 import { topic } from "../src/topic";
 import { createMemoryStore } from "../src/store";
 
@@ -12,7 +11,6 @@ test("pub and recv basic flow", async () => {
   const t = topic({
     id: "basic",
     prefix: "test:bt",
-    schema: z.object({ type: z.string(), orderId: z.string() }),
     store,
   });
 
@@ -32,30 +30,6 @@ test("pub and recv basic flow", async () => {
 });
 
 // ==========================
-// Schema validation
-// ==========================
-
-test("pub validates schema and rejects invalid data", async () => {
-  const store = createMemoryStore();
-  const t = topic({
-    id: "validate",
-    prefix: "test:bt",
-    schema: z.object({ count: z.number().min(0) }),
-    store,
-  });
-
-  let thrown: unknown = null;
-  try {
-    // @ts-expect-error intentional invalid type
-    await t.pub({ data: { count: "not-a-number" } });
-  } catch (error) {
-    thrown = error;
-  }
-
-  expect(thrown).not.toBeNull();
-});
-
-// ==========================
 // recv with wait: false
 // ==========================
 
@@ -64,7 +38,6 @@ test("reader recv with wait: false returns null when empty", async () => {
   const t = topic({
     id: "empty-recv",
     prefix: "test:bt",
-    schema: z.object({ id: z.string() }),
     store,
   });
 
@@ -81,7 +54,6 @@ test("reader stream yields events", async () => {
   const t = topic({
     id: "stream",
     prefix: "test:bt",
-    schema: z.object({ idx: z.number() }),
     store,
   });
 
@@ -105,7 +77,6 @@ test("reader stream stops on AbortSignal", async () => {
   const t = topic({
     id: "stream-abort",
     prefix: "test:bt",
-    schema: z.object({ v: z.number() }),
     store,
   });
 
@@ -136,7 +107,6 @@ test("live yields events after subscription", async () => {
   const t = topic({
     id: "live",
     prefix: "test:bt",
-    schema: z.object({ n: z.number() }),
     store,
   });
 
@@ -166,7 +136,6 @@ test("live with after cursor replays events", async () => {
   const t = topic({
     id: "live-replay",
     prefix: "test:bt",
-    schema: z.object({ value: z.number() }),
     store,
   });
 
@@ -196,7 +165,6 @@ test("consumer group isolation - different groups get same events", async () => 
   const t = topic({
     id: "groups",
     prefix: "test:bt",
-    schema: z.object({ value: z.number() }),
     store,
   });
 
@@ -221,7 +189,6 @@ test("idempotency key prevents duplicate publishing", async () => {
   const t = topic({
     id: "idempotency",
     prefix: "test:bt",
-    schema: z.object({ id: z.string() }),
     store,
   });
 
@@ -251,7 +218,6 @@ test("payload size limit is enforced", async () => {
   const t = topic({
     id: "size-limit",
     prefix: "test:bt",
-    schema: z.object({ data: z.string() }),
     limits: { payloadBytes: 64 },
     store,
   });
@@ -280,7 +246,6 @@ test("ordering key is preserved", async () => {
   const t = topic({
     id: "ordering",
     prefix: "test:bt",
-    schema: z.object({ v: z.number() }),
     store,
   });
 
@@ -302,7 +267,6 @@ test("meta is preserved", async () => {
   const t = topic({
     id: "meta",
     prefix: "test:bt",
-    schema: z.object({ v: z.number() }),
     store,
   });
 
@@ -329,7 +293,6 @@ test("commit returns true", async () => {
   const t = topic({
     id: "commit",
     prefix: "test:bt",
-    schema: z.object({ n: z.number() }),
     store,
   });
 
@@ -352,7 +315,6 @@ test("different tenants are isolated", async () => {
   const t = topic({
     id: "tenant-iso",
     prefix: "test:bt",
-    schema: z.object({ value: z.string() }),
     store,
   });
 
@@ -383,7 +345,6 @@ test("recv with wait true and timeoutMs returns null after timeout", async () =>
   const store = createMemoryStore();
   const t = topic({
     id: "timeout-test",
-    schema: z.object({ msg: z.string() }),
     store,
   });
   const r = t.reader("timeout-group");
@@ -399,7 +360,6 @@ test("commit returns true on first call", async () => {
   const store = createMemoryStore();
   const t = topic({
     id: "commit-test",
-    schema: z.object({ v: z.number() }),
     store,
   });
   await t.pub({ data: { v: 1 } });

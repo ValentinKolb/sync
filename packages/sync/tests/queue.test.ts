@@ -1,6 +1,5 @@
 import { beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { z } from "zod";
 import { queue } from "../index";
 
 beforeEach(async () => {
@@ -14,7 +13,6 @@ test("send + recv + ack", async () => {
   const q = queue({
     id: "basic",
     prefix: "test:q",
-    schema: z.object({ msg: z.string() }),
   });
 
   await q.send({ data: { msg: "hello" } });
@@ -32,7 +30,6 @@ test("nack requeues message and increments attempt", async () => {
   const q = queue({
     id: "nack",
     prefix: "test:q",
-    schema: z.object({ n: z.number() }),
   });
 
   await q.send({ data: { n: 1 } });
@@ -51,7 +48,6 @@ test("delay sends message to delayed queue", async () => {
   const q = queue({
     id: "delay",
     prefix: "test:q",
-    schema: z.object({ ok: z.boolean() }),
   });
 
   await q.send({ data: { ok: true }, delayMs: 80 });
@@ -69,7 +65,6 @@ test("touch extends lease", async () => {
   const q = queue({
     id: "touch",
     prefix: "test:q",
-    schema: z.object({ id: z.string() }),
   });
 
   await q.send({ data: { id: "a" } });
@@ -90,7 +85,6 @@ test("expired lease requeues message", async () => {
   const q = queue({
     id: "expire",
     prefix: "test:q",
-    schema: z.object({ id: z.string() }),
   });
 
   await q.send({ data: { id: "b" } });
@@ -111,7 +105,6 @@ test("idempotency key deduplicates send", async () => {
   const q = queue({
     id: "idempotency",
     prefix: "test:q",
-    schema: z.object({ k: z.string() }),
   });
 
   const a = await q.send({ data: { k: "x" }, idempotencyKey: "same" });
@@ -129,7 +122,6 @@ test("reader exposes recv/stream as read-only handle", async () => {
   const q = queue({
     id: "reader",
     prefix: "test:q",
-    schema: z.object({ v: z.number() }),
   });
 
   await q.send({ data: { v: 1 } });
@@ -146,29 +138,10 @@ test("reader exposes recv/stream as read-only handle", async () => {
   expect(values).toEqual([1, 2]);
 });
 
-test("send validates data against schema", async () => {
-  const q = queue({
-    id: "validate",
-    prefix: "test:q",
-    schema: z.object({ msg: z.string() }),
-  });
-
-  let thrown: unknown = null;
-  try {
-    // @ts-expect-error intentional invalid payload
-    await q.send({ data: { msg: 123 } });
-  } catch (error) {
-    thrown = error;
-  }
-
-  expect(thrown).not.toBeNull();
-});
-
 test("nack delay validation rejects values above maxNackDelayMs", async () => {
   const q = queue({
     id: "nack-limit",
     prefix: "test:q",
-    schema: z.object({ id: z.string() }),
     limits: { maxNackDelayMs: 20 },
   });
 
@@ -191,7 +164,6 @@ test("tenant isolation keeps queues separated", async () => {
   const q = queue({
     id: "tenant",
     prefix: "test:q",
-    schema: z.object({ value: z.string() }),
   });
 
   await q.send({ tenantId: "t1", data: { value: "a" } });
@@ -210,7 +182,6 @@ test("idempotency key expires after ttl", async () => {
   const q = queue({
     id: "idempotency-ttl",
     prefix: "test:q",
-    schema: z.object({ v: z.number() }),
   });
 
   const a = await q.send({ data: { v: 1 }, idempotencyKey: "k", idempotencyTtlMs: 40 });
@@ -231,7 +202,6 @@ test("parallel recv claims each message exactly once", async () => {
   const q = queue({
     id: "parallel-recv",
     prefix: "test:q",
-    schema: z.object({ idx: z.number() }),
   });
 
   const count = 20;
@@ -262,7 +232,6 @@ test("parallel send with same idempotency key deduplicates", async () => {
   const q = queue({
     id: "parallel-idem",
     prefix: "test:q",
-    schema: z.object({ v: z.number() }),
   });
 
   const results = await Promise.all(
@@ -284,7 +253,6 @@ test("double ack returns false on second call", async () => {
   const q = queue({
     id: "double-ack",
     prefix: "test:q",
-    schema: z.object({ v: z.number() }),
   });
 
   await q.send({ data: { v: 1 } });
@@ -299,7 +267,6 @@ test("double nack returns false on second call", async () => {
   const q = queue({
     id: "double-nack",
     prefix: "test:q",
-    schema: z.object({ v: z.number() }),
   });
 
   await q.send({ data: { v: 1 } });
@@ -319,7 +286,6 @@ test("ack after lease expiry and maintenance returns false", async () => {
   const q = queue({
     id: "ack-expired",
     prefix: "test:q",
-    schema: z.object({ v: z.number() }),
   });
 
   await q.send({ data: { v: 1 } });
@@ -345,7 +311,6 @@ test("nack with delay requeues after delay elapses", async () => {
   const q = queue({
     id: "nack-delay",
     prefix: "test:q",
-    schema: z.object({ v: z.number() }),
   });
 
   await q.send({ data: { v: 1 } });
@@ -370,7 +335,6 @@ test("payload exceeding size limit is rejected", async () => {
   const q = queue({
     id: "payload-limit",
     prefix: "test:q",
-    schema: z.object({ data: z.string() }),
     limits: { payloadBytes: 64 },
   });
 
@@ -389,7 +353,6 @@ test("FIFO ordering is preserved", async () => {
   const q = queue({
     id: "fifo",
     prefix: "test:q",
-    schema: z.object({ seq: z.number() }),
   });
 
   for (let i = 0; i < 10; i++) {
@@ -409,7 +372,6 @@ test("meta is preserved through send/recv", async () => {
   const q = queue({
     id: "meta",
     prefix: "test:q",
-    schema: z.object({ v: z.number() }),
   });
 
   await q.send({
@@ -428,7 +390,6 @@ test("message moves to dlq after max deliveries", async () => {
   const q = queue({
     id: "dlq",
     prefix: "test:q",
-    schema: z.object({ value: z.string() }),
     delivery: { maxDeliveries: 2 },
   });
 
@@ -457,7 +418,6 @@ test("concurrent ack and nack on same delivery — only one succeeds", async () 
   const q = queue({
     id: "race-ack-nack",
     prefix: "test:q",
-    schema: z.object({ v: z.number() }),
   });
 
   await q.send({ data: { v: 1 } });
@@ -484,7 +444,6 @@ test("nack delay exceeding maxMessageAgeMs sends message to DLQ", async () => {
   const q = queue({
     id: "nack-age-dlq",
     prefix: "test:q",
-    schema: z.object({ v: z.number() }),
     limits: { maxMessageAgeMs: 80 },
   });
 
@@ -514,7 +473,6 @@ test("blocking recv unblocks when message is sent", async () => {
   const q = queue({
     id: "blocking-recv",
     prefix: "test:q",
-    schema: z.object({ v: z.number() }),
   });
 
   const reader = q.reader();
@@ -535,7 +493,6 @@ test("maintenance requeue + second consumer recv vs original ack", async () => {
   const q = queue({
     id: "race-maintenance-ack",
     prefix: "test:q",
-    schema: z.object({ v: z.number() }),
   });
 
   await q.send({ data: { v: 1 } });

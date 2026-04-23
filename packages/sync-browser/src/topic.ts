@@ -1,4 +1,3 @@
-import type { z } from "zod";
 import { type Store, createMemoryStore } from "./store";
 import { EventLog, type EventLogEntry } from "./internal/event-log";
 import { randomId } from "./internal/id";
@@ -16,9 +15,8 @@ const textEncoder = new TextEncoder();
 // Types
 // ==========================
 
-export type TopicConfig<TSchema extends z.ZodTypeAny> = {
+export type TopicConfig<T = unknown> = {
   id: string;
-  schema: TSchema;
   tenantId?: string;
   prefix?: string;
   limits?: {
@@ -98,8 +96,8 @@ type StoredEvent<T> = {
 // Topic Factory
 // ==========================
 
-export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>): Topic<z.infer<TSchema>> => {
-  type TData = z.infer<TSchema>;
+export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
+  type TData = T;
 
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
@@ -143,11 +141,8 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
     const tenantId = resolveTenant(pubCfg.tenantId);
     const log = getEventLog(tenantId);
 
-    const parsed = config.schema.safeParse(pubCfg.data);
-    if (!parsed.success) throw parsed.error;
-
     const payload: StoredEvent<TData> = {
-      data: parsed.data,
+      data: pubCfg.data,
       orderingKey: pubCfg.orderingKey,
       meta: pubCfg.meta,
       publishedAt: Date.now(),
@@ -231,12 +226,6 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
         return null;
       }
 
-      const parsed = config.schema.safeParse(stored.data);
-      if (!parsed.success) {
-        setCursor(tenantId, entry.id);
-        return null;
-      }
-
       setCursor(tenantId, entry.id);
 
       const commit = async (): Promise<boolean> => {
@@ -245,7 +234,7 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
       };
 
       return {
-        data: parsed.data,
+        data: stored.data as TData,
         eventId: entry.id,
         cursor: entry.id,
         deliveryId: `${group}:${entry.id}`,
@@ -286,13 +275,10 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
       const stored = parsePayload(entry);
       if (!stored) continue;
 
-      const parsed = config.schema.safeParse(stored.data);
-      if (!parsed.success) continue;
-
       cursor = entry.id;
 
       yield {
-        data: parsed.data,
+        data: stored.data as TData,
         eventId: entry.id,
         cursor: entry.id,
         orderingKey: stored.orderingKey,

@@ -1,5 +1,4 @@
 import { test, expect } from "bun:test";
-import { z } from "zod";
 import { queue } from "../src/queue";
 
 // Helper: unique queue per test to avoid cross-test interference
@@ -13,7 +12,6 @@ const makeQueue = (opts?: {
   return queue({
     id: `test-q-${counter}`,
     prefix: "test:bq",
-    schema: z.object({ msg: z.string() }),
     delivery: {
       maxDeliveries: opts?.maxDeliveries,
       defaultLeaseMs: opts?.defaultLeaseMs,
@@ -358,24 +356,6 @@ test("payload size limit enforced", async () => {
 });
 
 // ==========================
-// 16. Schema validation rejects invalid data
-// ==========================
-
-test("schema validation rejects invalid data", async () => {
-  const q = makeQueue();
-
-  let thrown: unknown = null;
-  try {
-    // @ts-expect-error intentional invalid data
-    await q.send({ data: { msg: 123 } });
-  } catch (error) {
-    thrown = error;
-  }
-
-  expect(thrown).not.toBeNull();
-});
-
-// ==========================
 // 17. Stream yields messages in order
 // ==========================
 
@@ -526,7 +506,6 @@ test("AbortSignal cancels recv", async () => {
 test("nack with delayMs exceeding maxNackDelayMs throws", async () => {
   const q = queue({
     id: `nack-overflow-${Date.now()}`,
-    schema: z.object({ v: z.number() }),
     limits: { maxNackDelayMs: 100 },
   });
   await q.send({ data: { v: 1 } });
@@ -538,7 +517,6 @@ test("nack with delayMs exceeding maxNackDelayMs throws", async () => {
 test("touch after ack returns false", async () => {
   const q = queue({
     id: `touch-after-ack-${Date.now()}`,
-    schema: z.object({ v: z.number() }),
   });
   await q.send({ data: { v: 1 } });
   const msg = await q.recv({ wait: false });
@@ -554,7 +532,6 @@ test("touch after ack returns false", async () => {
 test("message age expiry in claimNext moves to DLQ", async () => {
   const q = queue({
     id: `age-dlq-${Date.now()}`,
-    schema: z.object({ v: z.number() }),
     limits: { maxMessageAgeMs: 100 },
     delivery: { defaultLeaseMs: 30_000 },
   });
@@ -569,7 +546,6 @@ test("message age expiry in claimNext moves to DLQ", async () => {
 test("nack after ack returns false", async () => {
   const q = queue({
     id: `nack-after-ack-${Date.now()}`,
-    schema: z.object({ v: z.number() }),
   });
   await q.send({ data: { v: 1 } });
   const msg = await q.recv({ wait: false });
@@ -581,7 +557,6 @@ test("nack after ack returns false", async () => {
 test("ack after nack returns false", async () => {
   const q = queue({
     id: `ack-after-nack-${Date.now()}`,
-    schema: z.object({ v: z.number() }),
   });
   await q.send({ data: { v: 1 } });
   const msg = await q.recv({ wait: false });
@@ -593,7 +568,6 @@ test("ack after nack returns false", async () => {
 test("delayed message age expiry during maintenance moves to DLQ", async () => {
   const q = queue({
     id: `delayed-age-${Date.now()}`,
-    schema: z.object({ v: z.number() }),
     limits: { maxMessageAgeMs: 50 },
   });
   // Send with a delay longer than maxMessageAgeMs
@@ -609,7 +583,6 @@ test("delayed message age expiry during maintenance moves to DLQ", async () => {
 test("tenant isolation between queues", async () => {
   const q = queue({
     id: `tenant-iso-${Date.now()}`,
-    schema: z.object({ v: z.number() }),
   });
   await q.send({ data: { v: 1 }, tenantId: "t1" });
   await q.send({ data: { v: 2 }, tenantId: "t2" });

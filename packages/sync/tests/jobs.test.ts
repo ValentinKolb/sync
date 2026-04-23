@@ -1,6 +1,5 @@
 import { beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { z } from "zod";
 import { job } from "../index";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -12,558 +11,541 @@ beforeEach(async () => {
   }
 });
 
-test("submit + join completes a job", async () => {
-  const sendOrderMail = job({
-    id: uid("job-complete"),
-    schema: z.object({ value: z.number() }),
-    process: async ({ input }) => input.value * 2,
-  });
-
-  const id = await sendOrderMail.submit({ input: { value: 2 } });
-  const terminal = await sendOrderMail.join({ id, timeoutMs: 5_000 });
-
-  expect(terminal.status).toBe("completed");
-  expect(terminal.result).toBe(4);
-});
-
-test("retry then complete", async () => {
-  let calls = 0;
-
-  const worker = job({
-    id: uid("job-retry"),
-    schema: z.object({}),
-    process: async () => {
-      calls += 1;
-      if (calls < 2) throw new Error("first failure");
-      return "ok";
-    },
-  });
-
-  const id = await worker.submit({
-    input: {},
-    maxAttempts: 2,
-    backoff: { kind: "fixed", baseMs: 50 },
-  });
-
-  const terminal = await worker.join({ id, timeoutMs: 8_000 });
-
-  expect(terminal.status).toBe("completed");
-  expect(terminal.result).toBe("ok");
-  expect(calls).toBe(2);
-});
-
-test("cancel marks job as cancelled", async () => {
-  const worker = job({
-    id: uid("job-cancel"),
-    schema: z.object({ id: z.string() }),
-    process: async () => {
-      await Bun.sleep(100);
-      return "done";
-    },
-  });
-
-  const id = await worker.submit({
-    input: { id: "a" },
-    delayMs: 200,
-  });
-
-  await worker.cancel({ id, reason: "user-request" });
-
-  const terminal = await worker.join({ id, timeoutMs: 5_000 });
-  expect(terminal.status).toBe("cancelled");
-});
-
-test("events expose topic reader/live API", async () => {
-  const worker = job({
-    id: uid("job-events"),
-    schema: z.object({ value: z.number() }),
-    process: async ({ input }) => input.value + 1,
-  });
-
-  const id = await worker.submit({ input: { value: 5 } });
-  const terminal = await worker.join({ id, timeoutMs: 5_000 });
-  expect(terminal.status).toBe("completed");
-
-  const events = worker.events(id);
-  const reader = events.reader("orchestrator");
-
-  const types: string[] = [];
-  for await (const event of reader.stream({ wait: false })) {
-    types.push(event.data.type);
-    await event.commit();
+const waitFor = async (pred: () => boolean, timeoutMs = 5_000, pollMs = 20): Promise<void> => {
+  const start = Date.now();
+  while (!pred()) {
+    if (Date.now() - start > timeoutMs) throw new Error(`waitFor timed out after ${timeoutMs}ms`);
+    await Bun.sleep(pollMs);
   }
+};
 
-  expect(types.includes("submitted")).toBe(true);
-  expect(types.includes("started")).toBe(true);
-  expect(types.includes("completed")).toBe(true);
-  expect(typeof events.live).toBe("function");
-});
+// ==========================
+// Happy path
+// ==========================
 
-test("submit deduplicates by key", async () => {
-  const worker = job({
-    id: uid("job-dedup"),
-    schema: z.object({ value: z.number() }),
-    process: async ({ input }) => input.value,
-  });
+test("submit + process + after (success path)", async () => {
+  let afterCalled = false;
+  let seenData: number | undefined;
+  let seenError: Error | undefined;
 
-  const a = await worker.submit({ input: { value: 1 }, key: "same-key" });
-  const b = await worker.submit({ input: { value: 1 }, key: "same-key" });
-
-  expect(a).toBe(b);
-  const terminal = await worker.join({ id: a, timeoutMs: 5_000 });
-  expect(terminal.status).toBe("completed");
-});
-
-test("join returns timed_out when timeout is reached", async () => {
-  const worker = job({
-    id: uid("job-join-timeout"),
-    schema: z.object({}),
-    process: async () => "ok",
-  });
-
-  const id = await worker.submit({ input: {}, delayMs: 500 });
-  const terminal = await worker.join({ id, timeoutMs: 50 });
-
-  expect(terminal.status).toBe("timed_out");
-  expect(terminal.error?.code).toBe("JOIN_TIMEOUT");
-});
-
-test("job fails permanently after max attempts", async () => {
-  const worker = job({
-    id: uid("job-fail"),
-    schema: z.object({}),
-    process: async () => {
-      throw new Error("boom");
+  const worker = job<void, number>({
+    id: uid("happy"),
+    process: async () => 42,
+    after: async ({ ctx }) => {
+      afterCalled = true;
+      seenData = ctx.data;
+      seenError = ctx.error;
     },
   });
 
-  const id = await worker.submit({ input: {}, maxAttempts: 1 });
-  const terminal = await worker.join({ id, timeoutMs: 5_000 });
-
-  expect(terminal.status).toBe("failed");
-  expect(terminal.error?.message).toBe("boom");
-});
-
-test("job reaches timed_out status when lease is exceeded", async () => {
-  const worker = job({
-    id: uid("job-timeout"),
-    schema: z.object({}),
-    process: async () => {
-      await Bun.sleep(120);
-      return "late";
-    },
-  });
-
-  const id = await worker.submit({ input: {}, leaseMs: 40, maxAttempts: 1 });
-  const terminal = await worker.join({ id, timeoutMs: 5_000 });
-
-  expect(terminal.status).toBe("timed_out");
-});
-
-test("parallel submit with same key deduplicates atomically", async () => {
-  const worker = job({
-    id: uid("job-parallel-dedup"),
-    schema: z.object({ v: z.number() }),
-    process: async ({ input }) => input.v,
-  });
-
-  const results = await Promise.all(
-    Array.from({ length: 10 }, () =>
-      worker.submit({ input: { v: 1 }, key: "race-key" }),
-    ),
-  );
-
-  const unique = new Set(results);
-  expect(unique.size).toBe(1);
-
-  const terminal = await worker.join({ id: results[0], timeoutMs: 5_000 });
-  expect(terminal.status).toBe("completed");
-});
-
-test("stop() halts worker processing", async () => {
-  let processed = 0;
-
-  const worker = job({
-    id: uid("job-stop"),
-    schema: z.object({}),
-    process: async () => {
-      processed += 1;
-      return "ok";
-    },
-  });
-
-  const id = await worker.submit({ input: {} });
-  const terminal = await worker.join({ id, timeoutMs: 5_000 });
-  expect(terminal.status).toBe("completed");
-  expect(processed).toBe(1);
-
-  worker.stop();
-
-  // After stop, submitting starts the worker again
-  const id2 = await worker.submit({ input: {} });
-  const terminal2 = await worker.join({ id: id2, timeoutMs: 5_000 });
-  expect(terminal2.status).toBe("completed");
-  expect(processed).toBe(2);
+  await worker.submit({ key: "chat:1" });
+  await waitFor(() => afterCalled);
+  expect(seenData).toBe(42);
+  expect(seenError).toBeUndefined();
 
   worker.stop();
 });
 
-test("ctx.signal is aborted on timeout", async () => {
-  let signalAborted = false;
+test("ctx.key and ctx.jobId flow through process and after", async () => {
+  let processKey: string | null = null;
+  let afterKey: string | null = null;
+  let afterJobId: string | null = null;
 
   const worker = job({
-    id: uid("job-signal"),
-    schema: z.object({}),
+    id: uid("ctx-keys"),
     process: async ({ ctx }) => {
-      ctx.signal.addEventListener("abort", () => {
-        signalAborted = true;
-      });
-      await Bun.sleep(200);
-      return "late";
+      processKey = ctx.key;
+    },
+    after: async ({ ctx }) => {
+      afterKey = ctx.key;
+      afterJobId = ctx.jobId;
     },
   });
 
-  const id = await worker.submit({ input: {}, leaseMs: 40, maxAttempts: 1 });
-  const terminal = await worker.join({ id, timeoutMs: 5_000 });
+  const id = await worker.submit({ key: "chat:xyz" });
+  await waitFor(() => afterKey !== null);
+  expect(processKey).toBe("chat:xyz");
+  expect(afterKey).toBe("chat:xyz");
+  expect(afterJobId).toBe(id);
 
-  expect(terminal.status).toBe("timed_out");
-  // Give abort handler time to fire
-  await Bun.sleep(20);
-  expect(signalAborted).toBe(true);
+  worker.stop();
 });
 
-test("ctx.signal is aborted on error", async () => {
-  let signalAborted = false;
+test("ctx.duration reflects elapsed ms in process and after", async () => {
+  let processDuration: number | null = null;
+  let afterDuration: number | null = null;
 
   const worker = job({
-    id: uid("job-signal-err"),
-    schema: z.object({}),
+    id: uid("duration"),
     process: async ({ ctx }) => {
-      ctx.signal.addEventListener("abort", () => {
-        signalAborted = true;
-      });
-      throw new Error("boom");
-    },
-  });
-
-  const id = await worker.submit({ input: {}, maxAttempts: 1 });
-  const terminal = await worker.join({ id, timeoutMs: 5_000 });
-
-  expect(terminal.status).toBe("failed");
-  await Bun.sleep(20);
-  expect(signalAborted).toBe(true);
-});
-
-test("state TTL is isolated per job", async () => {
-  const worker = job({
-    id: uid("job-ttl-isolation"),
-    schema: z.object({ v: z.number() }),
-    process: async ({ input }) => input.v,
-  });
-
-  const id1 = await worker.submit({ input: { v: 1 } });
-  const id2 = await worker.submit({ input: { v: 2 } });
-
-  const t1 = await worker.join({ id: id1, timeoutMs: 5_000 });
-  const t2 = await worker.join({ id: id2, timeoutMs: 5_000 });
-  expect(t1.status).toBe("completed");
-  expect(t2.status).toBe("completed");
-
-  // Both states exist as independent Redis keys
-  const raw1 = await redis.get(`sync:job:${worker.id}:state:${id1}`);
-  const raw2 = await redis.get(`sync:job:${worker.id}:state:${id2}`);
-  expect(raw1).not.toBeNull();
-  expect(raw2).not.toBeNull();
-
-  // Each key has its own TTL
-  const ttl1 = await redis.send("PTTL", [`sync:job:${worker.id}:state:${id1}`]);
-  const ttl2 = await redis.send("PTTL", [`sync:job:${worker.id}:state:${id2}`]);
-  expect(Number(ttl1)).toBeGreaterThan(0);
-  expect(Number(ttl2)).toBeGreaterThan(0);
-});
-
-test("cancel during running job is detected by worker", async () => {
-  let started = false;
-  let signalAborted = false;
-
-  const worker = job({
-    id: uid("job-cancel-running"),
-    schema: z.object({}),
-    process: async ({ ctx }) => {
-      started = true;
-      ctx.signal.addEventListener("abort", () => {
-        signalAborted = true;
-      });
-      await Bun.sleep(300);
-      return "done";
-    },
-  });
-
-  const id = await worker.submit({ input: {}, leaseMs: 5_000 });
-
-  // Wait for the process to start
-  while (!started) await Bun.sleep(10);
-
-  await worker.cancel({ id, reason: "mid-flight" });
-  const terminal = await worker.join({ id, timeoutMs: 5_000 });
-  expect(terminal.status).toBe("cancelled");
-  await Bun.sleep(20);
-  expect(signalAborted).toBe(true);
-});
-
-test("cancel on already-completed job is a no-op", async () => {
-  const worker = job({
-    id: uid("job-cancel-noop"),
-    schema: z.object({}),
-    process: async () => "done",
-  });
-
-  const id = await worker.submit({ input: {} });
-  const terminal = await worker.join({ id, timeoutMs: 5_000 });
-  expect(terminal.status).toBe("completed");
-
-  // Cancel after completion should not change the state
-  await worker.cancel({ id, reason: "too late" });
-
-  const raw = await redis.get(`sync:job:${worker.id}:state:${id}`);
-  const state = JSON.parse(raw!);
-  expect(state.status).toBe("completed");
-});
-
-test("multiple concurrent joins on same job all resolve", async () => {
-  const worker = job({
-    id: uid("job-multi-join"),
-    schema: z.object({}),
-    process: async () => {
-      await Bun.sleep(50);
-      return "result";
-    },
-  });
-
-  const id = await worker.submit({ input: {} });
-
-  const [t1, t2, t3] = await Promise.all([
-    worker.join({ id, timeoutMs: 5_000 }),
-    worker.join({ id, timeoutMs: 5_000 }),
-    worker.join({ id, timeoutMs: 5_000 }),
-  ]);
-
-  expect(t1.status).toBe("completed");
-  expect(t2.status).toBe("completed");
-  expect(t3.status).toBe("completed");
-  expect(t1.result).toBe("result");
-});
-
-test("exponential backoff emits retry events with increasing nextAt", async () => {
-  const worker = job({
-    id: uid("job-exp-backoff"),
-    schema: z.object({}),
-    process: async () => {
-      throw new Error("retry me");
-    },
-  });
-
-  const id = await worker.submit({
-    input: {},
-    maxAttempts: 3,
-    backoff: { kind: "exp", baseMs: 100 },
-  });
-
-  const terminal = await worker.join({ id, timeoutMs: 15_000 });
-  expect(terminal.status).toBe("failed");
-
-  // Read retry events and check that nextAt gaps increase
-  const events = worker.events(id);
-  const reader = events.reader("backoff-check");
-  const retryDeltas: number[] = [];
-
-  for await (const event of reader.stream({ wait: false })) {
-    if (event.data.type === "retry") {
-      retryDeltas.push(event.data.nextAt - event.data.ts);
-    }
-    await event.commit();
-  }
-
-  // Should have 2 retry events (attempts 1 and 2 fail, attempt 3 fails terminally)
-  expect(retryDeltas.length).toBe(2);
-  // First retry: baseMs * 2^0 = 100, second retry: baseMs * 2^1 = 200
-  expect(retryDeltas[0]).toBeGreaterThanOrEqual(80); // ~100ms with some slack
-  expect(retryDeltas[1]).toBeGreaterThanOrEqual(160); // ~200ms with some slack
-  expect(retryDeltas[1]).toBeGreaterThan(retryDeltas[0]);
-});
-
-test("cancel emits cancelled event", async () => {
-  const worker = job({
-    id: uid("job-cancel-event"),
-    schema: z.object({}),
-    process: async () => "ok",
-  });
-
-  const id = await worker.submit({ input: {}, delayMs: 200 });
-  await worker.cancel({ id, reason: "manual" });
-
-  const events = worker.events(id);
-  const reader = events.reader("cancel-reader");
-  const types: string[] = [];
-
-  for await (const event of reader.stream({ wait: false })) {
-    types.push(event.data.type);
-    await event.commit();
-  }
-
-  expect(types.includes("cancelled")).toBe(true);
-});
-
-// ==========================
-// Race condition tests
-// ==========================
-
-test("cancel racing with completed write — final state is consistent", async () => {
-  // This test characterizes the race between cancel() and the worker
-  // writing "completed" state. We run multiple iterations to provoke
-  // the timing-dependent interleaving.
-  for (let attempt = 0; attempt < 20; attempt++) {
-    let processCompleted = false;
-
-    const worker = job({
-      id: uid("job-cancel-race"),
-      schema: z.object({}),
-      process: async () => {
-        await Bun.sleep(20);
-        processCompleted = true;
-        return "done";
-      },
-    });
-
-    const id = await worker.submit({ input: {}, leaseMs: 5_000 });
-
-    // Wait until the process is likely completing
-    while (!processCompleted) await Bun.sleep(5);
-
-    // Race: cancel right as the worker is finishing
-    await worker.cancel({ id, reason: "race" });
-
-    const terminal = await worker.join({ id, timeoutMs: 5_000 });
-
-    // The state should be one of the two — never something else
-    expect(["completed", "cancelled"]).toContain(terminal.status);
-
-    // Verify Redis state matches what join reported
-    const raw = await redis.get(`sync:job:${worker.id}:state:${id}`);
-    expect(raw).not.toBeNull();
-    const state = JSON.parse(raw!);
-    expect(state.status).toBe(terminal.status);
-
-    worker.stop();
-  }
-});
-
-test("lease expiry during processing does not cause double execution", async () => {
-  let execCount = 0;
-
-  const worker = job({
-    id: uid("job-no-double"),
-    schema: z.object({}),
-    process: async () => {
-      execCount += 1;
-      // Sleep less than leaseMs so withTimeout doesn't fire,
-      // but close enough that lease timing could be tight
       await Bun.sleep(30);
-      return "ok";
+      processDuration = ctx.duration;
+    },
+    after: async ({ ctx }) => {
+      afterDuration = ctx.duration;
     },
   });
 
-  const id = await worker.submit({ input: {}, leaseMs: 80, maxAttempts: 1 });
-  const terminal = await worker.join({ id, timeoutMs: 5_000 });
+  await worker.submit({ key: "x" });
+  await waitFor(() => afterDuration !== null);
+  expect(processDuration!).toBeGreaterThanOrEqual(25);
+  expect(afterDuration!).toBeGreaterThanOrEqual(processDuration!);
 
-  expect(terminal.status).toBe("completed");
-  expect(execCount).toBe(1);
+  worker.stop();
 });
 
-test("multiple rapid submits produce independent jobs", async () => {
-  let count = 0;
+// ==========================
+// Typed Input
+// ==========================
+
+test("typed input flows through submit → process → after", async () => {
+  let seen: { userId: string } | undefined;
+  let afterSeen: { userId: string } | undefined;
+
+  const worker = job<{ userId: string }, { processed: string }>({
+    id: uid("typed-input"),
+    process: async ({ ctx }) => {
+      seen = ctx.input;
+      return { processed: ctx.input.userId };
+    },
+    after: async ({ ctx }) => {
+      afterSeen = ctx.input;
+    },
+  });
+
+  await worker.submit({ key: "welcome:42", input: { userId: "42" } });
+  await waitFor(() => afterSeen !== undefined);
+  expect(seen?.userId).toBe("42");
+  expect(afterSeen?.userId).toBe("42");
+
+  worker.stop();
+});
+
+test("no input: submit omits input, ctx.input is undefined", async () => {
+  let inputVal: unknown = "sentinel";
 
   const worker = job({
-    id: uid("job-rapid-submit"),
-    schema: z.object({ n: z.number() }),
-    process: async ({ input }) => {
-      count += 1;
-      return input.n * 2;
+    id: uid("no-input"),
+    process: async ({ ctx }) => {
+      inputVal = ctx.input;
     },
   });
 
-  // Submit 10 jobs rapidly without idempotency keys
-  const ids = await Promise.all(
-    Array.from({ length: 10 }, (_, i) =>
-      worker.submit({ input: { n: i } }),
-    ),
-  );
+  await worker.submit({ key: "x" });
+  await waitFor(() => inputVal !== "sentinel");
+  expect(inputVal).toBeUndefined();
 
-  // All should have unique IDs
-  expect(new Set(ids).size).toBe(10);
-
-  // All should complete
-  const results = await Promise.all(
-    ids.map((id) => worker.join({ id, timeoutMs: 10_000 })),
-  );
-
-  for (const r of results) {
-    expect(r.status).toBe("completed");
-  }
-  expect(count).toBe(10);
+  worker.stop();
 });
 
-test("worker recovers when state key is missing but queue message exists", async () => {
+// ==========================
+// ctx.data / ctx.error
+// ==========================
+
+test("process throws → after sees ctx.error and no ctx.data", async () => {
+  let afterError: Error | undefined;
+  let afterData: unknown;
+
+  const worker = job({
+    id: uid("error"),
+    process: async () => {
+      throw new Error("kaboom");
+    },
+    after: async ({ ctx }) => {
+      afterError = ctx.error;
+      afterData = ctx.data;
+    },
+  });
+
+  await worker.submit({ key: "x" });
+  await waitFor(() => afterError !== undefined);
+  expect(afterError?.message).toBe("kaboom");
+  expect(afterData).toBeUndefined();
+
+  worker.stop();
+});
+
+test("process returns non-JSON value (Date) — passes in-memory to after", async () => {
+  let afterData: Date | undefined;
+  const sent = new Date("2024-01-15T10:00:00Z");
+
+  const worker = job<void, Date>({
+    id: uid("date-result"),
+    process: async () => sent,
+    after: async ({ ctx }) => {
+      afterData = ctx.data;
+    },
+  });
+
+  await worker.submit({ key: "x" });
+  await waitFor(() => afterData !== undefined);
+  expect(afterData).toBeInstanceOf(Date);
+  expect(afterData!.toISOString()).toBe(sent.toISOString());
+  // Same instance — proof that no JSON round-trip happened
+  expect(afterData).toBe(sent);
+
+  worker.stop();
+});
+
+// ==========================
+// Idempotency key lifecycle
+// ==========================
+
+test("concurrent submit with same key returns same jobId and runs once", async () => {
   let runs = 0;
 
   const worker = job({
-    id: uid("job-recover-missing-state"),
-    schema: z.object({ v: z.number() }),
-    process: async ({ input }) => {
+    id: uid("same-key-concurrent"),
+    process: async () => {
       runs += 1;
-      return input.v * 3;
+      await Bun.sleep(80);
     },
   });
 
-  const id = await worker.submit({
-    input: { v: 7 },
-    key: "recover-state-key",
-    delayMs: 100,
-  });
+  const [id1, id2, id3] = await Promise.all([
+    worker.submit({ key: "chat:1" }),
+    worker.submit({ key: "chat:1" }),
+    worker.submit({ key: "chat:1" }),
+  ]);
+  expect(id1).toBe(id2);
+  expect(id2).toBe(id3);
 
-  await Bun.sleep(20);
-  await redis.del(`sync:job:${worker.id}:state:${id}`);
-
-  const terminal = await worker.join({ id, timeoutMs: 6_000 });
-  expect(terminal.status).toBe("completed");
-  expect(terminal.result).toBe(21);
+  await Bun.sleep(300);
   expect(runs).toBe(1);
+
+  worker.stop();
 });
 
-test("cancel remains authoritative if written before completion finalize", async () => {
-  let started = false;
+test("key released after successful terminal; resubmit with same key gets new jobId", async () => {
+  let runs = 0;
 
   const worker = job({
-    id: uid("job-cancel-authoritative"),
-    schema: z.object({}),
+    id: uid("key-release-success"),
     process: async () => {
-      started = true;
-      await Bun.sleep(120);
-      return "done";
+      runs += 1;
     },
   });
 
-  const id = await worker.submit({ input: {}, leaseMs: 5_000 });
-  while (!started) await Bun.sleep(5);
+  const id1 = await worker.submit({ key: "chat:x" });
+  await waitFor(() => runs === 1);
 
-  await worker.cancel({ id, reason: "force-cancel" });
-  const terminal = await worker.join({ id, timeoutMs: 5_000 });
-  expect(terminal.status).toBe("cancelled");
+  const id2 = await worker.submit({ key: "chat:x" });
+  expect(id2).not.toBe(id1);
+  await waitFor(() => runs === 2);
 
-  const raw = await redis.get(`sync:job:${worker.id}:state:${id}`);
-  expect(raw).not.toBeNull();
-  const state = JSON.parse(raw!);
-  expect(state.status).toBe("cancelled");
+  worker.stop();
+});
+
+test("terminal failure (no reschedule) releases key", async () => {
+  let attempts = 0;
+  let afterRuns = 0;
+
+  const worker = job({
+    id: uid("key-release-fail"),
+    process: async () => {
+      attempts += 1;
+      throw new Error("boom");
+    },
+    after: async () => {
+      afterRuns += 1;
+      // no ctx.reschedule() → terminal
+    },
+  });
+
+  const id1 = await worker.submit({ key: "chat:x" });
+  await waitFor(() => afterRuns === 1);
+  expect(attempts).toBe(1);
+
+  const id2 = await worker.submit({ key: "chat:x" });
+  expect(id2).not.toBe(id1);
+  await waitFor(() => afterRuns === 2);
+  expect(attempts).toBe(2);
+
+  worker.stop();
+});
+
+test("pending reschedule holds the key", async () => {
+  let attempts = 0;
+
+  const worker = job({
+    id: uid("reschedule-holds-key"),
+    process: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("first attempt");
+    },
+    after: async ({ ctx }) => {
+      if (ctx.error && ctx.failureCount < 3) ctx.reschedule({ delayMs: 100 });
+    },
+  });
+
+  const id1 = await worker.submit({ key: "chat:x" });
+
+  await Bun.sleep(30);
+  const id2 = await worker.submit({ key: "chat:x" });
+  expect(id2).toBe(id1);
+
+  await waitFor(() => attempts === 2);
+  expect(attempts).toBe(2);
+
+  worker.stop();
+});
+
+// ==========================
+// ctx.reschedule + failureCount
+// ==========================
+
+test("ctx.reschedule nacks with delay; failureCount increments", async () => {
+  const failureCounts: number[] = [];
+  let succeeded = false;
+
+  const worker = job({
+    id: uid("reschedule-count"),
+    process: async ({ ctx }) => {
+      if (ctx.failureCount < 2) throw new Error(`attempt ${ctx.failureCount + 1} fails`);
+      succeeded = true;
+    },
+    after: async ({ ctx }) => {
+      if (ctx.error) {
+        failureCounts.push(ctx.failureCount);
+        if (ctx.failureCount < 5) ctx.reschedule({ delayMs: 50 });
+      }
+    },
+  });
+
+  await worker.submit({ key: "x" });
+  await waitFor(() => succeeded, 10_000);
+  expect(failureCounts).toEqual([0, 1]);
+
+  worker.stop();
+});
+
+test("after with no reschedule call → terminal, no more attempts", async () => {
+  let attempts = 0;
+  let afterCalls = 0;
+
+  const worker = job({
+    id: uid("no-reschedule"),
+    process: async () => {
+      attempts += 1;
+      throw new Error("nope");
+    },
+    after: async () => {
+      afterCalls += 1;
+    },
+  });
+
+  await worker.submit({ key: "x" });
+  await waitFor(() => afterCalls === 1);
+  await Bun.sleep(300);
+
+  expect(attempts).toBe(1);
+  expect(afterCalls).toBe(1);
+
+  worker.stop();
+});
+
+test("no after defined → default is terminal (no reschedule)", async () => {
+  let attempts = 0;
+
+  const worker = job({
+    id: uid("default-terminal"),
+    process: async () => {
+      attempts += 1;
+      throw new Error("nope");
+    },
+  });
+
+  await worker.submit({ key: "x" });
+  await Bun.sleep(400);
+  expect(attempts).toBe(1);
+
+  worker.stop();
+});
+
+test("ctx.reschedule on SUCCESS re-queues (polling pattern)", async () => {
+  let runs = 0;
+
+  const worker = job<void, { hasMore: boolean }>({
+    id: uid("success-reschedule"),
+    process: async () => {
+      runs += 1;
+      return { hasMore: runs < 3 };
+    },
+    after: async ({ ctx }) => {
+      if (ctx.data?.hasMore) ctx.reschedule({ delayMs: 30 });
+    },
+  });
+
+  await worker.submit({ key: "poller" });
+  await waitFor(() => runs === 3, 5_000);
+  await Bun.sleep(200);
+
+  expect(runs).toBe(3);
+
+  worker.stop();
+});
+
+// ==========================
+// metrics()
+// ==========================
+
+test("metric() reflects dispatches / failures / reschedules", async () => {
+  const worker = job({
+    id: uid("metrics"),
+    process: async ({ ctx }) => {
+      if (ctx.key === "good") return;
+      if (ctx.key === "retry-then-good") {
+        if (ctx.failureCount < 1) throw new Error("retry me");
+        return;
+      }
+      throw new Error("bad");
+    },
+    after: async ({ ctx }) => {
+      if (ctx.error && ctx.failureCount < 1) ctx.reschedule({ delayMs: 10 });
+    },
+  });
+
+  await worker.submit({ key: "good" });
+  await worker.submit({ key: "retry-then-good" });
+  await worker.submit({ key: "bad" });
+
+  await waitFor(() => {
+    const m = worker.metric();
+    return m.dispatches + m.failures >= 2;
+  }, 5_000);
+
+  const m = worker.metric();
+  // At least 2 succeeded ("good" + "retry-then-good" after retry),
+  // at least 1 failed ("bad"), at least 1 rescheduled ("retry-then-good")
+  expect(m.dispatches).toBeGreaterThanOrEqual(2);
+  expect(m.failures).toBeGreaterThanOrEqual(1);
+  expect(m.reschedules).toBeGreaterThanOrEqual(1);
+
+  // metric() returns a copy
+  m.dispatches = 9999;
+  expect(worker.metric().dispatches).not.toBe(9999);
+
+  worker.stop();
+});
+
+test("ctx.metric is a live reference inside after", async () => {
+  let seenDispatches = -1;
+
+  const worker = job({
+    id: uid("ctx-metric"),
+    process: async () => {},
+    after: async ({ ctx }) => {
+      seenDispatches = ctx.metric.dispatches;
+    },
+  });
+
+  await worker.submit({ key: "a" });
+  await waitFor(() => seenDispatches !== -1);
+  // At the moment after ran, the success increment hasn't fired yet,
+  // so ctx.metric.dispatches is 0. This is a documented semantic:
+  // ctx.metric is a reference, updated AFTER the after callback completes.
+  expect(seenDispatches).toBe(0);
+
+  worker.stop();
+});
+
+// ==========================
+// delayMs / at
+// ==========================
+
+test("delayMs delays first execution", async () => {
+  let ranAt: number | null = null;
+  const submittedAt = Date.now();
+
+  const worker = job({
+    id: uid("delay"),
+    process: async () => {
+      ranAt = Date.now();
+    },
+  });
+
+  await worker.submit({ key: "x", delayMs: 800 });
+  await waitFor(() => ranAt !== null, 5_000);
+
+  expect(ranAt! - submittedAt).toBeGreaterThanOrEqual(700);
+
+  worker.stop();
+});
+
+// ==========================
+// ctx.heartbeat / signal
+// ==========================
+
+test("ctx.heartbeat extends lease for long runs", async () => {
+  let done = false;
+
+  const worker = job({
+    id: uid("heartbeat"),
+    defaults: { leaseMs: 300 },
+    process: async ({ ctx }) => {
+      for (let i = 0; i < 5; i++) {
+        await Bun.sleep(100);
+        await ctx.heartbeat();
+      }
+      done = true;
+    },
+  });
+
+  await worker.submit({ key: "x" });
+  await waitFor(() => done, 5_000);
+  expect(done).toBe(true);
+
+  worker.stop();
+});
+
+// ==========================
+// stop()
+// ==========================
+
+test("stop halts the worker", async () => {
+  let ran = false;
+
+  const worker = job({
+    id: uid("stop"),
+    process: async () => {
+      ran = true;
+    },
+  });
+
+  worker.stop();
+  await worker.submit({ key: "x" });
+  await waitFor(() => ran, 5_000);
+  expect(ran).toBe(true);
+
+  worker.stop();
+});
+
+// ==========================
+// after error-swallow
+// ==========================
+
+test("errors thrown inside after do not blow up the worker", async () => {
+  const processedKeys: string[] = [];
+  let secondProcessed = false;
+
+  const worker = job<void, string>({
+    id: uid("after-throws"),
+    process: async ({ ctx }) => {
+      processedKeys.push(ctx.key);
+      return ctx.key;
+    },
+    after: async ({ ctx }) => {
+      if (ctx.data === "a") throw new Error("after error — should be swallowed");
+      if (ctx.data === "b") secondProcessed = true;
+    },
+  });
+
+  await worker.submit({ key: "a" });
+  await waitFor(() => processedKeys.includes("a"));
+
+  await worker.submit({ key: "b" });
+  await waitFor(() => secondProcessed, 3_000);
+  expect(processedKeys.sort()).toEqual(["a", "b"]);
 
   worker.stop();
 });

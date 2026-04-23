@@ -6,11 +6,11 @@
   ],
   "scripts": {
     "test": "bun run --filter '*' test",
-    "typecheck": "bun run --filter '*' typecheck"
+    "typecheck": "bun run --filter '*' typecheck && bun run typecheck:parity",
+    "typecheck:parity": "cd parity && bunx tsc --noEmit"
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "typescript": "^5",
-    "zod": "^4.0.0"
+    "typescript": "^5"
   }
 }

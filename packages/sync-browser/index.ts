@@ -1,45 +1,55 @@
-// Store
-export { createMemoryStore, createLocalStorageStore, MemoryStore, LocalStorageStore, type Store } from "./src/store";
-
-// Retry
-export { retry, isRetryableTransportError, DEFAULT_RETRY_OPTIONS, type RetryOptions } from "./src/retry";
-
-// Ratelimit
-export { ratelimit, RateLimitError, type RateLimiter, type RateLimitResult, type RateLimitConfig } from "./src/ratelimit";
-
-// Mutex
-export { mutex, LockError, type Mutex, type Lock, type MutexConfig } from "./src/mutex";
-
-// Topic
 export {
-  topic,
-  type Topic,
-  type TopicConfig,
-  type TopicPubConfig,
-  type TopicRecvConfig,
-  type TopicDelivery,
-  type TopicLiveConfig,
-  type TopicLiveEvent,
-  type TopicReader,
-} from "./src/topic";
-
-// Queue
+  ratelimit,
+  RateLimitError,
+  type RateLimiter,
+  type RateLimitResult,
+  type RateLimitConfig,
+} from "./src/ratelimit";
+export { mutex, LockError, type Mutex, type Lock, type MutexConfig } from "./src/mutex";
 export {
   queue,
   type Queue,
   type QueueConfig,
-  type QueueSendConfig,
-  type QueueRecvConfig,
-  type QueueReceived,
   type QueueReader,
+  type QueueRecvConfig,
+  type QueueSendConfig,
+  type QueueReceived,
 } from "./src/queue";
-
-// Ephemeral
+export {
+  topic,
+  type Topic,
+  type TopicConfig,
+  type TopicReader,
+  type TopicRecvConfig,
+  type TopicPubConfig,
+  type TopicDelivery,
+  type TopicLiveConfig,
+  type TopicLiveEvent,
+} from "./src/topic";
+export {
+  job,
+  type JobId,
+  type JobCtx,
+  type JobAfterCtx,
+  type JobConfig,
+  type JobHandle,
+  type JobMetrics,
+  type SubmitConfig,
+} from "./src/job";
+export {
+  scheduler,
+  type Scheduler,
+  type SchedulerConfig,
+  type SchedulerInfo,
+  type SchedulerMetrics,
+  type ScheduleConfig,
+  type ScheduleCtx,
+  type ScheduleAfterCtx,
+} from "./src/scheduler";
 export {
   ephemeral,
   EphemeralCapacityError,
   EphemeralPayloadTooLargeError,
-  type EphemeralStore,
   type EphemeralConfig,
   type EphemeralUpsertConfig,
   type EphemeralTouchConfig,
@@ -49,54 +59,23 @@ export {
   type EphemeralRecvConfig,
   type EphemeralEvent,
   type EphemeralReader,
+  type EphemeralStore,
 } from "./src/ephemeral";
-
-// Registry
 export {
-  registry,
-  RegistryCapacityError,
-  RegistryPayloadTooLargeError,
-  type Registry,
-  type RegistryConfig,
-  type RegistryUpsertConfig,
-  type RegistryTouchConfig,
-  type RegistryRemoveConfig,
-  type RegistryGetConfig,
-  type RegistryListConfig,
-  type RegistryCasConfig,
-  type RegistryEntry,
-  type RegistrySnapshot,
-  type RegistryRecvConfig,
-  type RegistryEvent,
-  type RegistryReader,
-} from "./src/registry";
+  retry,
+  isRetryableTransportError,
+  expBackoff,
+  type BackoffOptions,
+  type RetryCtx,
+  type RetryAfterCtx,
+  type RetryConfig,
+} from "./src/retry";
 
-// Job
+// Browser-only: Store abstraction for persistence (not present in server package)
 export {
-  job,
-  type JobId,
-  type JobStatus,
-  type JobTerminal,
-  type SubmitOptions,
-  type JoinOptions,
-  type CancelOptions,
-  type JobEvent,
-  type JobEvents,
-  type JobContext,
-  type JobHandle,
-  type JobDefinition,
-} from "./src/job";
-
-// Scheduler
-export {
-  scheduler,
-  type Scheduler,
-  type SchedulerConfig,
-  type SchedulerRegisterConfig,
-  type SchedulerUnregisterConfig,
-  type SchedulerTriggerNowConfig,
-  type SchedulerGetConfig,
-  type SchedulerInfo,
-  type SchedulerMetric,
-  type SchedulerMetricsSnapshot,
-} from "./src/scheduler";
+  createMemoryStore,
+  createLocalStorageStore,
+  MemoryStore,
+  LocalStorageStore,
+  type Store,
+} from "./src/store";

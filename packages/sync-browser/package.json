@@ -1,7 +1,7 @@
 {
   "name": "@valentinkolb/sync-browser",
-  "version": "0.0.2",
-  "description": "Browser-compatible sync primitives — in-memory ratelimit, mutex, queue, topic, job, scheduler, registry, ephemeral, retry",
+  "version": "5.0.0",
+  "description": "Browser-compatible sync primitives — in-memory ratelimit, mutex, queue, topic, job, scheduler, ephemeral, retry",
   "module": "index.ts",
   "type": "module",
   "sideEffects": false,
@@ -14,7 +14,6 @@
     "./job": "./src/job.ts",
     "./scheduler": "./src/scheduler.ts",
     "./ephemeral": "./src/ephemeral.ts",
-    "./registry": "./src/registry.ts",
     "./retry": "./src/retry.ts",
     "./store": "./src/store.ts"
   },
@@ -23,7 +22,6 @@
     "typecheck": "bunx tsc --noEmit"
   },
   "peerDependencies": {
-    "typescript": "^5",
-    "zod": "^4"
+    "typescript": "^5"
   }
 }

@@ -1,6 +1,5 @@
 import { redis, RedisClient } from "bun";
 import { randomUUID } from "crypto";
-import type { z } from "zod";
 import { isRetryableTransportError, retry } from "./retry";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -339,9 +338,8 @@ type QueueKeys = {
   idempotencyPrefix: string;
 };
 
-export type QueueConfig<TSchema extends z.ZodTypeAny> = {
+export type QueueConfig<T = unknown> = {
   id: string;
-  schema: TSchema;
   tenantId?: string;
   prefix?: string;
   ordering?: {
@@ -421,8 +419,8 @@ type ClaimedMessage<T> = {
   meta?: Record<string, unknown>;
 };
 
-export const queue = <TSchema extends z.ZodTypeAny>(config: QueueConfig<TSchema>): Queue<z.infer<TSchema>> => {
-  type TData = z.infer<TSchema>;
+export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
+  type TData = T;
 
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
@@ -579,13 +577,6 @@ export const queue = <TSchema extends z.ZodTypeAny>(config: QueueConfig<TSchema>
           continue;
         }
 
-        const parsed = config.schema.safeParse(claimed.data);
-        if (!parsed.success) {
-          await evalScript(ACK_SCRIPT, [keys.deliveries, keys.leases, keys.messages, keys.active], [claimed.deliveryId]);
-          if (!wait) return null;
-          continue;
-        }
-
         const ack = async (): Promise<boolean> => {
           const result = await evalScript(
             ACK_SCRIPT,
@@ -626,7 +617,7 @@ export const queue = <TSchema extends z.ZodTypeAny>(config: QueueConfig<TSchema>
         };
 
         return {
-          data: parsed.data,
+          data: claimed.data as TData,
           messageId: claimed.messageId,
           deliveryId: claimed.deliveryId,
           attempt: claimed.attempt,
@@ -647,14 +638,15 @@ export const queue = <TSchema extends z.ZodTypeAny>(config: QueueConfig<TSchema>
       try {
         while (!streamCfg.signal?.aborted) {
           const message = wait
-            ? await retry(
-                async () => await recv(streamCfg),
-                {
-                  attempts: Number.POSITIVE_INFINITY,
-                  signal: streamCfg.signal,
-                  retryIf: isRetryableTransportError,
+            ? await retry({
+                run: () => recv(streamCfg),
+                after: ({ ctx }) => {
+                  if (ctx.error && isRetryableTransportError(ctx.error)) {
+                    ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
+                  }
                 },
-              )
+                signal: streamCfg.signal,
+              })
             : await recv(streamCfg);
           if (message) {
             yield message;
@@ -674,17 +666,12 @@ export const queue = <TSchema extends z.ZodTypeAny>(config: QueueConfig<TSchema>
     const tenantId = resolveTenant(sendCfg.tenantId);
     const keys = keysForTenant(tenantId);
 
-    const parsed = config.schema.safeParse(sendCfg.data);
-    if (!parsed.success) {
-      throw parsed.error;
-    }
-
     const now = Date.now();
     const delayMs = Math.max(0, sendCfg.delayMs ?? 0);
     const idempotencyTtlMs = sendCfg.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS;
 
     const message: StoredMessage<TData> = {
-      data: parsed.data,
+      data: sendCfg.data,
       attempt: 0,
       orderingKey: sendCfg.orderingKey,
       meta: sendCfg.meta,

@@ -1,4 +1,3 @@
-import type { z } from "zod";
 import { EventLog, type EventLogEntry } from "./internal/event-log";
 
 const DEFAULT_MAX_ENTRIES = 10_000;
@@ -32,9 +31,8 @@ export class EphemeralPayloadTooLargeError extends Error {
 // Types
 // ==========================
 
-export type EphemeralConfig<TSchema extends z.ZodTypeAny> = {
+export type EphemeralConfig<T = unknown> = {
   id: string;
-  schema: TSchema;
   ttlMs: number;
   tenantId?: string;
   limits?: {
@@ -99,8 +97,8 @@ export type EphemeralStore<T> = {
   upsert(cfg: EphemeralUpsertConfig<T>): Promise<EphemeralEntry<T>>;
   touch(cfg: EphemeralTouchConfig): Promise<{ ok: boolean; version?: string; expiresAt?: number }>;
   remove(cfg: EphemeralRemoveConfig): Promise<boolean>;
-  snapshot(cfg?: { tenantId?: string }): Promise<EphemeralSnapshot<T>>;
-  reader(cfg?: { after?: string; tenantId?: string }): EphemeralReader<T>;
+  snapshot(cfg?: { tenantId?: string; prefix?: string }): Promise<EphemeralSnapshot<T>>;
+  reader(cfg?: { after?: string; tenantId?: string; prefix?: string }): EphemeralReader<T>;
 };
 
 // ==========================
@@ -141,8 +139,8 @@ const assertIdentifier = (value: string, label: string): void => {
 // Ephemeral Factory
 // ==========================
 
-export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<TSchema>): EphemeralStore<z.infer<TSchema>> => {
-  type TData = z.infer<TSchema>;
+export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
+  type TData = T;
 
   if (!Number.isFinite(config.ttlMs) || config.ttlMs <= 0) {
     throw new Error("ttlMs must be > 0");
@@ -222,10 +220,7 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
       throw new EphemeralCapacityError(`maxEntries (${maxEntries}) reached`);
     }
 
-    const parsed = config.schema.safeParse(cfg.value);
-    if (!parsed.success) throw parsed.error;
-
-    const payloadRaw = JSON.stringify(parsed.data);
+    const payloadRaw = JSON.stringify(cfg.value);
     const payloadBytes = textEncoder.encode(payloadRaw).byteLength;
     if (payloadBytes > maxPayloadBytes) {
       throw new EphemeralPayloadTooLargeError(`payload exceeds limit (${maxPayloadBytes} bytes)`);
@@ -237,7 +232,7 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
 
     const stored: StoredEntry<TData> = {
       key: cfg.key,
-      data: parsed.data,
+      data: cfg.value,
       version,
       updatedAt: now,
       expiresAt,
@@ -257,7 +252,7 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
 
     return {
       key: cfg.key,
-      value: parsed.data,
+      value: cfg.value,
       version,
       updatedAt: now,
       expiresAt,
@@ -340,18 +335,17 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
   // snapshot
   // ==========================
 
-  const snapshot = async (cfg: { tenantId?: string } = {}): Promise<EphemeralSnapshot<TData>> => {
+  const snapshot = async (cfg: { tenantId?: string; prefix?: string } = {}): Promise<EphemeralSnapshot<TData>> => {
     const tenantId = resolveTenant(cfg.tenantId);
     const state = getTenantState(tenantId);
+    const prefix = cfg.prefix;
 
     const entries: EphemeralEntry<TData>[] = [];
     for (const stored of state.entries.values()) {
-      const parsed = config.schema.safeParse(stored.data);
-      if (!parsed.success) continue;
-
+      if (prefix && !stored.key.startsWith(prefix)) continue;
       entries.push({
         key: stored.key,
-        value: parsed.data,
+        value: stored.data,
         version: stored.version,
         updatedAt: stored.updatedAt,
         expiresAt: stored.expiresAt,
@@ -370,9 +364,17 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
   // reader
   // ==========================
 
-  const reader = (readerCfg: { after?: string; tenantId?: string } = {}): EphemeralReader<TData> => {
+  const reader = (readerCfg: { after?: string; tenantId?: string; prefix?: string } = {}): EphemeralReader<TData> => {
     const tenantId = resolveTenant(readerCfg.tenantId);
     const state = getTenantState(tenantId);
+    const prefix = readerCfg.prefix;
+
+    const matchesPrefix = (event: EphemeralEvent<TData>): boolean => {
+      if (!prefix) return true;
+      if (event.type === "overflow") return true;
+      if (event.type === "upsert") return event.entry.key.startsWith(prefix);
+      return event.key.startsWith(prefix);
+    };
 
     let cursor = readerCfg.after ?? state.eventLog.latest();
     let overflowPending: EphemeralEvent<TData> | null = null;
@@ -408,16 +410,14 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
         if (!rawPayload) return null;
 
         try {
-          const payload = JSON.parse(rawPayload) as unknown;
-          const parsed = config.schema.safeParse(payload);
-          if (!parsed.success) return null;
+          const payload = JSON.parse(rawPayload) as TData;
 
           return {
             type: "upsert",
             cursor: entry.id,
             entry: {
               key: (entry.fields.key as string) ?? "",
-              value: parsed.data,
+              value: payload,
               version: String(entry.fields.version ?? ""),
               updatedAt: Number(entry.fields.updatedAt),
               expiresAt: Number(entry.fields.expiresAt),
@@ -474,37 +474,44 @@ export const ephemeral = <TSchema extends z.ZodTypeAny>(config: EphemeralConfig<
       const wait = cfg.wait ?? true;
       const timeoutMs = cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-      // Try buffered entries first
-      const entries = state.eventLog.range(cursor, 1);
-      if (entries.length > 0) {
-        cursor = entries[0]!.id;
-        return parseEvent(entries[0]!);
-      }
-
-      if (!wait) return null;
-
-      // Wait with timeout
-      const ac = new AbortController();
-      const timeout = setTimeout(() => ac.abort(), timeoutMs);
-      // Combine user signal and timeout signal
-      const onUserAbort = (): void => ac.abort();
-      if (cfg.signal) cfg.signal.addEventListener("abort", onUserAbort, { once: true });
-
-      try {
-        for await (const entry of state.eventLog.subscribe(cursor, ac.signal)) {
-          clearTimeout(timeout);
-          cursor = entry.id;
-          const parsed = parseEvent(entry);
-          if (parsed) return parsed;
+      // Loop to skip prefix-mismatched events. One pass if no prefix configured.
+      while (true) {
+        // Try buffered entries first
+        const entries = state.eventLog.range(cursor, 1);
+        if (entries.length > 0) {
+          cursor = entries[0]!.id;
+          const parsed = parseEvent(entries[0]!);
+          if (parsed && matchesPrefix(parsed)) return parsed;
+          continue; // skip and try next buffered entry
         }
-      } catch {
-        // Timeout or abort
-      } finally {
-        clearTimeout(timeout);
-        if (cfg.signal) cfg.signal.removeEventListener("abort", onUserAbort);
-      }
 
-      return null;
+        if (!wait) return null;
+
+        // Wait with timeout for a matching event
+        const ac = new AbortController();
+        const timeout = setTimeout(() => ac.abort(), timeoutMs);
+        const onUserAbort = (): void => ac.abort();
+        if (cfg.signal) cfg.signal.addEventListener("abort", onUserAbort, { once: true });
+
+        let got: EphemeralEvent<TData> | null = null;
+        try {
+          for await (const entry of state.eventLog.subscribe(cursor, ac.signal)) {
+            cursor = entry.id;
+            const parsed = parseEvent(entry);
+            if (!parsed) continue;
+            if (!matchesPrefix(parsed)) continue;
+            got = parsed;
+            break;
+          }
+        } catch {
+          // Timeout or abort
+        } finally {
+          clearTimeout(timeout);
+          if (cfg.signal) cfg.signal.removeEventListener("abort", onUserAbort);
+        }
+
+        return got;
+      }
     };
 
     const stream = async function* (cfg: EphemeralRecvConfig = {}): AsyncIterable<EphemeralEvent<TData>> {

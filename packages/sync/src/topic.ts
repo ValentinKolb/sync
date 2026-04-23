@@ -1,6 +1,5 @@
 import { redis, RedisClient } from "bun";
 import { randomUUID } from "crypto";
-import type { z } from "zod";
 import { parseFirstStreamEntry, type ParsedEntry } from "./internal/topic-utils";
 import { isRetryableTransportError, retry } from "./retry";
 
@@ -85,9 +84,8 @@ const blockingReadWithTemporaryClient = async (
   }
 };
 
-export type TopicConfig<TSchema extends z.ZodTypeAny> = {
+export type TopicConfig<T = unknown> = {
   id: string;
-  schema: TSchema;
   tenantId?: string;
   prefix?: string;
   limits?: {
@@ -158,8 +156,8 @@ type StoredEvent<T> = {
   publishedAt: number;
 };
 
-export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>): Topic<z.infer<TSchema>> => {
-  type TData = z.infer<TSchema>;
+export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
+  type TData = T;
 
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
@@ -205,11 +203,8 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
     const tenantId = resolveTenant(pubCfg.tenantId);
     const key = streamKey(tenantId);
 
-    const parsed = config.schema.safeParse(pubCfg.data);
-    if (!parsed.success) throw parsed.error;
-
     const payload: StoredEvent<TData> = {
-      data: parsed.data,
+      data: pubCfg.data,
       orderingKey: pubCfg.orderingKey,
       meta: pubCfg.meta,
       publishedAt: Date.now(),
@@ -306,19 +301,13 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
         return null;
       }
 
-      const parsed = config.schema.safeParse(stored.data);
-      if (!parsed.success) {
-        await redis.send("XACK", [key, group, entry.id]);
-        return null;
-      }
-
       const commit = async (): Promise<boolean> => {
         const acked = await redis.send("XACK", [key, group, entry.id]);
         return Number(acked) > 0;
       };
 
       return {
-        data: parsed.data,
+        data: stored.data as TData,
         eventId: entry.id,
         cursor: entry.id,
         deliveryId: `${group}:${entry.id}`,
@@ -334,14 +323,15 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
       try {
         while (!streamCfg.signal?.aborted) {
           const message = wait
-            ? await retry(
-                async () => await recv(streamCfg),
-                {
-                  attempts: Number.POSITIVE_INFINITY,
-                  signal: streamCfg.signal,
-                  retryIf: isRetryableTransportError,
+            ? await retry({
+                run: () => recv(streamCfg),
+                after: ({ ctx }) => {
+                  if (ctx.error && isRetryableTransportError(ctx.error)) {
+                    ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
+                  }
                 },
-              )
+                signal: streamCfg.signal,
+              })
             : await recv(streamCfg);
           if (message) {
             yield message;
@@ -384,15 +374,15 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
 
     try {
       while (!liveCfg.signal?.aborted) {
-        const result = await retry(
-          async (): Promise<unknown> =>
+        const result = await retry<unknown>({
+          run: () =>
             liveCfg.signal
-              ? await blockingReadWithTemporaryClient(
+              ? blockingReadWithTemporaryClient(
                   "XREAD",
                   ["COUNT", "1", "BLOCK", timeoutMs.toString(), "STREAMS", key, cursor],
                   liveCfg.signal,
                 )
-              : await (async (): Promise<unknown> => {
+              : (async (): Promise<unknown> => {
                   try {
                     const client = await ensureBlockingClient();
                     return await client.send("XREAD", ["COUNT", "1", "BLOCK", timeoutMs.toString(), "STREAMS", key, cursor]);
@@ -401,12 +391,13 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
                     throw asError(error);
                   }
                 })(),
-          {
-            attempts: Number.POSITIVE_INFINITY,
-            signal: liveCfg.signal,
-            retryIf: isRetryableTransportError,
+          after: ({ ctx }) => {
+            if (ctx.error && isRetryableTransportError(ctx.error)) {
+              ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
+            }
           },
-        );
+          signal: liveCfg.signal,
+        });
 
         const entry = parseFirstStreamEntry(result);
         if (!entry) continue;
@@ -416,11 +407,8 @@ export const topic = <TSchema extends z.ZodTypeAny>(config: TopicConfig<TSchema>
         const stored = parsePayload(entry);
         if (!stored) continue;
 
-        const parsed = config.schema.safeParse(stored.data);
-        if (!parsed.success) continue;
-
         yield {
-          data: parsed.data,
+          data: stored.data as TData,
           eventId: entry.id,
           cursor: entry.id,
           orderingKey: stored.orderingKey,
