@@ -66,6 +66,7 @@ export type EphemeralEntry<T> = {
   key: string;
   value: T;
   version: string;
+  createdAt: number;
   updatedAt: number;
   expiresAt: number;
 };
@@ -109,6 +110,7 @@ type StoredEntry<T> = {
   key: string;
   data: T;
   version: string;
+  createdAt: number;
   updatedAt: number;
   expiresAt: number;
 };
@@ -230,10 +232,15 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     const version = String(++state.seq);
     const expiresAt = now + ttlMs;
 
+    // Preserve createdAt across upserts on the same key; reset only on fresh-create.
+    const previous = state.entries.get(cfg.key);
+    const createdAt = previous?.createdAt ?? now;
+
     const stored: StoredEntry<TData> = {
       key: cfg.key,
       data: cfg.value,
       version,
+      createdAt,
       updatedAt: now,
       expiresAt,
     };
@@ -245,6 +252,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       type: "upsert",
       key: cfg.key,
       version,
+      createdAt,
       updatedAt: now,
       expiresAt,
       payload: payloadRaw,
@@ -254,6 +262,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       key: cfg.key,
       value: cfg.value,
       version,
+      createdAt,
       updatedAt: now,
       expiresAt,
     };
@@ -347,6 +356,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
         key: stored.key,
         value: stored.data,
         version: stored.version,
+        createdAt: stored.createdAt,
         updatedAt: stored.updatedAt,
         expiresAt: stored.expiresAt,
       });
@@ -411,6 +421,12 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
 
         try {
           const payload = JSON.parse(rawPayload) as TData;
+          const updatedAt = Number(entry.fields.updatedAt);
+          const createdAtField = entry.fields.createdAt;
+          const createdAt =
+            createdAtField !== undefined && Number.isFinite(Number(createdAtField))
+              ? Number(createdAtField)
+              : updatedAt;
 
           return {
             type: "upsert",
@@ -419,7 +435,8 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
               key: (entry.fields.key as string) ?? "",
               value: payload,
               version: String(entry.fields.version ?? ""),
-              updatedAt: Number(entry.fields.updatedAt),
+              createdAt,
+              updatedAt,
               expiresAt: Number(entry.fields.expiresAt),
             },
           };

@@ -27,8 +27,8 @@ const UPSERT_SCRIPT = `
 
   local ttlKey = KEYS[4] .. string.len(logicalKey) .. ":" .. logicalKey
 
-  local exists = redis.call("HEXISTS", KEYS[2], logicalKey)
-  if exists == 0 then
+  local existingRaw = redis.call("HGET", KEYS[2], logicalKey)
+  if not existingRaw then
     local count = tonumber(redis.call("HLEN", KEYS[2]))
     if count >= maxEntries then
       return "__ERR_CAPACITY__"
@@ -40,6 +40,15 @@ const UPSERT_SCRIPT = `
     return "__ERR_PAYLOAD__"
   end
 
+  -- Preserve createdAt across upserts on the same key; reset only on fresh-create
+  local createdAt = now
+  if existingRaw then
+    local okExisting, existing = pcall(cjson.decode, existingRaw)
+    if okExisting and type(existing.createdAt) == "number" then
+      createdAt = existing.createdAt
+    end
+  end
+
   local version = tostring(redis.call("INCR", KEYS[1]))
   local updatedAt = now
   local expiresAt = now + ttlMs
@@ -48,6 +57,7 @@ const UPSERT_SCRIPT = `
     key = logicalKey,
     data = data,
     version = version,
+    createdAt = createdAt,
     updatedAt = updatedAt,
     expiresAt = expiresAt,
   }
@@ -67,6 +77,8 @@ const UPSERT_SCRIPT = `
     logicalKey,
     "version",
     version,
+    "createdAt",
+    tostring(createdAt),
     "updatedAt",
     tostring(updatedAt),
     "expiresAt",
@@ -351,6 +363,7 @@ export type EphemeralEntry<T> = {
   key: string;
   value: T;
   version: string;
+  createdAt: number;
   updatedAt: number;
   expiresAt: number;
 };
@@ -398,6 +411,7 @@ type StoredEntry<T> = {
   key: string;
   data: T;
   version: string;
+  createdAt: number;
   updatedAt: number;
   expiresAt: number;
 };
@@ -461,11 +475,15 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
   const parseStoredEntry = (raw: string): EphemeralEntry<TData> | null => {
     try {
       const parsed = JSON.parse(raw) as StoredEntry<TData>;
+      const updatedAt = Number(parsed.updatedAt);
+      // Fallback for legacy records that may not have createdAt: use updatedAt.
+      const createdAt = Number.isFinite(Number(parsed.createdAt)) ? Number(parsed.createdAt) : updatedAt;
       return {
         key: parsed.key,
         value: parsed.data,
         version: String(parsed.version),
-        updatedAt: Number(parsed.updatedAt),
+        createdAt,
+        updatedAt,
         expiresAt: Number(parsed.expiresAt),
       };
     } catch {
@@ -484,6 +502,9 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       const expiresAt = parseOptionalNumber(entry.fields.expiresAt);
       if (updatedAt === null || expiresAt === null) return null;
 
+      // Legacy events may not have createdAt: fall back to updatedAt.
+      const createdAt = parseOptionalNumber(entry.fields.createdAt) ?? updatedAt;
+
       return {
         type: "upsert",
         cursor: entry.id,
@@ -491,6 +512,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
           key: entry.fields.key ?? "",
           value: payload,
           version: entry.fields.version ?? "",
+          createdAt,
           updatedAt,
           expiresAt,
         },

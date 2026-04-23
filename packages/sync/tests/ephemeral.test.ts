@@ -378,3 +378,72 @@ test("reader without prefix yields all events (baseline)", async () => {
   expect(ev2?.type).toBe("upsert");
   if (ev2?.type === "upsert") expect(ev2.entry.key).toBe("services/cache");
 });
+
+// ==========================
+// createdAt (uptime tracking)
+// ==========================
+
+test("createdAt is set on first upsert", async () => {
+  const store = ephemeral<{ v: number }>({ id: testId("createdAt-init"), ttlMs: 5_000 });
+  const before = Date.now();
+  const entry = await store.upsert({ key: "k", value: { v: 1 } });
+  const after = Date.now();
+
+  expect(entry.createdAt).toBeGreaterThanOrEqual(before);
+  expect(entry.createdAt).toBeLessThanOrEqual(after);
+  expect(entry.createdAt).toBe(entry.updatedAt);
+});
+
+test("createdAt stays constant across upserts with new value", async () => {
+  const store = ephemeral<{ v: number }>({ id: testId("createdAt-preserve"), ttlMs: 5_000 });
+  const first = await store.upsert({ key: "k", value: { v: 1 } });
+  await Bun.sleep(10);
+  const second = await store.upsert({ key: "k", value: { v: 2 } });
+
+  expect(second.createdAt).toBe(first.createdAt);
+  expect(second.updatedAt).toBeGreaterThan(first.updatedAt);
+});
+
+test("createdAt stays constant across touch", async () => {
+  const store = ephemeral<{ v: number }>({ id: testId("createdAt-touch"), ttlMs: 5_000 });
+  const first = await store.upsert({ key: "k", value: { v: 1 } });
+  await Bun.sleep(10);
+  await store.touch({ key: "k" });
+
+  const snap = await store.snapshot();
+  expect(snap.entries[0]?.createdAt).toBe(first.createdAt);
+  expect(snap.entries[0]?.updatedAt).toBeGreaterThan(first.updatedAt);
+});
+
+test("createdAt resets after remove + re-upsert", async () => {
+  const store = ephemeral<{ v: number }>({ id: testId("createdAt-remove"), ttlMs: 5_000 });
+  const first = await store.upsert({ key: "k", value: { v: 1 } });
+  await Bun.sleep(15);
+  await store.remove({ key: "k" });
+  await Bun.sleep(5);
+  const second = await store.upsert({ key: "k", value: { v: 2 } });
+
+  expect(second.createdAt).toBeGreaterThan(first.createdAt);
+});
+
+test("createdAt flows through snapshot", async () => {
+  const store = ephemeral<{ v: number }>({ id: testId("createdAt-snapshot"), ttlMs: 5_000 });
+  const entry = await store.upsert({ key: "k", value: { v: 1 } });
+
+  const snap = await store.snapshot();
+  expect(snap.entries[0]?.createdAt).toBe(entry.createdAt);
+});
+
+test("createdAt flows through reader upsert event", async () => {
+  const store = ephemeral<{ v: number }>({ id: testId("createdAt-reader"), ttlMs: 5_000 });
+  const r = store.reader();
+
+  const p = r.recv({ wait: true, timeoutMs: 500 });
+  const entry = await store.upsert({ key: "k", value: { v: 1 } });
+  const ev = await p;
+
+  expect(ev?.type).toBe("upsert");
+  if (ev?.type === "upsert") {
+    expect(ev.entry.createdAt).toBe(entry.createdAt);
+  }
+});

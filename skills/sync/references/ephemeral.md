@@ -33,7 +33,8 @@ type EphemeralEntry<T> = {
   key: string;
   value: T;
   version: string;
-  updatedAt: number;
+  createdAt: number;       // first upsert of this key (preserved across touch/upsert)
+  updatedAt: number;       // most recent touch or upsert
   expiresAt: number;
 };
 
@@ -85,6 +86,13 @@ await apps.upsert({ key: "services/cache", value: { ... } });
 // Snapshot just the "apps/" prefix (server: ZRANGEBYLEX; browser: startsWith)
 const allApps = await apps.snapshot({ prefix: "apps/" });
 
+// Admin-UI: show uptime per app
+for (const entry of allApps.entries) {
+  const uptimeMs = Date.now() - entry.createdAt;
+  const lastHeartbeatMs = Date.now() - entry.updatedAt;
+  console.log(`${entry.key} up for ${uptimeMs}ms, last heartbeat ${lastHeartbeatMs}ms ago`);
+}
+
 // Reader filtered by prefix (only events for matching keys flow)
 for await (const event of apps.reader({ prefix: "apps/" }).stream()) {
   // ...
@@ -98,6 +106,7 @@ for await (const event of apps.reader({ prefix: "apps/" }).stream()) {
 - **`overflow` events** fire when the reader's cursor fell behind the retention window. Handle by re-snapshotting.
 - **`maxEntries` per tenant**: once reached, `upsert` throws `EphemeralCapacityError`. Scale via multiple tenants or raise the limit.
 - **Touch returns `{ ok: false }`** if the key already expired between check and touch.
+- **`createdAt` vs `updatedAt`**: `createdAt` is set once when the entry is first upserted and **preserved** across subsequent `upsert` (even with new values) and `touch` calls on the same key. It only resets after `remove` or TTL expiry followed by a fresh upsert. Use `Date.now() - entry.createdAt` for "how long has this been registered" displays (admin UI uptime). `updatedAt` tracks the most recent touch/upsert — use for "last heartbeat" semantics.
 
 ## Redis keys (server)
 
