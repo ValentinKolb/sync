@@ -1,65 +1,31 @@
-// Store
-export { createMemoryStore, createLocalStorageStore, MemoryStore, LocalStorageStore, type Store } from "./src/store";
-
-// Retry
 export {
-  retry,
-  isRetryableTransportError,
-  expBackoff,
-  type BackoffOptions,
-  type RetryCtx,
-  type RetryAfterCtx,
-  type RetryConfig,
-} from "./src/retry";
-
-// Ratelimit
-export { ratelimit, RateLimitError, type RateLimiter, type RateLimitResult, type RateLimitConfig } from "./src/ratelimit";
-
-// Mutex
+  ratelimit,
+  RateLimitError,
+  type RateLimiter,
+  type RateLimitResult,
+  type RateLimitConfig,
+} from "./src/ratelimit";
 export { mutex, LockError, type Mutex, type Lock, type MutexConfig } from "./src/mutex";
-
-// Topic
-export {
-  topic,
-  type Topic,
-  type TopicConfig,
-  type TopicPubConfig,
-  type TopicRecvConfig,
-  type TopicDelivery,
-  type TopicLiveConfig,
-  type TopicLiveEvent,
-  type TopicReader,
-} from "./src/topic";
-
-// Queue
 export {
   queue,
   type Queue,
   type QueueConfig,
-  type QueueSendConfig,
-  type QueueRecvConfig,
-  type QueueReceived,
   type QueueReader,
+  type QueueRecvConfig,
+  type QueueSendConfig,
+  type QueueReceived,
 } from "./src/queue";
-
-// Ephemeral
 export {
-  ephemeral,
-  EphemeralCapacityError,
-  EphemeralPayloadTooLargeError,
-  type EphemeralStore,
-  type EphemeralConfig,
-  type EphemeralUpsertConfig,
-  type EphemeralTouchConfig,
-  type EphemeralRemoveConfig,
-  type EphemeralEntry,
-  type EphemeralSnapshot,
-  type EphemeralRecvConfig,
-  type EphemeralEvent,
-  type EphemeralReader,
-} from "./src/ephemeral";
-
-// Job
+  topic,
+  type Topic,
+  type TopicConfig,
+  type TopicReader,
+  type TopicRecvConfig,
+  type TopicPubConfig,
+  type TopicDelivery,
+  type TopicLiveConfig,
+  type TopicLiveEvent,
+} from "./src/topic";
 export {
   job,
   type JobId,
@@ -70,8 +36,6 @@ export {
   type JobMetrics,
   type SubmitConfig,
 } from "./src/job";
-
-// Scheduler
 export {
   scheduler,
   type Scheduler,
@@ -82,3 +46,36 @@ export {
   type ScheduleCtx,
   type ScheduleAfterCtx,
 } from "./src/scheduler";
+export {
+  ephemeral,
+  EphemeralCapacityError,
+  EphemeralPayloadTooLargeError,
+  type EphemeralConfig,
+  type EphemeralUpsertConfig,
+  type EphemeralTouchConfig,
+  type EphemeralRemoveConfig,
+  type EphemeralEntry,
+  type EphemeralSnapshot,
+  type EphemeralRecvConfig,
+  type EphemeralEvent,
+  type EphemeralReader,
+  type EphemeralStore,
+} from "./src/ephemeral";
+export {
+  retry,
+  isRetryableTransportError,
+  expBackoff,
+  type BackoffOptions,
+  type RetryCtx,
+  type RetryAfterCtx,
+  type RetryConfig,
+} from "./src/retry";
+
+// Browser-only: Store abstraction for persistence (not present in server package)
+export {
+  createMemoryStore,
+  createLocalStorageStore,
+  MemoryStore,
+  LocalStorageStore,
+  type Store,
+} from "./src/store";
