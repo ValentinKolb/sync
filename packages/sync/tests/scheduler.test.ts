@@ -506,3 +506,60 @@ test("errors thrown in after do not crash the scheduler", async () => {
   const info = await s.get({ id: "e" });
   expect(info?.runNumber).toBe(2);
 });
+
+// ==========================
+// ctx.trigger
+// ==========================
+
+test("ctx.trigger is 'manual' when invoked via runNow", async () => {
+  const s = makeScheduler(uid("trigger-manual"));
+  let processTrigger: string | null = null;
+  let afterTrigger: string | null = null;
+
+  await s.create({
+    id: "t",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async ({ ctx }) => {
+      processTrigger = ctx.trigger;
+    },
+    after: async ({ ctx }) => {
+      afterTrigger = ctx.trigger;
+    },
+  });
+
+  await s.runNow({ id: "t" });
+  expect(processTrigger).toBe("manual");
+  expect(afterTrigger).toBe("manual");
+});
+
+test("ctx.trigger is 'cron' when dispatched via tick loop", async () => {
+  const s = makeScheduler(uid("trigger-cron"));
+  let processTrigger: string | null = null;
+  let afterTrigger: string | null = null;
+
+  await s.create({
+    id: "t",
+    cron: "* * * * *",
+    tz: "UTC",
+    process: async ({ ctx }) => {
+      processTrigger = ctx.trigger;
+    },
+    after: async ({ ctx }) => {
+      afterTrigger = ctx.trigger;
+    },
+  });
+
+  // Force due
+  const keyPrefix = `sync:scheduler:${s.id}`;
+  const raw = await redis.get(`${keyPrefix}:schedule:t`);
+  const parsed = JSON.parse(raw as string);
+  parsed.nextRunAt = Date.now() - 1000;
+  await redis.set(`${keyPrefix}:schedule:t`, JSON.stringify(parsed));
+  await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed.nextRunAt), "t"]);
+
+  s.start();
+  await waitFor(() => processTrigger !== null, 5_000);
+  expect(processTrigger).toBe("cron");
+  expect(afterTrigger).toBe("cron");
+});

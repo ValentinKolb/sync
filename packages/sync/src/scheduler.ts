@@ -107,6 +107,8 @@ export type ScheduleCtx = {
   slotTs: number;
   runNumber: number;
   failureCount: number;
+  /** What caused this run: "cron" for tick dispatch, "manual" for `runNow`. */
+  trigger: "cron" | "manual";
   readonly duration: number;
   signal: AbortSignal;
 };
@@ -304,12 +306,15 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   };
 
   // Run a single schedule: increment runNumber, invoke process + after, update state, persist.
-  // `advanceCron` controls whether nextRunAt advances to the next cron slot when user does not reschedule.
+  // `trigger` records what caused this run. It also controls cron advancement:
+  // "cron" advances nextRunAt to the next cron slot when user does not reschedule;
+  // "manual" leaves nextRunAt unchanged (regular cron continues unaffected by runNow).
   const dispatchOne = async (
     schedule: StoredSchedule,
     handler: HandlerEntry,
-    advanceCron: boolean,
+    trigger: "cron" | "manual",
   ): Promise<void> => {
+    const advanceCron = trigger === "cron";
     const slotTs = schedule.nextRunAt;
     schedule.runNumber += 1;
     const runNumber = schedule.runNumber;
@@ -323,6 +328,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         slotTs,
         runNumber,
         failureCount: failureCountBefore,
+        trigger,
         signal: jobAc.signal,
       } as ScheduleCtx;
       Object.defineProperty(ctx, "duration", {
@@ -422,7 +428,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         continue;
       }
 
-      await dispatchOne(schedule, handler, true);
+      await dispatchOne(schedule, handler, "cron");
     }
   };
 
@@ -502,7 +508,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
     // `runNow` does not advance cron — regular schedule continues as before,
     // unless user explicitly calls ctx.reschedule in after.
-    await dispatchOne(schedule, handler, false);
+    await dispatchOne(schedule, handler, "manual");
   };
 
   const get = async (cfg: { id: string }): Promise<SchedulerInfo | null> => {

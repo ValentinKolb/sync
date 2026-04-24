@@ -50,6 +50,8 @@ export type ScheduleCtx = {
   slotTs: number;
   runNumber: number;
   failureCount: number;
+  /** What caused this run: "cron" for tick dispatch, "manual" for `runNow`. */
+  trigger: "cron" | "manual";
   readonly duration: number;
   signal: AbortSignal;
 };
@@ -269,8 +271,9 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const dispatchOne = async (
     schedule: StoredSchedule,
     handler: HandlerEntry,
-    advanceCron: boolean,
+    trigger: "cron" | "manual",
   ): Promise<void> => {
+    const advanceCron = trigger === "cron";
     const slotTs = schedule.nextRunAt;
     schedule.runNumber += 1;
     const runNumber = schedule.runNumber;
@@ -284,6 +287,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         slotTs,
         runNumber,
         failureCount: failureCountBefore,
+        trigger,
         signal: jobAc.signal,
       } as ScheduleCtx;
       Object.defineProperty(ctx, "duration", {
@@ -365,7 +369,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         continue;
       }
 
-      await dispatchOne(schedule, handler, true);
+      await dispatchOne(schedule, handler, "cron");
     }
   };
 
@@ -461,7 +465,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     const handler = handlers.get(cfg.id);
     if (!handler) throw new Error(`runNow: no handler registered for schedule ${cfg.id}`);
 
-    await dispatchOne(schedule, handler, false);
+    await dispatchOne(schedule, handler, "manual");
   };
 
   const get = async (cfg: { id: string }): Promise<SchedulerInfo | null> => {

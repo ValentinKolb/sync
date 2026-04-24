@@ -331,3 +331,48 @@ test("errors thrown in after do not crash the scheduler", async () => {
   await s.runNow({ id: "e" });
   expect(processed).toBe(2);
 });
+
+// ==========================
+// ctx.trigger
+// ==========================
+
+test("ctx.trigger is 'manual' when invoked via runNow", async () => {
+  const s = makeScheduler(uid("trigger-manual"));
+  let processTrigger: string | null = null;
+  let afterTrigger: string | null = null;
+
+  await s.create({
+    id: "t",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async ({ ctx }) => {
+      processTrigger = ctx.trigger;
+    },
+    after: async ({ ctx }) => {
+      afterTrigger = ctx.trigger;
+    },
+  });
+
+  await s.runNow({ id: "t" });
+  expect(processTrigger).toBe("manual");
+  expect(afterTrigger).toBe("manual");
+});
+
+test("ctx.trigger differs for cron vs manual on the same schedule", async () => {
+  const s = makeScheduler(uid("trigger-both"));
+  const triggers: string[] = [];
+
+  await s.create({
+    id: "t",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async ({ ctx }) => {
+      triggers.push(ctx.trigger);
+    },
+  });
+
+  await s.runNow({ id: "t" });
+  await s.runNow({ id: "t" });
+
+  expect(triggers).toEqual(["manual", "manual"]);
+});

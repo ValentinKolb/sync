@@ -26,6 +26,7 @@ type ScheduleCtx = {
   slotTs: number;           // the cron slot timestamp this dispatch is for
   runNumber: number;        // 1-indexed, persistent across restarts, monotonic
   failureCount: number;     // consecutive failures before this run (resets on success)
+  trigger: "cron" | "manual"; // what caused this run
   readonly duration: number;
   signal: AbortSignal;
 };
@@ -103,7 +104,7 @@ await sched.create<{ cleaned: number }>({
 });
 
 // Manual trigger — doesn't alter cron schedule
-await sched.runNow({ id: "cleanup" });
+await sched.runNow({ id: "cleanup" });  // ctx.trigger === "manual" inside the handler
 
 // Remove
 await sched.delete({ id: "cleanup" });
@@ -154,6 +155,7 @@ Each item has its own `ctx.failureCount`. Already-running items skip duplicate s
 - **Misfire behavior**: always "skip" — if the system was down when a slot was due, `nextRunAt` advances past all missed slots to the next future cron slot. There's no `catch_up_one` / `catch_up_all` in v5.
 - **`create` is idempotent by id**: second call with same id updates. If `cron`/`tz` changed, `nextRunAt` resets; otherwise it's preserved.
 - **`runNow` does NOT advance cron**: the regular schedule continues unchanged, unless you call `ctx.reschedule` inside `after`.
+- **`ctx.trigger`**: `"cron"` when dispatched by the tick loop; `"manual"` when invoked via `runNow`. Useful for conditionals like "skip expensive validation on manual runs" or "log admin runs separately". Available in both `process` and `after` ctx.
 - **`ctx.runNumber` is persistent**: preserved across restarts, re-registrations, and (different) cron changes. Only `delete` resets.
 - **`ctx.failureCount` persists across cron slots**: resets to 0 on any successful run. A consistently failing schedule grows this counter indefinitely — use it to decide when to give up in `after`.
 - **Handler missing on the current leader pod**: the scheduler silently advances past the slot. Another pod with the handler will pick up the next slot. All pods should register all schedules on startup.
