@@ -368,3 +368,57 @@ test("commit returns true on first call", async () => {
   expect(msg).not.toBeNull();
   expect(await msg!.commit()).toBe(true);
 });
+
+test("latestCursor returns null when log is empty", async () => {
+  const store = createMemoryStore();
+  const t = topic({
+    id: "latest-empty",
+    store,
+  });
+
+  expect(await t.latestCursor()).toBeNull();
+});
+
+test("latestCursor returns the latest published cursor", async () => {
+  const store = createMemoryStore();
+  const t = topic({
+    id: "latest-published",
+    store,
+  });
+
+  await t.pub({ data: { n: 1 } });
+  const second = await t.pub({ data: { n: 2 } });
+
+  expect(await t.latestCursor()).toBe(second.cursor);
+});
+
+test("latestCursor uses the same tenant isolation as pub and live", async () => {
+  const store = createMemoryStore();
+  const t = topic({
+    id: "latest-tenant",
+    store,
+  });
+
+  const t1 = await t.pub({ tenantId: "t1", data: { value: "alpha" } });
+  const t2 = await t.pub({ tenantId: "t2", data: { value: "beta" } });
+
+  expect(await t.latestCursor({ tenantId: "t1" })).toBe(t1.cursor);
+  expect(await t.latestCursor({ tenantId: "t2" })).toBe(t2.cursor);
+  expect(await t.latestCursor({ tenantId: "missing" })).toBeNull();
+});
+
+test("latestCursor does not consume reader messages", async () => {
+  const store = createMemoryStore();
+  const t = topic({
+    id: "latest-non-consuming",
+    store,
+  });
+
+  const published = await t.pub({ data: { value: 42 } });
+  expect(await t.latestCursor()).toBe(published.cursor);
+
+  const message = await t.reader("latest-check").recv({ wait: false });
+  expect(message?.cursor).toBe(published.cursor);
+  expect(message?.data.value).toBe(42);
+  expect(await message?.commit()).toBe(true);
+});

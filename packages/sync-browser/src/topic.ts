@@ -35,6 +35,10 @@ export type TopicPubConfig<T> = {
   meta?: Record<string, unknown>;
 };
 
+export type TopicCursorConfig = {
+  tenantId?: string;
+};
+
 export type TopicRecvConfig = {
   tenantId?: string;
   timeoutMs?: number;
@@ -77,6 +81,7 @@ export type TopicReader<T> = {
 
 export type Topic<T> = {
   pub(cfg: TopicPubConfig<T>): Promise<{ eventId: string; cursor: string }>;
+  latestCursor(cfg?: TopicCursorConfig): Promise<string | null>;
   reader(group?: string): TopicReader<T>;
   live(cfg?: TopicLiveConfig): AsyncIterable<TopicLiveEvent<T>>;
 };
@@ -169,6 +174,12 @@ export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
 
     const eventId = log.append({ payload: payloadRaw });
     return { eventId, cursor: eventId };
+  };
+
+  const latestCursor = async (cursorCfg: TopicCursorConfig = {}): Promise<string | null> => {
+    const tenantId = resolveTenant(cursorCfg.tenantId);
+    const cursor = getEventLog(tenantId).latest();
+    return cursor === "0" ? null : cursor;
   };
 
   // ==========================
@@ -288,5 +299,5 @@ export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
     }
   };
 
-  return { pub, reader, live };
+  return { pub, latestCursor, reader, live };
 };

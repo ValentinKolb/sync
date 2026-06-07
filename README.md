@@ -112,6 +112,8 @@ const t = topic<{ type: string; orderId: string }>({
 
 await t.pub({ data: { type: "order.confirmed", orderId: "o1" } });
 
+const startCursor = (await t.latestCursor()) ?? "0-0";
+
 // Consumer group (at-least-once, acked)
 const reader = t.reader("analytics");
 for await (const msg of reader.stream()) {
@@ -120,7 +122,7 @@ for await (const msg of reader.stream()) {
 }
 
 // Live (best-effort, all listeners)
-for await (const event of t.live({ after: "0-0" })) {
+for await (const event of t.live({ after: startCursor })) {
   console.log(event.data);
 }
 ```

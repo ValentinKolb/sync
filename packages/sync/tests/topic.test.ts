@@ -455,3 +455,53 @@ test("concurrent first-recv on new group does not throw", async () => {
     await m!.commit();
   }
 });
+
+test("latestCursor returns null when stream is missing", async () => {
+  const t = topic({
+    id: "latest-empty",
+    prefix: "test:t",
+  });
+
+  expect(await t.latestCursor()).toBeNull();
+});
+
+test("latestCursor returns the latest published cursor", async () => {
+  const t = topic({
+    id: "latest-published",
+    prefix: "test:t",
+  });
+
+  await t.pub({ data: { n: 1 } });
+  const second = await t.pub({ data: { n: 2 } });
+
+  expect(await t.latestCursor()).toBe(second.cursor);
+});
+
+test("latestCursor uses the same tenant isolation as pub and live", async () => {
+  const t = topic({
+    id: "latest-tenant",
+    prefix: "test:t",
+  });
+
+  const t1 = await t.pub({ tenantId: "t1", data: { value: "alpha" } });
+  const t2 = await t.pub({ tenantId: "t2", data: { value: "beta" } });
+
+  expect(await t.latestCursor({ tenantId: "t1" })).toBe(t1.cursor);
+  expect(await t.latestCursor({ tenantId: "t2" })).toBe(t2.cursor);
+  expect(await t.latestCursor({ tenantId: "missing" })).toBeNull();
+});
+
+test("latestCursor does not consume reader messages", async () => {
+  const t = topic({
+    id: "latest-non-consuming",
+    prefix: "test:t",
+  });
+
+  const published = await t.pub({ data: { value: 42 } });
+  expect(await t.latestCursor()).toBe(published.cursor);
+
+  const message = await t.reader("latest-check").recv({ wait: false });
+  expect(message?.cursor).toBe(published.cursor);
+  expect(message?.data.value).toBe(42);
+  expect(await message?.commit()).toBe(true);
+});

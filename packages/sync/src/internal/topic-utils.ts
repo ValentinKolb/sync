@@ -62,3 +62,18 @@ export const parseFirstStreamEntry = (raw: unknown): ParsedEntry | null => {
   };
 };
 
+export const parseFirstRangeEntry = (raw: unknown): ParsedEntry | null => {
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+
+  const firstEntry = raw[0];
+  if (!Array.isArray(firstEntry) || firstEntry.length < 2) return null;
+
+  const id = firstEntry[0];
+  const fieldArray = firstEntry[1];
+  if (typeof id !== "string") return null;
+
+  return {
+    id,
+    fields: fieldArrayToObject(fieldArray),
+  };
+};

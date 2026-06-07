@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { fieldArrayToObject, parseFirstStreamEntry } from "../src/internal/topic-utils";
+import { fieldArrayToObject, parseFirstRangeEntry, parseFirstStreamEntry } from "../src/internal/topic-utils";
 
 test("fieldArrayToObject converts alternating key/value arrays", () => {
   const fields = fieldArrayToObject(["payload", "{\"x\":1}", "n", 42]);
@@ -38,3 +38,17 @@ test("parseFirstStreamEntry returns null for invalid shapes", () => {
   expect(parseFirstStreamEntry([["k", []]])).toBeNull();
 });
 
+test("parseFirstRangeEntry parses Redis range responses", () => {
+  const raw = [["123-0", ["payload", "{\"value\":1}"]]];
+  const entry = parseFirstRangeEntry(raw);
+
+  expect(entry?.id).toBe("123-0");
+  expect(entry?.fields.payload).toBe("{\"value\":1}");
+});
+
+test("parseFirstRangeEntry returns null for invalid shapes", () => {
+  expect(parseFirstRangeEntry(null)).toBeNull();
+  expect(parseFirstRangeEntry({})).toBeNull();
+  expect(parseFirstRangeEntry([])).toBeNull();
+  expect(parseFirstRangeEntry([["k"]])).toBeNull();
+});

@@ -19,6 +19,7 @@ export {
   topic,
   type Topic,
   type TopicConfig,
+  type TopicCursorConfig,
   type TopicReader,
   type TopicRecvConfig,
   type TopicPubConfig,

@@ -34,6 +34,7 @@ import type {
 import type {
   Topic as S_Topic,
   TopicConfig as S_TopicConfig,
+  TopicCursorConfig as S_TopicCursorConfig,
   TopicReader as S_TopicReader,
   TopicRecvConfig as S_TopicRecvConfig,
   TopicPubConfig as S_TopicPubConfig,
@@ -103,6 +104,7 @@ import type {
 import type {
   Topic as B_Topic,
   TopicConfig as B_TopicConfig,
+  TopicCursorConfig as B_TopicCursorConfig,
   TopicReader as B_TopicReader,
   TopicRecvConfig as B_TopicRecvConfig,
   TopicPubConfig as B_TopicPubConfig,
@@ -210,6 +212,7 @@ assertEqual<Equal<S_Topic<{ foo: string }>, B_Topic<{ foo: string }>>>(true);
 const _topicCfgAdditive: B_TopicConfig<{ foo: string }> = {} as unknown as S_TopicConfig<{ foo: string }>;
 void _topicCfgAdditive;
 assertEqual<Equal<S_TopicReader<{ foo: string }>, B_TopicReader<{ foo: string }>>>(true);
+assertEqual<Equal<S_TopicCursorConfig, B_TopicCursorConfig>>(true);
 assertEqual<Equal<S_TopicRecvConfig, B_TopicRecvConfig>>(true);
 assertEqual<Equal<S_TopicPubConfig<{ foo: string }>, B_TopicPubConfig<{ foo: string }>>>(true);
 assertEqual<Equal<S_TopicDelivery<{ foo: string }>, B_TopicDelivery<{ foo: string }>>>(true);

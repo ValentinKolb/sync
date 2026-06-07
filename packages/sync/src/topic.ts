@@ -1,6 +1,6 @@
 import { redis, RedisClient } from "bun";
 import { randomUUID } from "crypto";
-import { parseFirstStreamEntry, type ParsedEntry } from "./internal/topic-utils";
+import { parseFirstRangeEntry, parseFirstStreamEntry, type ParsedEntry } from "./internal/topic-utils";
 import { isRetryableTransportError, retry } from "./retry";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -103,6 +103,10 @@ export type TopicPubConfig<T> = {
   meta?: Record<string, unknown>;
 };
 
+export type TopicCursorConfig = {
+  tenantId?: string;
+};
+
 export type TopicRecvConfig = {
   tenantId?: string;
   timeoutMs?: number;
@@ -145,6 +149,7 @@ export type TopicReader<T> = {
 
 export type Topic<T> = {
   pub(cfg: TopicPubConfig<T>): Promise<{ eventId: string; cursor: string }>;
+  latestCursor(cfg?: TopicCursorConfig): Promise<string | null>;
   reader(group?: string): TopicReader<T>;
   live(cfg?: TopicLiveConfig): AsyncIterable<TopicLiveEvent<T>>;
 };
@@ -226,6 +231,13 @@ export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
 
     const eventId = typeof rawId === "string" ? rawId : String(rawId);
     return { eventId, cursor: eventId };
+  };
+
+  const latestCursor = async (cursorCfg: TopicCursorConfig = {}): Promise<string | null> => {
+    const tenantId = resolveTenant(cursorCfg.tenantId);
+    const key = streamKey(tenantId);
+    const raw = await redis.send("XREVRANGE", [key, "+", "-", "COUNT", "1"]);
+    return parseFirstRangeEntry(raw)?.id ?? null;
   };
 
   const reader = (group = "default"): TopicReader<TData> => {
@@ -423,6 +435,7 @@ export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
 
   return {
     pub,
+    latestCursor,
     reader,
     live,
   };
