@@ -61,6 +61,7 @@ import type {
   JobConfig as S_JobConfig,
   JobHandle as S_JobHandle,
   JobMetrics as S_JobMetrics,
+  JobTraceEvent as S_JobTraceEvent,
   SubmitConfig as S_SubmitConfig,
 } from "../packages/sync/src/job";
 import type {
@@ -68,10 +69,14 @@ import type {
   SchedulerConfig as S_SchedulerConfig,
   SchedulerInfo as S_SchedulerInfo,
   SchedulerMetrics as S_SchedulerMetrics,
+  SchedulerTraceEvent as S_SchedulerTraceEvent,
   ScheduleConfig as S_ScheduleConfig,
   ScheduleCtx as S_ScheduleCtx,
   ScheduleAfterCtx as S_ScheduleAfterCtx,
 } from "../packages/sync/src/scheduler";
+import type {
+  TraceHandler as S_TraceHandler,
+} from "../packages/sync/src/trace";
 import type {
   BackoffOptions as S_BackoffOptions,
   RetryCtx as S_RetryCtx,
@@ -131,6 +136,7 @@ import type {
   JobConfig as B_JobConfig,
   JobHandle as B_JobHandle,
   JobMetrics as B_JobMetrics,
+  JobTraceEvent as B_JobTraceEvent,
   SubmitConfig as B_SubmitConfig,
 } from "../packages/sync-browser/src/job";
 import type {
@@ -138,10 +144,14 @@ import type {
   SchedulerConfig as B_SchedulerConfig,
   SchedulerInfo as B_SchedulerInfo,
   SchedulerMetrics as B_SchedulerMetrics,
+  SchedulerTraceEvent as B_SchedulerTraceEvent,
   ScheduleConfig as B_ScheduleConfig,
   ScheduleCtx as B_ScheduleCtx,
   ScheduleAfterCtx as B_ScheduleAfterCtx,
 } from "../packages/sync-browser/src/scheduler";
+import type {
+  TraceHandler as B_TraceHandler,
+} from "../packages/sync-browser/src/trace";
 import type {
   BackoffOptions as B_BackoffOptions,
   RetryCtx as B_RetryCtx,
@@ -247,6 +257,7 @@ assertEqual<Equal<S_JobConfig<{ userId: string }, number>, B_JobConfig<{ userId:
 assertEqual<Equal<S_JobHandle<{ userId: string }>, B_JobHandle<{ userId: string }>>>(true);
 assertEqual<Equal<S_JobHandle<void>, B_JobHandle<void>>>(true);
 assertEqual<Equal<S_JobMetrics, B_JobMetrics>>(true);
+assertEqual<Equal<S_JobTraceEvent<{ userId: string }, number>, B_JobTraceEvent<{ userId: string }, number>>>(true);
 assertEqual<Equal<S_SubmitConfig<{ userId: string }>, B_SubmitConfig<{ userId: string }>>>(true);
 assertEqual<Equal<S_SubmitConfig<void>, B_SubmitConfig<void>>>(true);
 
@@ -260,9 +271,16 @@ const _schedCfgAdditive: B_SchedulerConfig = {} as unknown as S_SchedulerConfig;
 void _schedCfgAdditive;
 assertEqual<Equal<S_SchedulerInfo, B_SchedulerInfo>>(true);
 assertEqual<Equal<S_SchedulerMetrics, B_SchedulerMetrics>>(true);
+assertEqual<Equal<S_SchedulerTraceEvent<number>, B_SchedulerTraceEvent<number>>>(true);
 assertEqual<Equal<S_ScheduleConfig<number>, B_ScheduleConfig<number>>>(true);
 assertEqual<Equal<S_ScheduleCtx, B_ScheduleCtx>>(true);
 assertEqual<Equal<S_ScheduleAfterCtx<number>, B_ScheduleAfterCtx<number>>>(true);
+
+// ==========================
+// Trace
+// ==========================
+
+assertEqual<Equal<S_TraceHandler<{ type: "x" }>, B_TraceHandler<{ type: "x" }>>>(true);
 
 // ==========================
 // Retry

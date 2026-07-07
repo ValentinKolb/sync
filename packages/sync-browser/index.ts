@@ -35,6 +35,7 @@ export {
   type JobConfig,
   type JobHandle,
   type JobMetrics,
+  type JobTraceEvent,
   type SubmitConfig,
 } from "./src/job";
 export {
@@ -43,10 +44,12 @@ export {
   type SchedulerConfig,
   type SchedulerInfo,
   type SchedulerMetrics,
+  type SchedulerTraceEvent,
   type ScheduleConfig,
   type ScheduleCtx,
   type ScheduleAfterCtx,
 } from "./src/scheduler";
+export { type TraceHandler } from "./src/trace";
 export {
   ephemeral,
   EphemeralCapacityError,

@@ -2,6 +2,7 @@ import { redis, sleep } from "bun";
 import { mutex, type Lock } from "./mutex";
 import { expBackoff, type BackoffOptions } from "./retry";
 import { assertValidTimeZone, nextCronTimestamp } from "./internal/cron";
+import { emitTrace, type TraceHandler } from "./trace";
 
 const DEFAULT_PREFIX = "sync:scheduler";
 const DEFAULT_LEASE_MS = 5_000;
@@ -11,7 +12,7 @@ const DEFAULT_BATCH_SIZE = 200;
 
 // Upsert: creates or updates the schedule record. Preserves runNumber always;
 // preserves nextRunAt/failureCount iff cron/tz unchanged.
-// Returns 1 = created, 2 = updated.
+// Returns [1 = created | 2 = updated, stored nextRunAt].
 const UPSERT_SCRIPT = `
   local raw = redis.call("GET", KEYS[1])
   local incomingRaw = ARGV[1]
@@ -56,8 +57,8 @@ const UPSERT_SCRIPT = `
   redis.call("ZADD", KEYS[2], tostring(incoming.nextRunAt), scheduleId)
   redis.call("SADD", KEYS[3], scheduleId)
 
-  if created == 1 then return 1 end
-  return 2
+  if created == 1 then return {1, tostring(incoming.nextRunAt)} end
+  return {2, tostring(incoming.nextRunAt)}
 `;
 
 const DELETE_SCRIPT = `
@@ -102,6 +103,13 @@ export type SchedulerMetrics = {
   lastTickAt: number | null;
 };
 
+export type SchedulerTraceEvent<Result = unknown> =
+  | { type: "scheduled"; scheduleId: string; cron: string; tz: string; nextRunAt: number; meta?: Record<string, unknown> }
+  | { type: "started"; scheduleId: string; runNumber: number; trigger: "cron" | "manual"; slotTs: number }
+  | { type: "succeeded"; scheduleId: string; runNumber: number; data: Result; durationMs: number }
+  | { type: "failed"; scheduleId: string; runNumber: number; error: Error; durationMs: number }
+  | { type: "rescheduled"; scheduleId: string; runNumber: number; delayMs: number };
+
 export type ScheduleCtx = {
   scheduleId: string;
   slotTs: number;
@@ -126,6 +134,7 @@ export type ScheduleConfig<Result = unknown> = {
   cron: string;
   tz?: string;
   meta?: Record<string, unknown>;
+  trace?: TraceHandler<SchedulerTraceEvent<Result>>;
   process: (cfg: { ctx: ScheduleCtx }) => Promise<Result> | Result;
   after?: (cfg: { ctx: ScheduleAfterCtx<Result> }) => Promise<void> | void;
 };
@@ -174,6 +183,7 @@ export type Scheduler = {
 type HandlerEntry = {
   process: (cfg: { ctx: ScheduleCtx }) => Promise<unknown> | unknown;
   after?: (cfg: { ctx: ScheduleAfterCtx<unknown> }) => Promise<void> | void;
+  trace?: TraceHandler<SchedulerTraceEvent<unknown>>;
 };
 
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
@@ -340,6 +350,14 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
     const ctx = makeCtx();
 
+    await emitTrace(handler.trace, {
+      type: "started",
+      scheduleId: schedule.id,
+      runNumber,
+      trigger,
+      slotTs,
+    });
+
     let result: unknown;
     let error: Error | undefined;
     try {
@@ -347,6 +365,24 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     } catch (err) {
       jobAc.abort();
       error = asError(err);
+    }
+
+    if (error) {
+      await emitTrace(handler.trace, {
+        type: "failed",
+        scheduleId: schedule.id,
+        runNumber,
+        error,
+        durationMs: Date.now() - startedAt,
+      });
+    } else {
+      await emitTrace(handler.trace, {
+        type: "succeeded",
+        scheduleId: schedule.id,
+        runNumber,
+        data: result,
+        durationMs: Date.now() - startedAt,
+      });
     }
 
     let rescheduleRequested: { delayMs?: number } | null = null;
@@ -377,10 +413,12 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       metrics.dispatches += 1;
     }
 
+    let traceRescheduled: { delayMs: number } | null = null;
     if (rescheduleRequested) {
       const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
       schedule.nextRunAt = Date.now() + delayMs;
       metrics.reschedules += 1;
+      traceRescheduled = { delayMs };
     } else if (advanceCron) {
       schedule.nextRunAt = nextCronTimestamp(schedule.cron, schedule.tz, Date.now());
     }
@@ -389,6 +427,14 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     schedule.updatedAt = Date.now();
 
     await persist(schedule);
+    if (traceRescheduled) {
+      await emitTrace(handler.trace, {
+        type: "rescheduled",
+        scheduleId: schedule.id,
+        runNumber,
+        delayMs: traceRescheduled.delayMs,
+      });
+    }
   };
 
   const dispatchDue = async (): Promise<void> => {
@@ -469,23 +515,34 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       meta: cfg.meta,
     };
 
-    const result = Number(
-      await redis.send("EVAL", [
-        UPSERT_SCRIPT,
-        "3",
-        scheduleKey(cfg.id),
-        dueKey,
-        indexKey,
-        JSON.stringify(incoming),
-        String(firstRunAt),
-        cfg.id,
-        String(Date.now()),
-      ]),
-    );
+    const resultRaw = await redis.send("EVAL", [
+      UPSERT_SCRIPT,
+      "3",
+      scheduleKey(cfg.id),
+      dueKey,
+      indexKey,
+      JSON.stringify(incoming),
+      String(firstRunAt),
+      cfg.id,
+      String(Date.now()),
+    ]);
+    const resultTuple = Array.isArray(resultRaw) ? resultRaw : [resultRaw, firstRunAt];
+    const result = Number(resultTuple[0]);
+    const storedNextRunAt = Number(resultTuple[1] ?? firstRunAt);
 
     handlers.set(cfg.id, {
       process: cfg.process as HandlerEntry["process"],
       after: cfg.after as HandlerEntry["after"],
+      trace: cfg.trace as HandlerEntry["trace"],
+    });
+
+    await emitTrace(cfg.trace, {
+      type: "scheduled",
+      scheduleId: cfg.id,
+      cron: cfg.cron,
+      tz,
+      nextRunAt: storedNextRunAt,
+      ...(cfg.meta ? { meta: cfg.meta } : {}),
     });
 
     return {

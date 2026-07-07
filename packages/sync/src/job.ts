@@ -1,6 +1,7 @@
 import { redis, sleep } from "bun";
 import { queue } from "./queue";
 import { expBackoff, isRetryableTransportError, retry, type BackoffOptions } from "./retry";
+import { emitTrace, type TraceHandler } from "./trace";
 
 const DEFAULT_PREFIX = "sync:job";
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -38,6 +39,14 @@ export type JobMetrics = {
   reschedules: number;
 };
 
+export type JobTraceEvent<Input = void, Result = unknown> =
+  | { type: "submitted"; jobId: string; key: string; input?: Input; meta?: Record<string, unknown> }
+  | { type: "started"; jobId: string; key: string; input?: Input; attempt: number }
+  | { type: "succeeded"; jobId: string; key: string; input?: Input; data: Result; durationMs: number }
+  | { type: "failed"; jobId: string; key: string; input?: Input; error: Error; durationMs: number }
+  | { type: "rescheduled"; jobId: string; key: string; attempt: number; delayMs: number }
+  | { type: "finished"; jobId: string; key: string; status: "succeeded" | "failed"; durationMs: number };
+
 export type JobCtx<Input = void> = {
   jobId: JobId;
   key: string;
@@ -72,6 +81,7 @@ export type JobConfig<Input = void, Result = unknown> = {
     leaseMs?: number;
     keyTtlMs?: number;
   };
+  trace?: TraceHandler<JobTraceEvent<Input, Result>>;
   process: (cfg: { ctx: JobCtx<Input> }) => Promise<Result> | Result;
   after?: (cfg: { ctx: JobAfterCtx<Input, Result> }) => Promise<void> | void;
 };
@@ -208,6 +218,15 @@ export const job = <Input = void, Result = unknown>(
             };
 
             const ctx = makeCtx();
+            const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
+
+            await emitTrace(config.trace, {
+              type: "started",
+              jobId: payload.jobId,
+              key: payload.key,
+              ...traceInput,
+              attempt,
+            });
 
             let result: Result | undefined;
             let error: Error | undefined;
@@ -216,6 +235,26 @@ export const job = <Input = void, Result = unknown>(
             } catch (err) {
               jobAc.abort();
               error = asError(err);
+            }
+
+            if (error) {
+              await emitTrace(config.trace, {
+                type: "failed",
+                jobId: payload.jobId,
+                key: payload.key,
+                ...traceInput,
+                error,
+                durationMs: Date.now() - startedAt,
+              });
+            } else {
+              await emitTrace(config.trace, {
+                type: "succeeded",
+                jobId: payload.jobId,
+                key: payload.key,
+                ...traceInput,
+                data: result as Result,
+                durationMs: Date.now() - startedAt,
+              });
             }
 
             // Build after ctx
@@ -238,8 +277,9 @@ export const job = <Input = void, Result = unknown>(
             }
 
             if (rescheduleRequested) {
+              const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
               const nacked = await message.nack({
-                delayMs: (rescheduleRequested as { delayMs?: number }).delayMs ?? 0,
+                delayMs,
                 reason: "reschedule",
                 error: error?.message,
               });
@@ -248,6 +288,13 @@ export const job = <Input = void, Result = unknown>(
                 // Lease expired; message will be redelivered. Key stays claimed.
                 continue;
               }
+              await emitTrace(config.trace, {
+                type: "rescheduled",
+                jobId: payload.jobId,
+                key: payload.key,
+                attempt,
+                delayMs,
+              });
               continue;
             }
 
@@ -264,6 +311,13 @@ export const job = <Input = void, Result = unknown>(
             } else {
               metrics.dispatches += 1;
             }
+            await emitTrace(config.trace, {
+              type: "finished",
+              jobId: payload.jobId,
+              key: payload.key,
+              status: error ? "failed" : "succeeded",
+              durationMs: Date.now() - startedAt,
+            });
           } catch {
             if (workerAc.signal.aborted) break;
             await sleep(25);
@@ -280,14 +334,16 @@ export const job = <Input = void, Result = unknown>(
 
   const submit = async (cfg: SubmitConfig<Input>): Promise<JobId> => {
     if (!cfg.key) throw new Error("submit: key is required");
-    startWorker();
 
     const leaseMs = Math.max(1, cfg.leaseMs ?? defaultLeaseMs);
     const keyTtlMs = Math.min(MAX_KEY_TTL_MS, Math.max(1_000, cfg.keyTtlMs ?? defaultKeyTtlMs));
     const delayMs = cfg.at !== undefined ? Math.max(0, cfg.at - Date.now()) : Math.max(0, cfg.delayMs ?? 0);
 
     const { jobId, isNew } = await claimKey(cfg.key, keyTtlMs);
-    if (!isNew) return jobId;
+    if (!isNew) {
+      startWorker();
+      return jobId;
+    }
 
     const payload: WorkPayload = {
       jobId,
@@ -309,6 +365,16 @@ export const job = <Input = void, Result = unknown>(
       await releaseKey(cfg.key);
       throw error;
     }
+
+    const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
+    await emitTrace(config.trace, {
+      type: "submitted",
+      jobId,
+      key: cfg.key,
+      ...traceInput,
+      ...(cfg.meta ? { meta: cfg.meta } : {}),
+    });
+    startWorker();
 
     return jobId;
   };

@@ -44,9 +44,19 @@ type ScheduleConfig<Result = unknown> = {
   cron: string;             // standard 5-field cron (min hour dom month dow)
   tz?: string;              // IANA tz, default "UTC"
   meta?: Record<string, unknown>;
+  trace?: TraceHandler<SchedulerTraceEvent<Result>>;
   process: (cfg: { ctx: ScheduleCtx }) => Promise<Result> | Result;
   after?: (cfg: { ctx: ScheduleAfterCtx<Result> }) => Promise<void> | void;
 };
+
+type TraceHandler<Event> = (event: Event) => void | Promise<void>;
+
+type SchedulerTraceEvent<Result = unknown> =
+  | { type: "scheduled"; scheduleId: string; cron: string; tz: string; nextRunAt: number; meta?: Record<string, unknown> }
+  | { type: "started"; scheduleId: string; runNumber: number; trigger: "cron" | "manual"; slotTs: number }
+  | { type: "succeeded"; scheduleId: string; runNumber: number; data: Result; durationMs: number }
+  | { type: "failed"; scheduleId: string; runNumber: number; error: Error; durationMs: number }
+  | { type: "rescheduled"; scheduleId: string; runNumber: number; delayMs: number };
 
 type SchedulerMetrics = {
   isLeader: boolean;
@@ -92,6 +102,9 @@ await sched.create<{ cleaned: number }>({
   id: "cleanup",
   cron: "0 * * * *",
   tz: "Europe/Berlin",
+  trace: async (event) => {
+    await cloudTrace({ source: "cleanup", event });
+  },
   process: async ({ ctx }) => {
     const n = await cleanupOldRecords();
     return { cleaned: n };
@@ -148,6 +161,18 @@ await sched.create({
 
 Each item has its own `ctx.failureCount`. Already-running items skip duplicate submits. Failed items retry independently of the cron tick.
 
+## Trace semantics
+
+`trace` is per schedule, not on the scheduler factory. A scheduler can host unrelated schedules, so each schedule chooses its own observability sink.
+
+- **`scheduled`** fires after `create()` successfully creates or updates the schedule record and handler.
+- **`started`** fires before `process`.
+- **`succeeded` / `failed`** describe the `process` result for one run. `after` can still call `ctx.reschedule()` after either event.
+- **`rescheduled`** fires after `after` calls `ctx.reschedule()` and the schedule state has been updated.
+- **There is no `finished` event**. A schedule is a recurring definition, not a terminal unit of work. Use `succeeded`, `failed`, and `rescheduled` for run outcomes.
+- **Trace handler errors are swallowed**. The library logs `[sync trace] trace handler failed` and keeps scheduler execution unchanged.
+- **Trace handlers are awaited** so events for one run keep a deterministic order. If you want buffering or fire-and-forget behavior, implement it inside the trace handler.
+
 ## Gotchas
 
 - **`cron` is validated** at `create` time (invalid cron throws).
@@ -161,6 +186,7 @@ Each item has its own `ctx.failureCount`. Already-running items skip duplicate s
 - **Handler missing on the current leader pod**: the scheduler silently advances past the slot. Another pod with the handler will pick up the next slot. All pods should register all schedules on startup.
 - **Multiple pods coordinate via leader mutex**: one leader dispatches at a time. Leader lease is 5s by default. Brief overlap during handoff can cause at-least-once slot dispatch — make `process` idempotent.
 - **`after` errors are swallowed**: don't throw inside `after` — use `ctx.reschedule` to signal intent.
+- **Trace is not an audit log by itself**: it is an in-process callback. Persist events yourself if you need durable audit history.
 
 ## Redis keys (server)
 

@@ -17,6 +17,9 @@ const sync = job({
 const sendMail = job<{ userId: string }, { sent: boolean }>({
   id: "send-mail",
   defaults: { leaseMs: 30_000, keyTtlMs: 24 * 60 * 60 * 1000 },
+  trace: async (event) => {
+    await cloudTrace({ source: "send-mail", event });
+  },
   process: async ({ ctx }) => {
     // ctx.input: { userId: string }
     return { sent: true };
@@ -58,6 +61,28 @@ type JobMetrics = {
   reschedules: number;            // ctx.reschedule() calls
 };
 
+type TraceHandler<Event> = (event: Event) => void | Promise<void>;
+
+type JobTraceEvent<Input = void, Result = unknown> =
+  | { type: "submitted"; jobId: string; key: string; input?: Input; meta?: Record<string, unknown> }
+  | { type: "started"; jobId: string; key: string; input?: Input; attempt: number }
+  | { type: "succeeded"; jobId: string; key: string; input?: Input; data: Result; durationMs: number }
+  | { type: "failed"; jobId: string; key: string; input?: Input; error: Error; durationMs: number }
+  | { type: "rescheduled"; jobId: string; key: string; attempt: number; delayMs: number }
+  | { type: "finished"; jobId: string; key: string; status: "succeeded" | "failed"; durationMs: number };
+
+type JobConfig<Input = void, Result = unknown> = {
+  id: string;
+  prefix?: string;
+  defaults?: {
+    leaseMs?: number;
+    keyTtlMs?: number;
+  };
+  trace?: TraceHandler<JobTraceEvent<Input, Result>>;
+  process: (cfg: { ctx: JobCtx<Input> }) => Promise<Result> | Result;
+  after?: (cfg: { ctx: JobAfterCtx<Input, Result> }) => Promise<void> | void;
+};
+
 type SubmitConfig<Input> = {
   key: string;                    // required; idempotency scope
   keyTtlMs?: number;
@@ -82,22 +107,28 @@ submit({ key })
   → claim idempotency key atomically
   → if key already held → return existing jobId (dedupe)
   → enqueue work message
+  → trace "submitted" (new enqueue only)
   → auto-start worker loop (first submit only)
 
 worker picks up message
+  → trace "started"
   → process({ ctx })
      if process returns: result in ctx.data
      if process throws:  error in ctx.error
+     if process returns: trace "succeeded"
+     if process throws:  trace "failed"
   → after({ ctx })  (if defined)
 
 if ctx.reschedule called in after:
   → nack message with delayMs
+  → trace "rescheduled"
   → key stays claimed
   → eventually re-delivered as attempt = failureCount + 2
 else (terminal):
   → ack message
   → DEL idempotency key
   → metric counter updated (dispatches or failures)
+  → trace "finished"
 ```
 
 ## Usage patterns
@@ -159,9 +190,28 @@ process: async ({ ctx }) => {
 }
 ```
 
+### Trace to your own observability sink
+
+```ts
+const summarize = job<{ docId: string }, { tokens: number }>({
+  id: "summarize",
+  trace: async (event) => {
+    await cloudTrace({ source: "summarize", event });
+  },
+  process: async ({ ctx }) => summarizeDoc(ctx.input.docId),
+});
+```
+
+Trace is a callback, not a storage layer. Use it to log, publish, count, or map events to OpenTelemetry. The library does not redact or serialize `input`, `data`, or `error`; do that in your handler.
+
 ## Gotchas
 
 - **`key` is required** — jobs can't be submitted anonymously. This is your idempotency scope.
+- **`trace` is observability-only**: trace handler errors are logged with `[sync trace]` and swallowed. They never fail submit, process, ack, nack, or key release.
+- **Trace order is deterministic for one job attempt**: handlers are awaited. If you want fire-and-forget behavior, do that inside your trace handler.
+- **`submitted` means new enqueue**: duplicate submits that return an existing `jobId` do not emit `submitted`.
+- **`succeeded` / `failed` describe the process attempt**: `after` can still call `ctx.reschedule()` after either event.
+- **`finished` means terminal**: it fires only after a successful ack and idempotency key release. Rescheduled jobs emit `rescheduled`, then a later attempt emits its own `started` event.
 - **Crash recovery**: if the worker dies mid-process, the queue lease expires and another worker (or the same one on restart) receives the message with `attempt++`. `ctx.failureCount` = `attempt - 1`.
 - **At-least-once**: `process` might run multiple times if crashes happen between side-effects and `ack`. Make your side effects idempotent or use `ctx.key` to detect re-runs.
 - **`after` errors are swallowed**: don't throw inside `after` — decide via `ctx.reschedule` instead.

@@ -22,8 +22,8 @@ Or when the user is building features that need one of the eight modules:
 | `queue` | Durable work queue: at-least-once, lease-based visibility, delayMs, idempotency, DLQ |
 | `topic` | Pub/sub with cursor-based replay; consumer groups OR `live()` broadcast |
 | `ephemeral` | TTL key/value with `tenantId` isolation, `prefix` filter, change-stream reader |
-| `job` | Durable background tasks with `process` + `after` lifecycle callbacks, typed input |
-| `scheduler` | Distributed cron with leader election, `runNumber`, `failureCount`, `ctx.reschedule` |
+| `job` | Durable background tasks with `process` + `after` lifecycle callbacks, typed input, optional trace callback |
+| `scheduler` | Distributed cron with leader election, `runNumber`, `failureCount`, `ctx.reschedule`, optional per-schedule trace callback |
 | `retry` | General-purpose retry wrapper with the same callback pattern |
 
 ## v5 API core pattern
@@ -45,6 +45,8 @@ mod({
 ```
 
 **No call to `ctx.reschedule` in `after`** → terminal. Key released (job), cron advances to next slot (scheduler), error rethrown (retry).
+
+`job` and `scheduler.create` accept optional `trace` callbacks for observability. Trace handlers are awaited for deterministic order, but handler errors are logged and swallowed; tracing must never decide transport state.
 
 ## Per-module reference
 

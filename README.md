@@ -168,6 +168,9 @@ import { job, isRetryableTransportError } from "@valentinkolb/sync";
 const sendMail = job<{ to: string }, { sent: boolean }>({
   id: "send-mail",
   defaults: { leaseMs: 30_000 },
+  trace: async (event) => {
+    await cloudTrace({ source: "send-mail", event });
+  },
 
   process: async ({ ctx }) => {
     // ctx.input: { to: string } — typed
@@ -193,6 +196,7 @@ sendMail.metric(); // { dispatches, failures, reschedules }
 ```
 
 Key lifecycle: claimed on submit, held during run and pending retry, released on terminal (success or failure without reschedule).
+`trace` is observability-only: handler errors are logged and swallowed. `submitted` fires only for a newly enqueued job, not for idempotent duplicate submits. `finished` fires only after a terminal ack and key release; a job that calls `ctx.reschedule()` emits `rescheduled` instead.
 
 **Input is optional** — simple jobs can omit both the input generic and the `input` submit field:
 
@@ -219,6 +223,9 @@ await sched.create<{ cleaned: number }>({
   id: "cleanup",
   cron: "0 * * * *",
   tz: "Europe/Berlin",
+  trace: async (event) => {
+    await cloudTrace({ source: "cleanup", event });
+  },
   process: async ({ ctx }) => {
     // ctx.scheduleId, ctx.slotTs, ctx.runNumber, ctx.failureCount, ctx.duration, ctx.signal
     const cleaned = await doCleanup();
@@ -243,6 +250,7 @@ await sched.stop();
 - `misfire` is always "skip" — missed slots (e.g. from downtime) jump to the next cron slot.
 - `ctx.runNumber` is 1-indexed and monotonic, persisted across restarts.
 - `ctx.failureCount` tracks consecutive failures, resets on success.
+- `trace` is per schedule and observability-only. Scheduler traces have no `finished` event because schedules are recurring definitions; use `succeeded`, `failed`, and `rescheduled` for run outcomes.
 
 ### Batch item retry via job fanout
 

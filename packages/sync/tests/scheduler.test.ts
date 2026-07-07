@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { scheduler, type Scheduler } from "../index";
+import { scheduler, type Scheduler, type SchedulerTraceEvent } from "../index";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 
@@ -562,4 +562,136 @@ test("ctx.trigger is 'cron' when dispatched via tick loop", async () => {
   await waitFor(() => processTrigger !== null, 5_000);
   expect(processTrigger).toBe("cron");
   expect(afterTrigger).toBe("cron");
+});
+
+// ==========================
+// trace
+// ==========================
+
+test("trace records schedule creation and manual run lifecycle", async () => {
+  const s = makeScheduler(uid("trace-lifecycle"));
+  const events: SchedulerTraceEvent<{ ok: boolean }>[] = [];
+
+  await s.create<{ ok: boolean }>({
+    id: "t",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    meta: { source: "test" },
+    trace: (event) => {
+      events.push(event);
+    },
+    process: async () => ({ ok: true }),
+  });
+
+  expect(events.map((event) => event.type)).toEqual(["scheduled"]);
+  const scheduled = events[0] as Extract<SchedulerTraceEvent<{ ok: boolean }>, { type: "scheduled" }>;
+  expect(scheduled.scheduleId).toBe("t");
+  expect(scheduled.cron).toBe("0 3 * * *");
+  expect(scheduled.tz).toBe("UTC");
+  expect(scheduled.nextRunAt).toBeGreaterThan(Date.now());
+  expect(scheduled.meta?.source).toBe("test");
+
+  await s.runNow({ id: "t" });
+
+  expect(events.map((event) => event.type)).toEqual(["scheduled", "started", "succeeded"]);
+  const started = events[1] as Extract<SchedulerTraceEvent<{ ok: boolean }>, { type: "started" }>;
+  expect(started.runNumber).toBe(1);
+  expect(started.trigger).toBe("manual");
+  expect(started.slotTs).toBe(scheduled.nextRunAt);
+
+  const succeeded = events[2] as Extract<SchedulerTraceEvent<{ ok: boolean }>, { type: "succeeded" }>;
+  expect(succeeded.runNumber).toBe(1);
+  expect(succeeded.data.ok).toBe(true);
+  expect(succeeded.durationMs).toBeGreaterThanOrEqual(0);
+});
+
+test("trace scheduled reports preserved nextRunAt on unchanged update", async () => {
+  const s = makeScheduler(uid("trace-preserved-next"));
+  const events: SchedulerTraceEvent<void>[] = [];
+
+  const cfg = {
+    id: "t",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    trace: (event: SchedulerTraceEvent<void>) => {
+      events.push(event);
+    },
+    process: async () => {},
+  };
+
+  await s.create(cfg);
+  const firstNextRunAt = (events[0] as Extract<SchedulerTraceEvent<void>, { type: "scheduled" }>).nextRunAt;
+
+  await s.runNow({ id: "t" });
+  await s.create(cfg);
+
+  const current = await s.get({ id: "t" });
+  const secondScheduled = events.filter((event) => event.type === "scheduled")[1] as Extract<
+    SchedulerTraceEvent<void>,
+    { type: "scheduled" }
+  >;
+  expect(secondScheduled.nextRunAt).toBe(firstNextRunAt);
+  expect(secondScheduled.nextRunAt).toBe(current?.nextRunAt);
+});
+
+test("trace records scheduler failures and reschedules", async () => {
+  const s = makeScheduler(uid("trace-reschedule"));
+  const events: SchedulerTraceEvent<string>[] = [];
+
+  await s.create<string>({
+    id: "r",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    trace: (event) => {
+      events.push(event);
+    },
+    process: async () => {
+      throw new Error("try again");
+    },
+    after: async ({ ctx }) => {
+      if (ctx.error) ctx.reschedule({ delayMs: 25 });
+    },
+  });
+
+  await s.runNow({ id: "r" });
+
+  expect(events.map((event) => event.type)).toEqual(["scheduled", "started", "failed", "rescheduled"]);
+  const failed = events[2] as Extract<SchedulerTraceEvent<string>, { type: "failed" }>;
+  expect(failed.error.message).toBe("try again");
+
+  const rescheduled = events[3] as Extract<SchedulerTraceEvent<string>, { type: "rescheduled" }>;
+  expect(rescheduled.runNumber).toBe(1);
+  expect(rescheduled.delayMs).toBe(25);
+});
+
+test("trace errors are swallowed and do not affect scheduler execution", async () => {
+  const originalWarn = console.warn;
+  let warnings = 0;
+  console.warn = () => {
+    warnings += 1;
+  };
+
+  const s = makeScheduler(uid("trace-throws"));
+  let ran = false;
+
+  try {
+    await s.create({
+      id: "t",
+      cron: "0 3 * * *",
+      tz: "UTC",
+      trace: () => {
+        throw new Error("trace failed");
+      },
+      process: async () => {
+        ran = true;
+      },
+    });
+
+    await s.runNow({ id: "t" });
+    expect(ran).toBe(true);
+    expect((await s.get({ id: "t" }))?.runNumber).toBe(1);
+    expect(warnings).toBeGreaterThan(0);
+  } finally {
+    console.warn = originalWarn;
+  }
 });

@@ -1,5 +1,5 @@
 import { test, expect, beforeEach } from "bun:test";
-import { job } from "../src/job";
+import { job, type JobTraceEvent } from "../src/job";
 
 let testCounter = 0;
 const uid = (name: string): string => `${name}-${Date.now()}-${++testCounter}`;
@@ -213,6 +213,7 @@ test("key released after terminal success; resubmit gets new jobId", async () =>
 
   const id1 = await worker.submit({ key: "chat:x" });
   await waitFor(() => runs === 1);
+  await waitFor(() => worker.metric().dispatches === 1);
 
   const id2 = await worker.submit({ key: "chat:x" });
   expect(id2).not.toBe(id1);
@@ -236,6 +237,7 @@ test("terminal failure (no reschedule) releases key", async () => {
 
   const id1 = await worker.submit({ key: "chat:x" });
   await waitFor(() => afterRuns === 1);
+  await waitFor(() => worker.metric().failures === 1);
 
   const id2 = await worker.submit({ key: "chat:x" });
   expect(id2).not.toBe(id1);
@@ -453,4 +455,125 @@ test("errors thrown inside after do not blow up the worker", async () => {
   expect(processedKeys.sort()).toEqual(["a", "b"]);
 
   worker.stop();
+});
+
+// ==========================
+// trace
+// ==========================
+
+test("trace records job lifecycle and only emits submitted for new jobs", async () => {
+  const events: JobTraceEvent<{ userId: string }, { ok: boolean }>[] = [];
+
+  const worker = job<{ userId: string }, { ok: boolean }>({
+    id: uid("trace-lifecycle"),
+    trace: (event) => {
+      events.push(event);
+    },
+    process: async () => ({ ok: true }),
+  });
+
+  const first = await worker.submit({
+    key: "user:1",
+    input: { userId: "u1" },
+    meta: { source: "test" },
+  });
+  const duplicate = await worker.submit({
+    key: "user:1",
+    input: { userId: "u1" },
+  });
+
+  expect(duplicate).toBe(first);
+  await waitFor(() => events.some((event) => event.type === "finished"));
+
+  expect(events.map((event) => event.type)).toEqual(["submitted", "started", "succeeded", "finished"]);
+
+  const submitted = events[0] as Extract<JobTraceEvent<{ userId: string }, { ok: boolean }>, { type: "submitted" }>;
+  expect(submitted.jobId).toBe(first);
+  expect(submitted.key).toBe("user:1");
+  expect(submitted.input?.userId).toBe("u1");
+  expect(submitted.meta?.source).toBe("test");
+
+  const started = events[1] as Extract<JobTraceEvent<{ userId: string }, { ok: boolean }>, { type: "started" }>;
+  expect(started.attempt).toBe(1);
+
+  const succeeded = events[2] as Extract<JobTraceEvent<{ userId: string }, { ok: boolean }>, { type: "succeeded" }>;
+  expect(succeeded.data.ok).toBe(true);
+  expect(succeeded.durationMs).toBeGreaterThanOrEqual(0);
+
+  const finished = events[3] as Extract<JobTraceEvent<{ userId: string }, { ok: boolean }>, { type: "finished" }>;
+  expect(finished.status).toBe("succeeded");
+
+  worker.stop();
+});
+
+test("trace records failed attempts, reschedules, and terminal finish", async () => {
+  const events: JobTraceEvent<void, string>[] = [];
+
+  const worker = job<void, string>({
+    id: uid("trace-reschedule"),
+    trace: (event) => {
+      events.push(event);
+    },
+    process: async ({ ctx }) => {
+      if (ctx.failureCount === 0) throw new Error("try again");
+      return "ok";
+    },
+    after: async ({ ctx }) => {
+      if (ctx.error && ctx.failureCount === 0) ctx.reschedule({ delayMs: 20 });
+    },
+  });
+
+  await worker.submit({ key: "retry" });
+  await waitFor(() => events.some((event) => event.type === "finished"), 5_000);
+
+  expect(events.map((event) => event.type)).toEqual([
+    "submitted",
+    "started",
+    "failed",
+    "rescheduled",
+    "started",
+    "succeeded",
+    "finished",
+  ]);
+
+  const failed = events[2] as Extract<JobTraceEvent<void, string>, { type: "failed" }>;
+  expect(failed.error.message).toBe("try again");
+
+  const rescheduled = events[3] as Extract<JobTraceEvent<void, string>, { type: "rescheduled" }>;
+  expect(rescheduled.attempt).toBe(1);
+  expect(rescheduled.delayMs).toBe(20);
+
+  const secondStarted = events[4] as Extract<JobTraceEvent<void, string>, { type: "started" }>;
+  expect(secondStarted.attempt).toBe(2);
+
+  worker.stop();
+});
+
+test("trace errors are swallowed and do not affect job execution", async () => {
+  const originalWarn = console.warn;
+  let warnings = 0;
+  console.warn = () => {
+    warnings += 1;
+  };
+
+  let ran = false;
+  const worker = job({
+    id: uid("trace-throws"),
+    trace: () => {
+      throw new Error("trace failed");
+    },
+    process: async () => {
+      ran = true;
+    },
+  });
+
+  try {
+    await worker.submit({ key: "x" });
+    await waitFor(() => ran);
+    await waitFor(() => worker.metric().dispatches === 1);
+    expect(warnings).toBeGreaterThan(0);
+  } finally {
+    console.warn = originalWarn;
+    worker.stop();
+  }
 });

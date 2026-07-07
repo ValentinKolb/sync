@@ -3,6 +3,7 @@ import { type Store, createMemoryStore } from "./store";
 import { expBackoff, type BackoffOptions } from "./retry";
 import { sleep } from "./internal/sleep";
 import { assertValidTimeZone, nextCronTimestamp } from "./internal/cron";
+import { emitTrace, type TraceHandler } from "./trace";
 
 const DEFAULT_PREFIX = "sync:scheduler";
 const DEFAULT_LEASE_MS = 5_000;
@@ -45,6 +46,13 @@ export type SchedulerMetrics = {
   lastTickAt: number | null;
 };
 
+export type SchedulerTraceEvent<Result = unknown> =
+  | { type: "scheduled"; scheduleId: string; cron: string; tz: string; nextRunAt: number; meta?: Record<string, unknown> }
+  | { type: "started"; scheduleId: string; runNumber: number; trigger: "cron" | "manual"; slotTs: number }
+  | { type: "succeeded"; scheduleId: string; runNumber: number; data: Result; durationMs: number }
+  | { type: "failed"; scheduleId: string; runNumber: number; error: Error; durationMs: number }
+  | { type: "rescheduled"; scheduleId: string; runNumber: number; delayMs: number };
+
 export type ScheduleCtx = {
   scheduleId: string;
   slotTs: number;
@@ -69,6 +77,7 @@ export type ScheduleConfig<Result = unknown> = {
   cron: string;
   tz?: string;
   meta?: Record<string, unknown>;
+  trace?: TraceHandler<SchedulerTraceEvent<Result>>;
   process: (cfg: { ctx: ScheduleCtx }) => Promise<Result> | Result;
   after?: (cfg: { ctx: ScheduleAfterCtx<Result> }) => Promise<void> | void;
 };
@@ -121,6 +130,7 @@ export type Scheduler = {
 type HandlerEntry = {
   process: (cfg: { ctx: ScheduleCtx }) => Promise<unknown> | unknown;
   after?: (cfg: { ctx: ScheduleAfterCtx<unknown> }) => Promise<void> | void;
+  trace?: TraceHandler<SchedulerTraceEvent<unknown>>;
 };
 
 // Module-level shared maps so multiple scheduler() instances with the same id
@@ -299,6 +309,14 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
     const ctx = makeCtx();
 
+    await emitTrace(handler.trace, {
+      type: "started",
+      scheduleId: schedule.id,
+      runNumber,
+      trigger,
+      slotTs,
+    });
+
     let result: unknown;
     let error: Error | undefined;
     try {
@@ -306,6 +324,24 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     } catch (err) {
       jobAc.abort();
       error = asError(err);
+    }
+
+    if (error) {
+      await emitTrace(handler.trace, {
+        type: "failed",
+        scheduleId: schedule.id,
+        runNumber,
+        error,
+        durationMs: Date.now() - startedAt,
+      });
+    } else {
+      await emitTrace(handler.trace, {
+        type: "succeeded",
+        scheduleId: schedule.id,
+        runNumber,
+        data: result,
+        durationMs: Date.now() - startedAt,
+      });
     }
 
     let rescheduleRequested: { delayMs?: number } | null = null;
@@ -336,16 +372,26 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       metrics.dispatches += 1;
     }
 
+    let traceRescheduled: { delayMs: number } | null = null;
     if (rescheduleRequested) {
       const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
       schedule.nextRunAt = Date.now() + delayMs;
       metrics.reschedules += 1;
+      traceRescheduled = { delayMs };
     } else if (advanceCron) {
       schedule.nextRunAt = nextCronTimestamp(schedule.cron, schedule.tz, Date.now());
     }
 
     schedule.updatedAt = Date.now();
     writePersistedState(schedule);
+    if (traceRescheduled) {
+      await emitTrace(handler.trace, {
+        type: "rescheduled",
+        scheduleId: schedule.id,
+        runNumber,
+        delayMs: traceRescheduled.delayMs,
+      });
+    }
   };
 
   const dispatchDue = async (): Promise<void> => {
@@ -443,9 +489,18 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     handlers.set(cfg.id, {
       process: cfg.process as HandlerEntry["process"],
       after: cfg.after as HandlerEntry["after"],
+      trace: cfg.trace as HandlerEntry["trace"],
     });
 
     writePersistedState(stored);
+    await emitTrace(cfg.trace, {
+      type: "scheduled",
+      scheduleId: cfg.id,
+      cron: cfg.cron,
+      tz,
+      nextRunAt: stored.nextRunAt,
+      ...(cfg.meta ? { meta: cfg.meta } : {}),
+    });
 
     return {
       created,
