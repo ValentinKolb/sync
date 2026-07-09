@@ -1,6 +1,6 @@
 ---
 name: sync
-description: "Use this skill for @valentinkolb/sync and @valentinkolb/sync-browser — distributed synchronization primitives for TypeScript/Bun (server) and browsers. Covers all 8 modules: ratelimit, mutex, queue, topic, ephemeral, job, scheduler, retry. Use when code imports from `@valentinkolb/sync` or `@valentinkolb/sync-browser`, or when building features that need: rate limiting, distributed locks, durable work queues with at-least-once delivery + DLQ + idempotency, pub/sub with cursor-based replay, TTL-based presence/registry, durable background jobs with retry + lifecycle callbacks, distributed cron scheduling with leader election, or retry helpers with exponential backoff. Also use for migrating v4 code to the v5 rewrite (unified callback API, no Zod peer dep, no registry module)."
+description: "Use this skill for @valentinkolb/sync and @valentinkolb/sync/browser — distributed synchronization primitives for TypeScript/Bun (server) and browsers. Covers all 8 modules: ratelimit, mutex, queue, topic, ephemeral, job, scheduler, retry. Use when code imports from `@valentinkolb/sync` or `@valentinkolb/sync/browser`, or when building features that need: rate limiting, distributed locks, durable work queues with at-least-once delivery + DLQ + idempotency, pub/sub with cursor-based replay, TTL-based presence/registry, durable background jobs with retry + lifecycle callbacks, distributed cron scheduling with leader election, or retry helpers with exponential backoff. Also use for migrating v4 code to the v5 rewrite (unified callback API, no Zod peer dep, no registry module)."
 ---
 
 # @valentinkolb/sync — v5
@@ -11,7 +11,7 @@ Distributed synchronization primitives with an **identical public API** between 
 
 Trigger for any imports from:
 - `@valentinkolb/sync` (server — Bun + Redis/Valkey/Dragonfly 6.2+)
-- `@valentinkolb/sync-browser` (browser — in-memory)
+- `@valentinkolb/sync/browser` (browser — in-memory)
 
 Or when the user is building features that need one of the eight modules:
 
@@ -64,9 +64,9 @@ Read the module's reference file in `references/` for full API, gotchas, and usa
 - [references/retry.md](references/retry.md) — general retry wrapper, `ctx.expBackoff` helper
 - [references/migration-v4-v5.md](references/migration-v4-v5.md) — breaking-change guide for code using v4
 
-## Browser package specifics
+## Browser runtime specifics
 
-`@valentinkolb/sync-browser` has the same API with additive options:
+`@valentinkolb/sync/browser` has the same API with additive options:
 
 - Most configs accept optional `store?: Store` for `createLocalStorageStore()` persistence.
 - Leader election trivially succeeds in a single tab.

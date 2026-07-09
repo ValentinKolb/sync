@@ -305,7 +305,14 @@ const q = queue<Mail>({ id: "mail" });
 ```bash
 # package.json
 "@valentinkolb/sync": "5.0.0"
-"@valentinkolb/sync-browser": "5.0.0"
 ```
+
+Browser code now uses the same package through the browser subpath:
+
+```ts
+import { scheduler } from "@valentinkolb/sync/browser";
+```
+
+The old `@valentinkolb/sync-browser` package is not released separately anymore.
 
 `zod` is no longer a `peerDependency`. Remove it from your install if you're not using it directly.

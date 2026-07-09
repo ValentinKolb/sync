@@ -1,22 +1,19 @@
 # @valentinkolb/sync
 
-Synchronization primitives for TypeScript — available as two packages:
+Synchronization primitives for TypeScript, published as one package with two runtimes:
 
-- **[`@valentinkolb/sync`](./packages/sync)**: Redis-backed (6.2+, Valkey, Dragonfly), built for [Bun](https://bun.sh). For horizontally scaled systems where multiple service instances coordinate via shared state.
-- **[`@valentinkolb/sync-browser`](./packages/sync-browser)**: fully in-memory, zero dependencies. For local-first browser apps that want the same primitives without a server.
+- **`@valentinkolb/sync`**: Redis-backed (6.2+, Valkey, Dragonfly), built for [Bun](https://bun.sh). For horizontally scaled systems where multiple service instances coordinate via shared state.
+- **`@valentinkolb/sync/browser`**: fully in-memory, zero dependencies. For local-first browser apps that want the same primitives without a server.
 
-Both share an **identical public API** — change the import, and code generally works. Type parity is enforced at compile-time (see `parity/`).
+Both runtimes share an **identical public API** — change the import, and code generally works. Type parity is enforced at compile-time (see `parity/`).
 
 Provides eight modules: **ratelimit**, **mutex**, **queue**, **topic**, **ephemeral**, **job**, **scheduler**, and **retry**. They compose — `job` uses `queue` internally, `scheduler` uses `mutex` for leader election.
 
 ## Installation
 
 ```bash
-# Server (Redis-backed)
+# Server and browser runtimes
 bun add @valentinkolb/sync
-
-# Browser (in-memory, no Redis)
-bun add @valentinkolb/sync-browser
 ```
 
 No runtime dependencies. TypeScript is a peer dependency.
@@ -318,7 +315,7 @@ No `after` defined → first error throws immediately. No `ctx.reschedule` call 
 
 ## Differences between server and browser
 
-Browser package (`@valentinkolb/sync-browser`) has the **same public API** but:
+The browser runtime (`@valentinkolb/sync/browser`) has the **same public API** but:
 
 - All state is in-memory (no Redis). Survives within a page/tab; resets on reload unless you pass a `store?: Store`.
 - `scheduler`/`mutex`/`ratelimit`/`topic` optionally accept `store?: Store` for `createLocalStorageStore()` persistence.

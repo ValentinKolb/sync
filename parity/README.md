@@ -1,6 +1,6 @@
 # Parity
 
-This directory enforces **API parity** between `@valentinkolb/sync` (Redis-backed, server) and `@valentinkolb/sync-browser` (in-memory, browser).
+This directory enforces **API parity** between `@valentinkolb/sync` (Redis-backed, server) and `@valentinkolb/sync/browser` (in-memory, browser).
 
 ## Type parity
 
@@ -42,7 +42,7 @@ Types that currently have additive fields:
 Behavior parity is enforced implicitly: both packages have parallel test suites covering the same scenarios. See:
 
 - `packages/sync/tests/*.test.ts` (server, requires Valkey on :6399)
-- `packages/sync-browser/tests/*.test.ts` (browser, in-memory)
+- `packages/sync-browser/tests/*.test.ts` (browser, in-memory internal workspace)
 
 Each shared module has a corresponding test file in both. When adding a new scenario to one side, add the mirror to the other.
 

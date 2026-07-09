@@ -1,7 +1,8 @@
 {
-  "name": "@valentinkolb/sync-browser",
+  "name": "@valentinkolb/sync-browser-internal",
+  "private": true,
   "version": "5.3.0",
-  "description": "Browser-compatible sync primitives — in-memory ratelimit, mutex, queue, topic, job, scheduler, ephemeral, retry",
+  "description": "Internal browser runtime for @valentinkolb/sync/browser — in-memory ratelimit, mutex, queue, topic, job, scheduler, ephemeral, retry",
   "module": "index.ts",
   "type": "module",
   "sideEffects": false,
