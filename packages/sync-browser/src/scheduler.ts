@@ -4,6 +4,11 @@ import { expBackoff, type BackoffOptions } from "./retry";
 import { sleep } from "./internal/sleep";
 import { assertValidTimeZone, nextCronTimestamp } from "./internal/cron";
 import { emitTrace, type TraceHandler } from "./trace";
+import {
+  registerBrowserSchedulerControl,
+  setBrowserSchedulerControlAvailable,
+  unregisterBrowserSchedulerControl,
+} from "./scheduler-control";
 
 const DEFAULT_PREFIX = "sync:scheduler";
 const DEFAULT_LEASE_MS = 5_000;
@@ -109,6 +114,7 @@ export type SchedulerInfo = {
   runNumber: number;
   failureCount: number;
   lastError?: string;
+  meta?: Record<string, unknown>;
 };
 
 export type Scheduler = {
@@ -150,6 +156,7 @@ const asInfo = (schedule: StoredSchedule): SchedulerInfo => ({
   runNumber: schedule.runNumber,
   failureCount: schedule.failureCount,
   ...(schedule.lastError ? { lastError: schedule.lastError } : {}),
+  ...(schedule.meta ? { meta: schedule.meta } : {}),
 });
 
 // ==========================
@@ -163,6 +170,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const tickMs = Math.max(50, config.dispatch?.tickMs ?? DEFAULT_TICK_MS);
   const batchSize = Math.max(1, config.dispatch?.batchSize ?? DEFAULT_BATCH_SIZE);
   const store = config.store ?? createMemoryStore();
+  const instanceId = crypto.randomUUID();
 
   const schedulesKey = `${prefix}:${config.id}:schedules`;
   if (!sharedSchedules.has(schedulesKey)) {
@@ -491,6 +499,20 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       after: cfg.after as HandlerEntry["after"],
       trace: cfg.trace as HandlerEntry["trace"],
     });
+    registerBrowserSchedulerControl({
+      prefix,
+      schedulerId: config.id,
+      scheduleId: cfg.id,
+      instanceId,
+      getInfo: () => {
+        const current = schedules.get(cfg.id);
+        return current ? asInfo(current) : null;
+      },
+      runNow: () => runNow({ id: cfg.id }),
+    });
+    if (running) {
+      setBrowserSchedulerControlAvailable({ prefix, schedulerId: config.id, instanceId, available: true });
+    }
 
     writePersistedState(stored);
     await emitTrace(cfg.trace, {
@@ -511,6 +533,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const deleteSchedule = async (cfg: { id: string }): Promise<void> => {
     schedules.delete(cfg.id);
     handlers.delete(cfg.id);
+    unregisterBrowserSchedulerControl({ prefix, schedulerId: config.id, scheduleId: cfg.id, instanceId });
     deletePersistedState(cfg.id);
   };
 
@@ -539,12 +562,14 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const start = (): void => {
     if (running) return;
     running = true;
+    setBrowserSchedulerControlAvailable({ prefix, schedulerId: config.id, instanceId, available: true });
     loopPromise = loop();
   };
 
   const stop = async (): Promise<void> => {
     if (!running) return;
     running = false;
+    setBrowserSchedulerControlAvailable({ prefix, schedulerId: config.id, instanceId, available: false });
     if (loopPromise) {
       await loopPromise;
       loopPromise = null;

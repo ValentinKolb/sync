@@ -3,6 +3,16 @@ import { mutex, type Lock } from "./mutex";
 import { expBackoff, type BackoffOptions } from "./retry";
 import { assertValidTimeZone, nextCronTimestamp } from "./internal/cron";
 import { emitTrace, type TraceHandler } from "./trace";
+import {
+  markSchedulerControlAccepted,
+  markSchedulerControlNotFound,
+  markSchedulerControlUnavailable,
+  refreshSchedulerControlHandler,
+  registerSchedulerControlIndex,
+  removeSchedulerControlHandler,
+  schedulerControlQueue,
+  type SchedulerControlRequest,
+} from "./scheduler-control";
 
 const DEFAULT_PREFIX = "sync:scheduler";
 const DEFAULT_LEASE_MS = 5_000;
@@ -162,6 +172,7 @@ export type SchedulerInfo = {
   runNumber: number;
   failureCount: number;
   lastError?: string;
+  meta?: Record<string, unknown>;
 };
 
 export type Scheduler = {
@@ -225,6 +236,7 @@ const asInfo = (schedule: StoredSchedule): SchedulerInfo => ({
   runNumber: schedule.runNumber,
   failureCount: schedule.failureCount,
   ...(schedule.lastError ? { lastError: schedule.lastError } : {}),
+  ...(schedule.meta ? { meta: schedule.meta } : {}),
 });
 
 // ==========================
@@ -241,6 +253,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const scheduleKey = (id: string): string => `${prefix}:${config.id}:schedule:${id}`;
   const dueKey = `${prefix}:${config.id}:due`;
   const indexKey = `${prefix}:${config.id}:index`;
+  const instanceId = crypto.randomUUID();
 
   const leaderMutex = mutex({
     id: `${config.id}:leader`,
@@ -250,6 +263,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   });
 
   const handlers = new Map<string, HandlerEntry>();
+  const controlQueues = new Map<string, ReturnType<typeof schedulerControlQueue>>();
   const metrics: SchedulerMetrics = {
     isLeader: false,
     leaderChanges: 0,
@@ -264,6 +278,14 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   let loopPromise: Promise<void> | null = null;
   let currentLeaderLock: Lock | null = null;
   let lastHeartbeatAt = 0;
+
+  const controlQueueForSchedule = (scheduleId: string): ReturnType<typeof schedulerControlQueue> => {
+    const existing = controlQueues.get(scheduleId);
+    if (existing) return existing;
+    const created = schedulerControlQueue(prefix, config.id, scheduleId);
+    controlQueues.set(scheduleId, created);
+    return created;
+  };
 
   const setLeader = (next: boolean): void => {
     if (metrics.isLeader === next) return;
@@ -478,9 +500,91 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     }
   };
 
+  const refreshControlHandlers = async (): Promise<void> => {
+    await Promise.all(
+      Array.from(handlers.keys()).map((scheduleId) =>
+        refreshSchedulerControlHandler({
+          prefix,
+          schedulerId: config.id,
+          scheduleId,
+          instanceId,
+          ttlMs: Math.max(5_000, tickMs * 4),
+        }),
+      ),
+    );
+  };
+
+  const removeControlHandlers = async (): Promise<void> => {
+    await Promise.all(
+      Array.from(handlers.keys()).map((scheduleId) =>
+        removeSchedulerControlHandler({
+          prefix,
+          schedulerId: config.id,
+          scheduleId,
+          instanceId,
+        }),
+      ),
+    );
+  };
+
+  const dispatchControlRequests = async (): Promise<void> => {
+    let dispatched = 0;
+    const controlLeaseMs = 30_000;
+    for (const [scheduleId, handler] of handlers) {
+      if (dispatched >= batchSize) break;
+      const message = await controlQueueForSchedule(scheduleId).recv({
+        wait: false,
+        leaseMs: controlLeaseMs,
+        consumerId: instanceId,
+      });
+      if (!message) continue;
+
+      const request: SchedulerControlRequest = message.data;
+      const raw = await redis.get(scheduleKey(scheduleId));
+      const schedule = parseSchedule(raw);
+      if (!schedule) {
+        await markSchedulerControlNotFound(
+          prefix,
+          request.requestId,
+          `schedulerControl.runNow: schedule ${request.schedulerId}/${request.scheduleId} not found`,
+        );
+        await message.ack();
+        dispatched += 1;
+        continue;
+      }
+
+      if (!handlers.has(scheduleId)) {
+        await markSchedulerControlUnavailable(
+          prefix,
+          request.requestId,
+          `schedulerControl.runNow: no live handler for schedule ${request.schedulerId}/${request.scheduleId}`,
+        );
+        await message.ack();
+        dispatched += 1;
+        continue;
+      }
+
+      await markSchedulerControlAccepted(prefix, request.requestId);
+      const touchTimer = setInterval(() => {
+        void message.touch({ leaseMs: controlLeaseMs });
+      }, Math.floor(controlLeaseMs / 3));
+      try {
+        await dispatchOne(schedule, handler, "manual");
+        await message.ack();
+      } catch (error) {
+        await message.nack({ delayMs: 250, reason: "control-dispatch-error", error: asError(error).message });
+      } finally {
+        clearInterval(touchTimer);
+      }
+      dispatched += 1;
+    }
+  };
+
   const loop = async (): Promise<void> => {
     while (running) {
       try {
+        await refreshControlHandlers();
+        await dispatchControlRequests();
         await tryAcquireLeadership();
         await maintainLeadership();
         if (currentLeaderLock) {
@@ -530,11 +634,21 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     const result = Number(resultTuple[0]);
     const storedNextRunAt = Number(resultTuple[1] ?? firstRunAt);
 
+    await registerSchedulerControlIndex(prefix, config.id);
     handlers.set(cfg.id, {
       process: cfg.process as HandlerEntry["process"],
       after: cfg.after as HandlerEntry["after"],
       trace: cfg.trace as HandlerEntry["trace"],
     });
+    if (running) {
+      await refreshSchedulerControlHandler({
+        prefix,
+        schedulerId: config.id,
+        scheduleId: cfg.id,
+        instanceId,
+        ttlMs: Math.max(5_000, tickMs * 4),
+      });
+    }
 
     await emitTrace(cfg.trace, {
       type: "scheduled",
@@ -553,6 +667,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
   const deleteSchedule = async (cfg: { id: string }): Promise<void> => {
     await redis.send("EVAL", [DELETE_SCRIPT, "3", scheduleKey(cfg.id), dueKey, indexKey, cfg.id]);
+    await removeSchedulerControlHandler({ prefix, schedulerId: config.id, scheduleId: cfg.id, instanceId });
     handlers.delete(cfg.id);
   };
 
@@ -603,6 +718,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     running = false;
     await loopPromise;
     loopPromise = null;
+    await removeControlHandlers();
     await relinquishLeadership();
   };
 

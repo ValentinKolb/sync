@@ -71,6 +71,7 @@ jobs:
               "./topic": { "import": "./src/topic.js", "types": "./src/topic.d.ts" },
               "./job": { "import": "./src/job.js", "types": "./src/job.d.ts" },
               "./scheduler": { "import": "./src/scheduler.js", "types": "./src/scheduler.d.ts" },
+              "./scheduler-control": { "import": "./src/scheduler-control.js", "types": "./src/scheduler-control.d.ts" },
               "./ephemeral": { "import": "./src/ephemeral.js", "types": "./src/ephemeral.d.ts" },
               "./retry": { "import": "./src/retry.js", "types": "./src/retry.d.ts" },
               "./store": { "import": "./src/store.js", "types": "./src/store.d.ts" }

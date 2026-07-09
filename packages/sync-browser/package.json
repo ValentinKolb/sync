@@ -13,6 +13,7 @@
     "./topic": "./src/topic.ts",
     "./job": "./src/job.ts",
     "./scheduler": "./src/scheduler.ts",
+    "./scheduler-control": "./src/scheduler-control.ts",
     "./ephemeral": "./src/ephemeral.ts",
     "./retry": "./src/retry.ts",
     "./store": "./src/store.ts"

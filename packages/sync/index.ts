@@ -49,6 +49,17 @@ export {
   type ScheduleCtx,
   type ScheduleAfterCtx,
 } from "./src/scheduler";
+export {
+  schedulerControl,
+  SchedulerControlNotFoundError,
+  SchedulerControlTimeoutError,
+  SchedulerControlUnavailableError,
+  type SchedulerControl,
+  type SchedulerControlConfig,
+  type SchedulerControlInfo,
+  type SchedulerControlRunNowConfig,
+  type SchedulerControlState,
+} from "./src/scheduler-control";
 export { type TraceHandler } from "./src/trace";
 export {
   ephemeral,

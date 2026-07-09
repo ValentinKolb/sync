@@ -1,6 +1,13 @@
 import { beforeEach, afterEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { scheduler, type Scheduler, type SchedulerTraceEvent } from "../index";
+import {
+  SchedulerControlNotFoundError,
+  SchedulerControlUnavailableError,
+  scheduler,
+  schedulerControl,
+  type Scheduler,
+  type SchedulerTraceEvent,
+} from "../index";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 
@@ -694,4 +701,85 @@ test("trace errors are swallowed and do not affect scheduler execution", async (
   } finally {
     console.warn = originalWarn;
   }
+});
+
+// ==========================
+// schedulerControl
+// ==========================
+
+test("schedulerControl lists schedules with meta and availability", async () => {
+  const s = makeScheduler(uid("control-list"));
+
+  await s.create({
+    id: "sync-users",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    meta: { label: "Sync users" },
+    process: async () => {},
+  });
+
+  const control = schedulerControl();
+  let listed = await control.list();
+  let info = listed.find((entry) => entry.schedulerId === s.id && entry.scheduleId === "sync-users");
+  expect(info?.cron).toBe("0 3 * * *");
+  expect(info?.tz).toBe("UTC");
+  expect(info?.state).toBe("unavailable");
+  expect(info?.meta?.label).toBe("Sync users");
+
+  s.start();
+  await waitFor(async () => {
+    listed = await control.list();
+    info = listed.find((entry) => entry.schedulerId === s.id && entry.scheduleId === "sync-users");
+    return info?.state === "available";
+  });
+});
+
+test("schedulerControl runNow is accepted by a live scheduler and does not advance cron", async () => {
+  const s = makeScheduler(uid("control-run"));
+  const events: SchedulerTraceEvent<void>[] = [];
+  let runs = 0;
+  let trigger: "cron" | "manual" | null = null;
+
+  await s.create({
+    id: "reindex",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    trace: (event) => {
+      events.push(event);
+    },
+    process: async ({ ctx }) => {
+      runs += 1;
+      trigger = ctx.trigger;
+    },
+  });
+
+  const before = (await s.get({ id: "reindex" }))!.nextRunAt;
+  s.start();
+  const control = schedulerControl();
+  await waitFor(async () => {
+    const listed = await control.list();
+    return listed.some((entry) => entry.schedulerId === s.id && entry.scheduleId === "reindex" && entry.state === "available");
+  });
+
+  await control.runNow({ schedulerId: s.id, scheduleId: "reindex", timeoutMs: 5_000 });
+
+  await waitFor(() => runs === 1);
+  expect(trigger).toBe("manual");
+  expect((await s.get({ id: "reindex" }))!.nextRunAt).toBe(before);
+  expect(events.some((event) => event.type === "started" && event.trigger === "manual")).toBe(true);
+});
+
+test("schedulerControl runNow reports unavailable when no live handler exists", async () => {
+  const s = makeScheduler(uid("control-unavailable"));
+  await s.create({ id: "cleanup", cron: "0 3 * * *", tz: "UTC", process: async () => {} });
+
+  await expect(
+    schedulerControl().runNow({ schedulerId: s.id, scheduleId: "cleanup", timeoutMs: 100 }),
+  ).rejects.toBeInstanceOf(SchedulerControlUnavailableError);
+});
+
+test("schedulerControl runNow reports not found for missing schedules", async () => {
+  await expect(
+    schedulerControl().runNow({ schedulerId: uid("missing-scheduler"), scheduleId: "missing", timeoutMs: 100 }),
+  ).rejects.toBeInstanceOf(SchedulerControlNotFoundError);
 });

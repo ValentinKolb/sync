@@ -75,6 +75,13 @@ import type {
   ScheduleAfterCtx as S_ScheduleAfterCtx,
 } from "../packages/sync/src/scheduler";
 import type {
+  SchedulerControl as S_SchedulerControl,
+  SchedulerControlConfig as S_SchedulerControlConfig,
+  SchedulerControlInfo as S_SchedulerControlInfo,
+  SchedulerControlRunNowConfig as S_SchedulerControlRunNowConfig,
+  SchedulerControlState as S_SchedulerControlState,
+} from "../packages/sync/src/scheduler-control";
+import type {
   TraceHandler as S_TraceHandler,
 } from "../packages/sync/src/trace";
 import type {
@@ -149,6 +156,13 @@ import type {
   ScheduleCtx as B_ScheduleCtx,
   ScheduleAfterCtx as B_ScheduleAfterCtx,
 } from "../packages/sync-browser/src/scheduler";
+import type {
+  SchedulerControl as B_SchedulerControl,
+  SchedulerControlConfig as B_SchedulerControlConfig,
+  SchedulerControlInfo as B_SchedulerControlInfo,
+  SchedulerControlRunNowConfig as B_SchedulerControlRunNowConfig,
+  SchedulerControlState as B_SchedulerControlState,
+} from "../packages/sync-browser/src/scheduler-control";
 import type {
   TraceHandler as B_TraceHandler,
 } from "../packages/sync-browser/src/trace";
@@ -275,6 +289,11 @@ assertEqual<Equal<S_SchedulerTraceEvent<number>, B_SchedulerTraceEvent<number>>>
 assertEqual<Equal<S_ScheduleConfig<number>, B_ScheduleConfig<number>>>(true);
 assertEqual<Equal<S_ScheduleCtx, B_ScheduleCtx>>(true);
 assertEqual<Equal<S_ScheduleAfterCtx<number>, B_ScheduleAfterCtx<number>>>(true);
+assertEqual<Equal<S_SchedulerControl, B_SchedulerControl>>(true);
+assertEqual<Equal<S_SchedulerControlConfig, B_SchedulerControlConfig>>(true);
+assertEqual<Equal<S_SchedulerControlInfo, B_SchedulerControlInfo>>(true);
+assertEqual<Equal<S_SchedulerControlRunNowConfig, B_SchedulerControlRunNowConfig>>(true);
+assertEqual<Equal<S_SchedulerControlState, B_SchedulerControlState>>(true);
 
 // ==========================
 // Trace

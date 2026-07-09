@@ -23,7 +23,7 @@ Or when the user is building features that need one of the eight modules:
 | `topic` | Pub/sub with cursor-based replay; consumer groups OR `live()` broadcast |
 | `ephemeral` | TTL key/value with `tenantId` isolation, `prefix` filter, change-stream reader |
 | `job` | Durable background tasks with `process` + `after` lifecycle callbacks, typed input, optional trace callback |
-| `scheduler` | Distributed cron with leader election, `runNumber`, `failureCount`, `ctx.reschedule`, optional per-schedule trace callback |
+| `scheduler` | Distributed cron with leader election, `runNumber`, `failureCount`, `ctx.reschedule`, optional per-schedule trace callback, remote manual control |
 | `retry` | General-purpose retry wrapper with the same callback pattern |
 
 ## v5 API core pattern
@@ -48,6 +48,8 @@ mod({
 
 `job` and `scheduler.create` accept optional `trace` callbacks for observability. Trace handlers are awaited for deterministic order, but handler errors are logged and swallowed; tracing must never decide transport state.
 
+`schedulerControl()` is the generic remote control plane for scheduler-backed background work. It can list known schedules across scheduler ids and request a manual run by `{ schedulerId, scheduleId }`. The request is executed only by a live scheduler instance that registered the handler. `runNow` waits for accepted, not completed; use trace or app-owned audit storage for run outcomes.
+
 ## Per-module reference
 
 Read the module's reference file in `references/` for full API, gotchas, and usage patterns:
@@ -58,7 +60,7 @@ Read the module's reference file in `references/` for full API, gotchas, and usa
 - [references/mutex.md](references/mutex.md) — distributed lock primitives
 - [references/ratelimit.md](references/ratelimit.md) — sliding-window limiter
 - [references/job.md](references/job.md) — durable jobs with `process`/`after`/`ctx.reschedule`, optional typed `<Input, Result>`
-- [references/scheduler.md](references/scheduler.md) — cron + leader election, `create/runNow/delete`, `ctx.runNumber`
+- [references/scheduler.md](references/scheduler.md) — cron + leader election, `create/runNow/delete`, `schedulerControl`, `ctx.runNumber`
 - [references/retry.md](references/retry.md) — general retry wrapper, `ctx.expBackoff` helper
 - [references/migration-v4-v5.md](references/migration-v4-v5.md) — breaking-change guide for code using v4
 
@@ -136,6 +138,7 @@ Clean by design. Summary:
 - **Queue messages** → `ack`/`nack` handles cleanup; terminal = DEL
 - **Job idempotency keys** → released on terminal (DEL), else TTL (default 24h)
 - **Schedule records** → stay (they ARE the schedule); only `delete({ id })` removes
+- **Scheduler control requests** → queued until a live handler accepts them; ack removes the request
 - **No per-job event streams** (removed in v5)
 - **No DLQ buildup** for jobs (internal queue uses `maxDeliveries: Number.MAX_SAFE_INTEGER`)
 

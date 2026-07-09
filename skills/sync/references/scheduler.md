@@ -78,6 +78,7 @@ type SchedulerInfo = {
   runNumber: number;
   failureCount: number;
   lastError?: string;
+  meta?: Record<string, unknown>;
 };
 
 type Scheduler = {
@@ -90,6 +91,33 @@ type Scheduler = {
   get(cfg: { id: string }): Promise<SchedulerInfo | null>;
   list(): Promise<SchedulerInfo[]>;
   metric(): SchedulerMetrics;
+};
+
+type SchedulerControlState = "available" | "unavailable";
+
+type SchedulerControlInfo = {
+  schedulerId: string;
+  scheduleId: string;
+  cron: string;
+  tz: string;
+  createdAt: number;
+  updatedAt: number;
+  nextRunAt: number;
+  runNumber: number;
+  failureCount: number;
+  state: SchedulerControlState;
+  lastError?: string;
+  meta?: Record<string, unknown>;
+};
+
+type SchedulerControl = {
+  list(): Promise<SchedulerControlInfo[]>;
+  runNow(cfg: {
+    schedulerId: string;
+    scheduleId: string;
+    requestId?: string;
+    timeoutMs?: number;
+  }): Promise<void>;
 };
 ```
 
@@ -129,6 +157,36 @@ sched.metric();
 
 await sched.stop();
 ```
+
+## Remote manual control
+
+Use `schedulerControl()` in an external process, such as an admin API, when that process should trigger scheduler-backed work without registering or importing the handler.
+
+```ts
+import {
+  SchedulerControlNotFoundError,
+  SchedulerControlUnavailableError,
+  schedulerControl,
+} from "@valentinkolb/sync";
+
+const control = schedulerControl();
+
+const schedules = await control.list();
+// [{ schedulerId: "platform", scheduleId: "cleanup", state: "available", meta: ... }]
+
+try {
+  await control.runNow({ schedulerId: "platform", scheduleId: "cleanup" });
+} catch (error) {
+  if (error instanceof SchedulerControlNotFoundError) {
+    // The schedule record does not exist.
+  }
+  if (error instanceof SchedulerControlUnavailableError) {
+    // The schedule exists, but no live scheduler has its handler registered.
+  }
+}
+```
+
+`schedulerControl.runNow()` waits for a live scheduler instance to accept the request. It does not wait for the handler to finish and it does not serialize handler results or errors. Use `trace`, metrics, or app-owned audit storage for completion visibility.
 
 ## Common pattern: cron + job fanout (batch item retry)
 
@@ -180,6 +238,8 @@ Each item has its own `ctx.failureCount`. Already-running items skip duplicate s
 - **Misfire behavior**: always "skip" — if the system was down when a slot was due, `nextRunAt` advances past all missed slots to the next future cron slot. There's no `catch_up_one` / `catch_up_all` in v5.
 - **`create` is idempotent by id**: second call with same id updates. If `cron`/`tz` changed, `nextRunAt` resets; otherwise it's preserved.
 - **`runNow` does NOT advance cron**: the regular schedule continues unchanged, unless you call `ctx.reschedule` inside `after`.
+- **`schedulerControl.runNow` is remote accepted, not completed**: it returns when a live scheduler with the handler accepts the request. The handler then runs with `ctx.trigger === "manual"`.
+- **Unavailable is explicit**: `SchedulerControlUnavailableError` means the schedule exists but no live handler heartbeat is present. Start a scheduler instance that calls `create()` for that schedule.
 - **`ctx.trigger`**: `"cron"` when dispatched by the tick loop; `"manual"` when invoked via `runNow`. Useful for conditionals like "skip expensive validation on manual runs" or "log admin runs separately". Available in both `process` and `after` ctx.
 - **`ctx.runNumber` is persistent**: preserved across restarts, re-registrations, and (different) cron changes. Only `delete` resets.
 - **`ctx.failureCount` persists across cron slots**: resets to 0 on any successful run. A consistently failing schedule grows this counter indefinitely — use it to decide when to give up in `after`.
@@ -194,6 +254,9 @@ Each item has its own `ctx.failureCount`. Already-running items skip duplicate s
 - `sync:scheduler:{sid}:due` — sorted set of scheduleId by nextRunAt
 - `sync:scheduler:{sid}:index` — set of all schedule ids
 - `sync:scheduler:leader:{sid}:leader:active` — leader mutex key
+- `sync:scheduler:index` — set of scheduler ids for `schedulerControl().list()`
+- `sync:scheduler:{sid}:control:{id}:handler:{instance}` — live handler heartbeat
+- `sync:scheduler:control:*` — durable manual-run control queues and short-lived accepted responses
 
 **Removed in v5**: `leader:epoch`, CAS Lua scripts, `dispatch:dlq`.
 

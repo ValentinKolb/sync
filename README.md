@@ -213,7 +213,7 @@ await sync.submit({ key: "daily" });
 Distributed cron with leader election, callback-based dispatch.
 
 ```ts
-import { scheduler } from "@valentinkolb/sync";
+import { scheduler, schedulerControl } from "@valentinkolb/sync";
 
 const sched = scheduler({ id: "platform" });
 
@@ -251,6 +251,17 @@ await sched.stop();
 - `ctx.runNumber` is 1-indexed and monotonic, persisted across restarts.
 - `ctx.failureCount` tracks consecutive failures, resets on success.
 - `trace` is per schedule and observability-only. Scheduler traces have no `finished` event because schedules are recurring definitions; use `succeeded`, `failed`, and `rescheduled` for run outcomes.
+
+External processes can trigger a live schedule without owning the handler:
+
+```ts
+const control = schedulerControl();
+
+await control.list(); // [{ schedulerId, scheduleId, state, cron, tz, meta, ... }]
+await control.runNow({ schedulerId: "platform", scheduleId: "cleanup" });
+```
+
+`schedulerControl.runNow()` waits until a live scheduler instance with the registered handler accepts the request. It does not wait for the handler's business result. Missing schedules throw `SchedulerControlNotFoundError`; schedules without a live handler throw `SchedulerControlUnavailableError`. The manual run still uses `ctx.trigger === "manual"` and does not advance cron unless `after` calls `ctx.reschedule()`.
 
 ### Batch item retry via job fanout
 
