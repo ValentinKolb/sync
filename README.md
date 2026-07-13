@@ -111,12 +111,7 @@ await t.pub({ data: { type: "order.confirmed", orderId: "o1" } });
 
 const startCursor = (await t.latestCursor()) ?? "0-0";
 
-// Consumer group (at-least-once, acked)
 const reader = t.reader("analytics");
-for await (const msg of reader.stream()) {
-  await process(msg.data);
-  await msg.commit();
-}
 
 // Recover deliveries abandoned by a crashed consumer. Keep nextCursor between
 // calls so one poison prefix cannot starve later pending entries.
@@ -134,6 +129,12 @@ do {
   }
   recoveryCursor = batch.nextCursor;
 } while (recoveryCursor !== "0-0");
+
+// Consumer group (at-least-once, acked)
+for await (const msg of reader.stream()) {
+  await process(msg.data);
+  await msg.commit();
+}
 
 // Live (best-effort, all listeners)
 for await (const event of t.live({ after: startCursor })) {

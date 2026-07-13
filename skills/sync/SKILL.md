@@ -20,7 +20,7 @@ Or when the user is building features that need one of the eight modules:
 | `ratelimit` | Sliding-window rate limiter per identifier |
 | `mutex` | Distributed lock with retry, TTL, owner-only release |
 | `queue` | Durable work queue: at-least-once, lease-based visibility, delayMs, idempotency, DLQ |
-| `topic` | Pub/sub with cursor-based replay; consumer groups OR `live()` broadcast |
+| `topic` | Pub/sub with cursor-based replay, consumer-group pending recovery, or `live()` broadcast |
 | `ephemeral` | TTL key/value with `tenantId` isolation, `prefix` filter, change-stream reader |
 | `job` | Durable background tasks with `process` + `after` lifecycle callbacks, typed input, optional trace callback |
 | `scheduler` | Distributed cron with leader election, `runNumber`, `failureCount`, `ctx.reschedule`, optional per-schedule trace callback, remote manual control |
@@ -55,7 +55,7 @@ mod({
 Read the module's reference file in `references/` for full API, gotchas, and usage patterns:
 
 - [references/queue.md](references/queue.md) — `send/recv/ack/nack/touch`, DLQ, idempotency
-- [references/topic.md](references/topic.md) — `pub/reader/live`, cursor replay, consumer groups
+- [references/topic.md](references/topic.md) — `pub/reader/reclaim/live`, cursor replay, consumer groups, pending recovery
 - [references/ephemeral.md](references/ephemeral.md) — TTL KV with `tenantId` isolation, `prefix` filter (replaces old registry)
 - [references/mutex.md](references/mutex.md) — distributed lock primitives
 - [references/ratelimit.md](references/ratelimit.md) — sliding-window limiter
