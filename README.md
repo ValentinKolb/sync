@@ -118,11 +118,35 @@ for await (const msg of reader.stream()) {
   await msg.commit();
 }
 
+// Recover deliveries abandoned by a crashed consumer. Keep nextCursor between
+// calls so one poison prefix cannot starve later pending entries.
+let recoveryCursor = "0-0";
+do {
+  const batch = await reader.reclaim({ minIdleMs: 60_000, cursor: recoveryCursor });
+  for (const entry of batch.entries) {
+    if (entry.kind === "invalid") {
+      await recordPoisonMessage(entry.eventId, entry.error);
+      await entry.commit();
+      continue;
+    }
+    await process(entry.delivery.data);
+    await entry.delivery.commit();
+  }
+  recoveryCursor = batch.nextCursor;
+} while (recoveryCursor !== "0-0");
+
 // Live (best-effort, all listeners)
 for await (const event of t.live({ after: startCursor })) {
   console.log(event.data);
 }
 ```
+
+Pass `invalidPayload: "throw"` to `recv()` or `stream()` to receive a
+`TopicPayloadError` for malformed transport envelopes and leave the entry
+pending. The default remains `"ack"` for compatibility. `reclaim()` returns
+pending malformed entries with `kind: "invalid"` so the application can record
+or dead-letter them before acknowledging. The in-memory browser runtime has no
+leased pending deliveries, so `reclaim()` returns an empty completed batch.
 
 ## Ephemeral
 

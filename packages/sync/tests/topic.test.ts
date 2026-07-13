@@ -1,6 +1,6 @@
 import { beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { topic } from "../index";
+import { TopicPayloadError, topic } from "../index";
 
 beforeEach(async () => {
   const keys = await redis.send("KEYS", ["test:t:*"]);
@@ -228,6 +228,127 @@ test("uncommitted message is redelivered to same group", async () => {
 
   // But the original can still commit
   expect(await msg1?.commit()).toBe(true);
+});
+
+test("reader reclaims an abandoned delivery through the public API", async () => {
+  const t = topic<{ value: number }>({ id: "reclaim", prefix: "test:t" });
+  await t.pub({ data: { value: 42 } });
+
+  const original = await t.reader("workers").recv({ wait: false });
+  expect(original?.data.value).toBe(42);
+
+  const recovered = await t.reader("workers").reclaim?.({ minIdleMs: 0 });
+  if (!recovered) throw new Error("Expected topic reclaim support");
+  expect(recovered.nextCursor).toBe("0-0");
+  expect(recovered.entries).toHaveLength(1);
+  const entry = recovered.entries[0];
+  expect(entry?.kind).toBe("delivery");
+  if (entry?.kind !== "delivery") throw new Error("Expected a recovered delivery");
+  expect(entry.delivery.data.value).toBe(42);
+  expect(await entry.delivery.commit()).toBe(true);
+});
+
+test("invalid transport payload remains pending and is reclaimable", async () => {
+  const t = topic<{ value: number }>({ id: "invalid-reclaim", prefix: "test:t" });
+  const key = "test:t:default:invalid-reclaim:stream";
+  await redis.send("XADD", [key, "*", "payload", "{broken"]);
+
+  const reader = t.reader("workers");
+  await expect(reader.recv({ wait: false, invalidPayload: "throw" })).rejects.toBeInstanceOf(TopicPayloadError);
+
+  const recovered = await reader.reclaim?.({ minIdleMs: 0 });
+  if (!recovered) throw new Error("Expected topic reclaim support");
+  const entry = recovered.entries[0];
+  expect(entry).toMatchObject({ kind: "invalid", error: "payload is not valid JSON", rawPayload: "{broken" });
+  if (entry?.kind !== "invalid") throw new Error("Expected an invalid recovered delivery");
+  expect(await entry.commit()).toBe(true);
+});
+
+test("reader keeps legacy acknowledgement for invalid payloads by default", async () => {
+  const t = topic({ id: "invalid-default", prefix: "test:t" });
+  const key = "test:t:default:invalid-default:stream";
+  await redis.send("XADD", [key, "*", "payload", "{broken"]);
+
+  const reader = t.reader("workers");
+  expect(await reader.recv({ wait: false })).toBeNull();
+  const recovered = await reader.reclaim?.({ minIdleMs: 0 });
+  expect(recovered?.entries).toHaveLength(0);
+});
+
+test("topic preserves undefined data", async () => {
+  const t = topic<undefined>({ id: "undefined-data", prefix: "test:t" });
+  await t.pub({ data: undefined });
+
+  const delivery = await t.reader("workers").recv({ wait: false, invalidPayload: "throw" });
+  expect(delivery?.data).toBeUndefined();
+  expect(await delivery?.commit()).toBe(true);
+});
+
+test("reclaim cursor advances beyond more than one poison batch", async () => {
+  const t = topic<{ value: number }>({ id: "poison-prefix", prefix: "test:t" });
+  const key = "test:t:default:poison-prefix:stream";
+  const reader = t.reader("workers");
+
+  for (let index = 0; index < 30; index++) {
+    await redis.send("XADD", [key, "*", "payload", index % 2 === 0 ? "not-json" : JSON.stringify({ publishedAt: "invalid" })]);
+  }
+  await t.pub({ data: { value: 99 } });
+
+  for (let index = 0; index < 30; index++) {
+    await expect(reader.recv({ wait: false, invalidPayload: "throw" })).rejects.toBeInstanceOf(TopicPayloadError);
+  }
+  const valid = await reader.recv({ wait: false });
+  expect(valid?.data.value).toBe(99);
+
+  const kinds: string[] = [];
+  let cursor = "0-0";
+  do {
+    const batch = await reader.reclaim?.({ minIdleMs: 0, cursor, count: 7 });
+    if (!batch) throw new Error("Expected topic reclaim support");
+    kinds.push(...batch.entries.map((entry) => entry.kind));
+    cursor = batch.nextCursor;
+  } while (cursor !== "0-0");
+
+  expect(kinds.filter((kind) => kind === "invalid")).toHaveLength(30);
+  expect(kinds.filter((kind) => kind === "delivery")).toHaveLength(1);
+});
+
+test("reclaim validates its batch controls", async () => {
+  const reader = topic({ id: "reclaim-config", prefix: "test:t" }).reader("workers");
+  if (!reader.reclaim) throw new Error("Expected topic reclaim support");
+  await expect(reader.reclaim({ minIdleMs: -1 })).rejects.toThrow("minIdleMs must be a non-negative number");
+  await expect(reader.reclaim({ count: 0 })).rejects.toThrow("count must be an integer between 1 and 1000");
+  await expect(reader.reclaim({ count: 1_001 })).rejects.toThrow("count must be an integer between 1 and 1000");
+});
+
+test("reclaim advances across an ineligible pending prefix", async () => {
+  const t = topic<{ value: number }>({ id: "ineligible-prefix", prefix: "test:t" });
+  const key = "test:t:default:ineligible-prefix:stream";
+  const group = "workers";
+  const originalReader = t.reader(group);
+  const eventIds: string[] = [];
+
+  for (let index = 0; index < 25; index++) {
+    eventIds.push((await t.pub({ data: { value: index } })).eventId);
+    await originalReader.recv({ wait: false });
+  }
+  for (const eventId of eventIds.slice(0, 20)) {
+    await redis.send("XCLAIM", [key, group, "fresh-owner", "0", eventId, "IDLE", "0", "JUSTID"]);
+  }
+  for (const eventId of eventIds.slice(20)) {
+    await redis.send("XCLAIM", [key, group, "stale-owner", "0", eventId, "IDLE", "60000", "JUSTID"]);
+  }
+
+  const reader = t.reader(group);
+  const first = await reader.reclaim?.({ minIdleMs: 30_000, cursor: "0-0", count: 1 });
+  if (!first) throw new Error("Expected topic reclaim support");
+  expect(first.entries).toHaveLength(0);
+  expect(first.nextCursor).not.toBe("0-0");
+
+  const second = await reader.reclaim?.({ minIdleMs: 30_000, cursor: first.nextCursor, count: 10 });
+  if (!second) throw new Error("Expected topic reclaim support");
+  expect(second.entries).toHaveLength(5);
+  expect(second.entries.every((entry) => entry.kind === "delivery")).toBe(true);
 });
 
 test("tenant isolation separates topic streams", async () => {

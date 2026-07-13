@@ -1,6 +1,6 @@
 import { redis, RedisClient } from "bun";
 import { randomUUID } from "crypto";
-import { parseFirstRangeEntry, parseFirstStreamEntry, type ParsedEntry } from "./internal/topic-utils";
+import { fieldArrayToObject, parseFirstRangeEntry, parseFirstStreamEntry, type ParsedEntry } from "./internal/topic-utils";
 import { isRetryableTransportError, retry } from "./retry";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -10,6 +10,8 @@ const DEFAULT_RETENTION_MS = 7 * DAY_MS;
 const DEFAULT_IDEMPOTENCY_TTL_MS = 7 * DAY_MS;
 const DEFAULT_PAYLOAD_BYTES = 128 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_RECLAIM_COUNT = 25;
+const MAX_RECLAIM_COUNT = 1_000;
 
 const PUB_SCRIPT = `
   local payload = ARGV[1]
@@ -112,6 +114,14 @@ export type TopicRecvConfig = {
   timeoutMs?: number;
   wait?: boolean;
   signal?: AbortSignal;
+  invalidPayload?: "ack" | "throw";
+};
+
+export type TopicReclaimConfig = {
+  tenantId?: string;
+  minIdleMs?: number;
+  cursor?: string;
+  count?: number;
 };
 
 export type TopicDelivery<T> = {
@@ -123,6 +133,25 @@ export type TopicDelivery<T> = {
   publishedAt: number;
   meta?: Record<string, unknown>;
   commit(): Promise<boolean>;
+};
+
+export type TopicInvalidDelivery = {
+  kind: "invalid";
+  eventId: string;
+  deliveryId: string;
+  cursor: string;
+  error: string;
+  rawPayload: string | null;
+  commit(): Promise<boolean>;
+};
+
+export type TopicReclaimedDelivery<T> =
+  | { kind: "delivery"; delivery: TopicDelivery<T> }
+  | TopicInvalidDelivery;
+
+export type TopicReclaimResult<T> = {
+  nextCursor: string;
+  entries: TopicReclaimedDelivery<T>[];
 };
 
 export type TopicLiveConfig = {
@@ -144,7 +173,12 @@ export type TopicLiveEvent<T> = {
 export type TopicReader<T> = {
   group: string;
   recv(cfg?: TopicRecvConfig): Promise<TopicDelivery<T> | null>;
+  reclaim?(cfg?: TopicReclaimConfig): Promise<TopicReclaimResult<T>>;
   stream(cfg?: TopicRecvConfig): AsyncIterable<TopicDelivery<T>>;
+};
+
+export type RecoverableTopicReader<T> = TopicReader<T> & {
+  reclaim(cfg?: TopicReclaimConfig): Promise<TopicReclaimResult<T>>;
 };
 
 export type Topic<T> = {
@@ -154,6 +188,10 @@ export type Topic<T> = {
   live(cfg?: TopicLiveConfig): AsyncIterable<TopicLiveEvent<T>>;
 };
 
+export type RecoverableTopic<T> = Omit<Topic<T>, "reader"> & {
+  reader(group?: string): RecoverableTopicReader<T>;
+};
+
 type StoredEvent<T> = {
   data: T;
   orderingKey?: string;
@@ -161,7 +199,35 @@ type StoredEvent<T> = {
   publishedAt: number;
 };
 
-export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
+type StoredEventParseResult =
+  | { ok: true; value: StoredEvent<unknown> }
+  | { ok: false; error: string; rawPayload: string | null };
+
+const parseAutoClaimResult = (raw: unknown): { nextCursor: string; entries: ParsedEntry[] } => {
+  if (!Array.isArray(raw)) return { nextCursor: "0-0", entries: [] };
+  const nextCursor = typeof raw[0] === "string" ? raw[0] : "0-0";
+  const rawEntries = Array.isArray(raw[1]) ? raw[1] : [];
+  const entries: ParsedEntry[] = [];
+  for (const rawEntry of rawEntries) {
+    if (!Array.isArray(rawEntry) || typeof rawEntry[0] !== "string") continue;
+    entries.push({ id: rawEntry[0], fields: fieldArrayToObject(rawEntry[1]) });
+  }
+  return { nextCursor, entries };
+};
+
+export class TopicPayloadError extends Error {
+  readonly eventId: string;
+  readonly rawPayload: string | null;
+
+  constructor(eventId: string, reason: string, rawPayload: string | null) {
+    super(`Invalid topic payload at ${eventId}: ${reason}`);
+    this.name = "TopicPayloadError";
+    this.eventId = eventId;
+    this.rawPayload = rawPayload;
+  }
+}
+
+export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
   type TData = T;
 
   const prefix = config.prefix ?? DEFAULT_PREFIX;
@@ -193,14 +259,28 @@ export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
     ensuredGroups.add(ensuredKey);
   };
 
-  const parsePayload = (entry: ParsedEntry): StoredEvent<unknown> | null => {
+  const parsePayload = (entry: ParsedEntry): StoredEventParseResult => {
     const rawPayload = entry.fields.payload;
-    if (!rawPayload) return null;
+    if (!rawPayload) return { ok: false, error: "missing payload field", rawPayload: null };
 
     try {
-      return JSON.parse(rawPayload) as StoredEvent<unknown>;
+      const value = JSON.parse(rawPayload) as unknown;
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return { ok: false, error: "envelope must be an object", rawPayload };
+      }
+      const envelope = value as Record<string, unknown>;
+      if (typeof envelope.publishedAt !== "number" || !Number.isFinite(envelope.publishedAt)) {
+        return { ok: false, error: "envelope has invalid publishedAt", rawPayload };
+      }
+      if (envelope.orderingKey !== undefined && typeof envelope.orderingKey !== "string") {
+        return { ok: false, error: "envelope has invalid orderingKey", rawPayload };
+      }
+      if (envelope.meta !== undefined && (!envelope.meta || typeof envelope.meta !== "object" || Array.isArray(envelope.meta))) {
+        return { ok: false, error: "envelope has invalid meta", rawPayload };
+      }
+      return { ok: true, value: envelope as StoredEvent<unknown> };
     } catch {
-      return null;
+      return { ok: false, error: "payload is not valid JSON", rawPayload };
     }
   };
 
@@ -240,7 +320,7 @@ export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
     return parseFirstRangeEntry(raw)?.id ?? null;
   };
 
-  const reader = (group = "default"): TopicReader<TData> => {
+  const reader = (group = "default"): RecoverableTopicReader<TData> => {
     const consumer = `consumer:${process.pid}:${randomUUID()}`;
     let blockingClient: RedisClient | null = null;
 
@@ -278,6 +358,22 @@ export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
       }
     };
 
+    const createCommit = (key: string, eventId: string) => async (): Promise<boolean> => {
+      const acked = await redis.send("XACK", [key, group, eventId]);
+      return Number(acked) > 0;
+    };
+
+    const createDelivery = (entry: ParsedEntry, stored: StoredEvent<unknown>, key: string): TopicDelivery<TData> => ({
+      data: stored.data as TData,
+      eventId: entry.id,
+      cursor: entry.id,
+      deliveryId: `${group}:${entry.id}`,
+      orderingKey: stored.orderingKey,
+      publishedAt: stored.publishedAt,
+      meta: stored.meta,
+      commit: createCommit(key, entry.id),
+    });
+
     const recv = async (recvCfg: TopicRecvConfig = {}): Promise<TopicDelivery<TData> | null> => {
       const tenantId = resolveTenant(recvCfg.tenantId);
       const key = streamKey(tenantId);
@@ -308,26 +404,55 @@ export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
       if (!entry) return null;
 
       const stored = parsePayload(entry);
-      if (!stored) {
-        await redis.send("XACK", [key, group, entry.id]);
+      if (!stored.ok) {
+        if (recvCfg.invalidPayload === "throw") throw new TopicPayloadError(entry.id, stored.error, stored.rawPayload);
+        await createCommit(key, entry.id)();
         return null;
       }
+      return createDelivery(entry, stored.value, key);
+    };
 
-      const commit = async (): Promise<boolean> => {
-        const acked = await redis.send("XACK", [key, group, entry.id]);
-        return Number(acked) > 0;
-      };
+    const reclaim = async (reclaimCfg: TopicReclaimConfig = {}): Promise<TopicReclaimResult<TData>> => {
+      const tenantId = resolveTenant(reclaimCfg.tenantId);
+      const key = streamKey(tenantId);
+      await ensureGroup(key, group);
 
-      return {
-        data: stored.data as TData,
-        eventId: entry.id,
-        cursor: entry.id,
-        deliveryId: `${group}:${entry.id}`,
-        orderingKey: stored.orderingKey,
-        publishedAt: stored.publishedAt,
-        meta: stored.meta,
-        commit,
-      };
+      const minIdleMs = reclaimCfg.minIdleMs ?? 60_000;
+      if (!Number.isFinite(minIdleMs) || minIdleMs < 0) throw new Error("minIdleMs must be a non-negative number");
+      const count = reclaimCfg.count ?? DEFAULT_RECLAIM_COUNT;
+      if (!Number.isInteger(count) || count < 1 || count > MAX_RECLAIM_COUNT) {
+        throw new Error(`count must be an integer between 1 and ${MAX_RECLAIM_COUNT}`);
+      }
+
+      const raw = await redis.send("XAUTOCLAIM", [
+        key,
+        group,
+        consumer,
+        String(minIdleMs),
+        reclaimCfg.cursor ?? "0-0",
+        "COUNT",
+        String(count),
+      ]);
+      const claimed = parseAutoClaimResult(raw);
+      const entries: TopicReclaimedDelivery<TData>[] = claimed.entries.map((entry) => {
+        const stored = parsePayload(entry);
+        if (!stored.ok) {
+          return {
+            kind: "invalid",
+            eventId: entry.id,
+            cursor: entry.id,
+            deliveryId: `${group}:${entry.id}`,
+            error: stored.error,
+            rawPayload: stored.rawPayload,
+            commit: createCommit(key, entry.id),
+          };
+        }
+        return {
+          kind: "delivery",
+          delivery: createDelivery(entry, stored.value, key),
+        };
+      });
+      return { nextCursor: claimed.nextCursor, entries };
     };
 
     const stream = async function* (streamCfg: TopicRecvConfig = {}): AsyncIterable<TopicDelivery<TData>> {
@@ -359,6 +484,7 @@ export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
     return {
       group,
       recv,
+      reclaim,
       stream,
     };
   };
@@ -417,15 +543,15 @@ export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
         cursor = entry.id;
 
         const stored = parsePayload(entry);
-        if (!stored) continue;
+        if (!stored.ok) continue;
 
         yield {
-          data: stored.data as TData,
+          data: stored.value.data as TData,
           eventId: entry.id,
           cursor: entry.id,
-          orderingKey: stored.orderingKey,
-          publishedAt: stored.publishedAt,
-          meta: stored.meta,
+          orderingKey: stored.value.orderingKey,
+          publishedAt: stored.value.publishedAt,
+          meta: stored.value.meta,
         };
       }
     } finally {

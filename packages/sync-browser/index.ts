@@ -17,10 +17,17 @@ export {
 } from "./src/queue";
 export {
   topic,
+  TopicPayloadError,
   type Topic,
+  type RecoverableTopic,
   type TopicConfig,
   type TopicCursorConfig,
   type TopicReader,
+  type RecoverableTopicReader,
+  type TopicReclaimConfig,
+  type TopicReclaimResult,
+  type TopicReclaimedDelivery,
+  type TopicInvalidDelivery,
   type TopicRecvConfig,
   type TopicPubConfig,
   type TopicDelivery,

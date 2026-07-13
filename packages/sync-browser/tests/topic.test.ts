@@ -45,6 +45,28 @@ test("reader recv with wait: false returns null when empty", async () => {
   expect(message).toBeNull();
 });
 
+test("reader reclaim is an empty parity operation in the in-memory runtime", async () => {
+  const store = createMemoryStore();
+  const reader = topic({ id: "reclaim", prefix: "test:bt", store }).reader("workers");
+  if (!reader.reclaim) throw new Error("Expected topic reclaim support");
+
+  await expect(reader.reclaim({ minIdleMs: 0, count: 25 })).resolves.toEqual({
+    nextCursor: "0-0",
+    entries: [],
+  });
+  await expect(reader.reclaim({ minIdleMs: -1 })).rejects.toThrow("minIdleMs must be a non-negative number");
+  await expect(reader.reclaim({ count: 0 })).rejects.toThrow("count must be an integer between 1 and 1000");
+});
+
+test("topic preserves undefined data", async () => {
+  const store = createMemoryStore();
+  const t = topic<undefined>({ id: "undefined-data", prefix: "test:bt", store });
+  await t.pub({ data: undefined });
+
+  const delivery = await t.reader("workers").recv({ wait: false, invalidPayload: "throw" });
+  expect(delivery?.data).toBeUndefined();
+});
+
 // ==========================
 // reader.stream
 // ==========================

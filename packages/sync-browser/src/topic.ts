@@ -44,6 +44,14 @@ export type TopicRecvConfig = {
   timeoutMs?: number;
   wait?: boolean;
   signal?: AbortSignal;
+  invalidPayload?: "ack" | "throw";
+};
+
+export type TopicReclaimConfig = {
+  tenantId?: string;
+  minIdleMs?: number;
+  cursor?: string;
+  count?: number;
 };
 
 export type TopicDelivery<T> = {
@@ -56,6 +64,37 @@ export type TopicDelivery<T> = {
   meta?: Record<string, unknown>;
   commit(): Promise<boolean>;
 };
+
+export type TopicInvalidDelivery = {
+  kind: "invalid";
+  eventId: string;
+  deliveryId: string;
+  cursor: string;
+  error: string;
+  rawPayload: string | null;
+  commit(): Promise<boolean>;
+};
+
+export type TopicReclaimedDelivery<T> =
+  | { kind: "delivery"; delivery: TopicDelivery<T> }
+  | TopicInvalidDelivery;
+
+export type TopicReclaimResult<T> = {
+  nextCursor: string;
+  entries: TopicReclaimedDelivery<T>[];
+};
+
+export class TopicPayloadError extends Error {
+  readonly eventId: string;
+  readonly rawPayload: string | null;
+
+  constructor(eventId: string, reason: string, rawPayload: string | null) {
+    super(`Invalid topic payload at ${eventId}: ${reason}`);
+    this.name = "TopicPayloadError";
+    this.eventId = eventId;
+    this.rawPayload = rawPayload;
+  }
+}
 
 export type TopicLiveConfig = {
   tenantId?: string;
@@ -76,7 +115,12 @@ export type TopicLiveEvent<T> = {
 export type TopicReader<T> = {
   group: string;
   recv(cfg?: TopicRecvConfig): Promise<TopicDelivery<T> | null>;
+  reclaim?(cfg?: TopicReclaimConfig): Promise<TopicReclaimResult<T>>;
   stream(cfg?: TopicRecvConfig): AsyncIterable<TopicDelivery<T>>;
+};
+
+export type RecoverableTopicReader<T> = TopicReader<T> & {
+  reclaim(cfg?: TopicReclaimConfig): Promise<TopicReclaimResult<T>>;
 };
 
 export type Topic<T> = {
@@ -84,6 +128,10 @@ export type Topic<T> = {
   latestCursor(cfg?: TopicCursorConfig): Promise<string | null>;
   reader(group?: string): TopicReader<T>;
   live(cfg?: TopicLiveConfig): AsyncIterable<TopicLiveEvent<T>>;
+};
+
+export type RecoverableTopic<T> = Omit<Topic<T>, "reader"> & {
+  reader(group?: string): RecoverableTopicReader<T>;
 };
 
 // ==========================
@@ -101,7 +149,7 @@ type StoredEvent<T> = {
 // Topic Factory
 // ==========================
 
-export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
+export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
   type TData = T;
 
   const prefix = config.prefix ?? DEFAULT_PREFIX;
@@ -186,7 +234,7 @@ export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
   // reader
   // ==========================
 
-  const reader = (group = "default"): TopicReader<TData> => {
+  const reader = (group = "default"): RecoverableTopicReader<TData> => {
     const consumerId = `consumer:${randomId()}`;
     const cursors = new Map<string, string>();
     const getCursor = (tenantId: string): string => cursors.get(tenantId) ?? "0";
@@ -269,7 +317,17 @@ export const topic = <T>(config: TopicConfig<T>): Topic<T> => {
       }
     };
 
-    return { group, recv, stream };
+    const reclaim = async (reclaimCfg: TopicReclaimConfig = {}): Promise<TopicReclaimResult<TData>> => {
+      const minIdleMs = reclaimCfg.minIdleMs ?? 60_000;
+      if (!Number.isFinite(minIdleMs) || minIdleMs < 0) throw new Error("minIdleMs must be a non-negative number");
+      const count = reclaimCfg.count ?? 25;
+      if (!Number.isInteger(count) || count < 1 || count > 1_000) {
+        throw new Error("count must be an integer between 1 and 1000");
+      }
+      return { nextCursor: "0-0", entries: [] };
+    };
+
+    return { group, recv, reclaim, stream };
   };
 
   // ==========================

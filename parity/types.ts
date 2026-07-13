@@ -33,9 +33,15 @@ import type {
 } from "../packages/sync/src/queue";
 import type {
   Topic as S_Topic,
+  RecoverableTopic as S_RecoverableTopic,
   TopicConfig as S_TopicConfig,
   TopicCursorConfig as S_TopicCursorConfig,
   TopicReader as S_TopicReader,
+  RecoverableTopicReader as S_RecoverableTopicReader,
+  TopicReclaimConfig as S_TopicReclaimConfig,
+  TopicReclaimResult as S_TopicReclaimResult,
+  TopicReclaimedDelivery as S_TopicReclaimedDelivery,
+  TopicInvalidDelivery as S_TopicInvalidDelivery,
   TopicRecvConfig as S_TopicRecvConfig,
   TopicPubConfig as S_TopicPubConfig,
   TopicDelivery as S_TopicDelivery,
@@ -115,9 +121,15 @@ import type {
 } from "../packages/sync-browser/src/queue";
 import type {
   Topic as B_Topic,
+  RecoverableTopic as B_RecoverableTopic,
   TopicConfig as B_TopicConfig,
   TopicCursorConfig as B_TopicCursorConfig,
   TopicReader as B_TopicReader,
+  RecoverableTopicReader as B_RecoverableTopicReader,
+  TopicReclaimConfig as B_TopicReclaimConfig,
+  TopicReclaimResult as B_TopicReclaimResult,
+  TopicReclaimedDelivery as B_TopicReclaimedDelivery,
+  TopicInvalidDelivery as B_TopicInvalidDelivery,
   TopicRecvConfig as B_TopicRecvConfig,
   TopicPubConfig as B_TopicPubConfig,
   TopicDelivery as B_TopicDelivery,
@@ -232,12 +244,18 @@ assertEqual<Equal<S_QueueReceived<{ foo: string }>, B_QueueReceived<{ foo: strin
 // ==========================
 
 assertEqual<Equal<S_Topic<{ foo: string }>, B_Topic<{ foo: string }>>>(true);
+assertEqual<Equal<S_RecoverableTopic<{ foo: string }>, B_RecoverableTopic<{ foo: string }>>>(true);
 // TopicConfig differs: browser has optional `store?` additive field
 const _topicCfgAdditive: B_TopicConfig<{ foo: string }> = {} as unknown as S_TopicConfig<{ foo: string }>;
 void _topicCfgAdditive;
 assertEqual<Equal<S_TopicReader<{ foo: string }>, B_TopicReader<{ foo: string }>>>(true);
+assertEqual<Equal<S_RecoverableTopicReader<{ foo: string }>, B_RecoverableTopicReader<{ foo: string }>>>(true);
 assertEqual<Equal<S_TopicCursorConfig, B_TopicCursorConfig>>(true);
 assertEqual<Equal<S_TopicRecvConfig, B_TopicRecvConfig>>(true);
+assertEqual<Equal<S_TopicReclaimConfig, B_TopicReclaimConfig>>(true);
+assertEqual<Equal<S_TopicReclaimResult<{ foo: string }>, B_TopicReclaimResult<{ foo: string }>>>(true);
+assertEqual<Equal<S_TopicReclaimedDelivery<{ foo: string }>, B_TopicReclaimedDelivery<{ foo: string }>>>(true);
+assertEqual<Equal<S_TopicInvalidDelivery, B_TopicInvalidDelivery>>(true);
 assertEqual<Equal<S_TopicPubConfig<{ foo: string }>, B_TopicPubConfig<{ foo: string }>>>(true);
 assertEqual<Equal<S_TopicDelivery<{ foo: string }>, B_TopicDelivery<{ foo: string }>>>(true);
 assertEqual<Equal<S_TopicLiveConfig, B_TopicLiveConfig>>(true);
