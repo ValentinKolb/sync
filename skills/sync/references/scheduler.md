@@ -5,7 +5,7 @@ Distributed cron with leader election and callback-based dispatch. Same API on s
 ## Factory
 
 ```ts
-import { scheduler } from "@valentinkolb/sync";
+import { scheduler } from "@k2b/sync";
 
 const sched = scheduler({
   id: "platform",
@@ -167,7 +167,7 @@ import {
   SchedulerControlNotFoundError,
   SchedulerControlUnavailableError,
   schedulerControl,
-} from "@valentinkolb/sync";
+} from "@k2b/sync";
 
 const control = schedulerControl();
 

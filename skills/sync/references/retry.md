@@ -5,7 +5,7 @@ General-purpose retry wrapper with the same callback pattern as `job` and `sched
 ## API
 
 ```ts
-import { retry, isRetryableTransportError, expBackoff } from "@valentinkolb/sync";
+import { retry, isRetryableTransportError, expBackoff } from "@k2b/sync";
 
 type RetryCtx = {
   attempt: number;          // 1-indexed

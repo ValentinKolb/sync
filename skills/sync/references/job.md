@@ -5,7 +5,7 @@ Durable background tasks with callback-based lifecycle. Same API on server and b
 ## Factory
 
 ```ts
-import { job, isRetryableTransportError } from "@valentinkolb/sync";
+import { job, isRetryableTransportError } from "@k2b/sync";
 
 // Simple — no input, no typed result
 const sync = job({

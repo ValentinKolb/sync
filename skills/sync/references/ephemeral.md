@@ -5,7 +5,7 @@ TTL-based key/value store with tenant isolation, snapshots with optional prefix 
 ## Factory
 
 ```ts
-import { ephemeral, EphemeralCapacityError, EphemeralPayloadTooLargeError } from "@valentinkolb/sync";
+import { ephemeral, EphemeralCapacityError, EphemeralPayloadTooLargeError } from "@k2b/sync";
 
 const presence = ephemeral<{ userId: string; displayName: string }>({
   id: "notebook.presence",

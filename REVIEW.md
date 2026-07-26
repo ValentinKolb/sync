@@ -1,4 +1,4 @@
-# Code Review — @valentinkolb/sync/browser
+# Code Review — @k2b/sync/browser
 
 ## Zusammenfassung
 Die Browser-Sublib ist insgesamt ordentlich strukturiert, konsistent typisiert und mit einer breiten Testsuite abgesichert. Die kleineren Bausteine wirken überwiegend solide; besonders positiv sind Timer-Cleanup im Store, die `EventLog.subscribe()`-Race-Vermeidung und mehrere gute Mutex-/Scheduler-Tests. Die größten Probleme liegen nicht im Happy Path, sondern in Semantikbrüchen gegenüber der dokumentierten API: `topic` implementiert faktisch keine Consumer Groups, `job` behandelt `heartbeat()` nicht als Verlängerung des echten Ausführungszeitlimits, `registry` signalisiert Replay-Gaps nicht, und der Publish-Workflow erzeugt kaputte Browser-Typ-Exports. Die Tests sind breit, geben an einigen kritischen Stellen aber false confidence.
@@ -249,7 +249,7 @@ Die Browser-Sublib ist insgesamt ordentlich strukturiert, konsistent typisiert u
 ## Bewertung
 
 ### Kritisch (muss vor Release gefixt werden)
-1. `.github/workflows/publish.yml:105-118`, `.github/workflows/publish.yml:138`, `tsconfig.json:29`: Browser-Type-Exports im Publish-Artefakt sind kaputt. Impact: `@valentinkolb/sync/browser` publiziert JS ohne auflösbare Type Declarations.
+1. `.github/workflows/publish.yml:105-118`, `.github/workflows/publish.yml:138`, `tsconfig.json:29`: Browser-Type-Exports im Publish-Artefakt sind kaputt. Impact: `@k2b/sync/browser` publiziert JS ohne auflösbare Type Declarations.
 2. `src/browser/topic.ts:183-185`, `src/browser/topic.ts:194-196`, `src/browser/topic.ts:238-243`: `topic.reader(group)` implementiert keine echte Group-Semantik. Impact: doppelte Event-Verarbeitung statt at-least-once/load-balanced delivery.
 3. `src/browser/queue.ts:403-420`: invalides `nack({ delayMs })` kann Nachrichten orphanen. Impact: reale Work Items gehen dauerhaft verloren.
 4. `src/browser/job.ts:330-347`: `ctx.heartbeat()` verlängert nicht das echte Job-Timeout. Impact: lange Jobs timeouten trotz Heartbeat und brechen semantisch unerwartet ab.

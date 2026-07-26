@@ -2,6 +2,26 @@
 
 v5 is a major breaking rewrite. The surface of every module changed. This guide walks through each migration.
 
+## Package scope migration (v5.7.0)
+
+Starting with v5.7.0, the package and repository moved:
+
+- npm: `@valentinkolb/sync` -> `@k2b/sync`
+- GitHub: `ValentinKolb/sync` -> `k2b-dev/sync`
+
+The public API is unchanged. Replace the package scope in dependencies and
+imports:
+
+```diff
+-import { queue } from "@valentinkolb/sync";
+-import { topic } from "@valentinkolb/sync/browser";
++import { queue } from "@k2b/sync";
++import { topic } from "@k2b/sync/browser";
+```
+
+The retired standalone `@valentinkolb/sync-browser` package is also deprecated.
+Use the `/browser` export from `@k2b/sync`.
+
 ## TL;DR
 
 - **Zod is no longer a peer dependency.** Payloads are typed via generics; runtime validation is your responsibility.
@@ -19,7 +39,7 @@ v5 is a major breaking rewrite. The surface of every module changed. This guide 
 
 ```ts
 import { z } from "zod";
-import { queue } from "@valentinkolb/sync";
+import { queue } from "@k2b/sync";
 
 const q = queue({
   id: "mail",
@@ -30,7 +50,7 @@ const q = queue({
 ### After (v5)
 
 ```ts
-import { queue } from "@valentinkolb/sync";
+import { queue } from "@k2b/sync";
 
 const q = queue<{ to: string }>({ id: "mail" });
 ```
@@ -49,7 +69,7 @@ const q = queue<{ to: string }>({ id: "mail" });
 ### Before (v4)
 
 ```ts
-import { registry } from "@valentinkolb/sync";
+import { registry } from "@k2b/sync";
 
 const apps = registry({ id: "apps", schema: AppSchema });
 await apps.upsert({ key: "apps/backend", value: { ... } });
@@ -59,7 +79,7 @@ const list = await apps.list({ prefix: "apps/", status: "active" });
 ### After (v5)
 
 ```ts
-import { ephemeral } from "@valentinkolb/sync";
+import { ephemeral } from "@k2b/sync";
 
 const apps = ephemeral<AppValue>({
   id: "apps",
@@ -209,7 +229,7 @@ await sched.delete({ id: "cleanup" });
 ### Before (v4)
 
 ```ts
-import { retry, isRetryableTransportError } from "@valentinkolb/sync";
+import { retry, isRetryableTransportError } from "@k2b/sync";
 
 const user = await retry(async () => await fetchUser(id), {
   attempts: 5,
@@ -225,7 +245,7 @@ const user = await retry(async () => await fetchUser(id), {
 ### After (v5)
 
 ```ts
-import { retry, isRetryableTransportError } from "@valentinkolb/sync";
+import { retry, isRetryableTransportError } from "@k2b/sync";
 
 const user = await retry({
   run: () => fetchUser(id),
@@ -304,13 +324,13 @@ const q = queue<Mail>({ id: "mail" });
 
 ```bash
 # package.json
-"@valentinkolb/sync": "5.0.0"
+"@k2b/sync": "5.0.0"
 ```
 
 Browser code now uses the same package through the browser subpath:
 
 ```ts
-import { scheduler } from "@valentinkolb/sync/browser";
+import { scheduler } from "@k2b/sync/browser";
 ```
 
 The old `@valentinkolb/sync-browser` package is not released separately anymore.

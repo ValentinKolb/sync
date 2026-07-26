@@ -80,7 +80,7 @@ jobs:
       - name: Build browser modules
         run: |
           # Use tsc to preserve the browser module graph, then add .js extensions
-          # so @valentinkolb/sync/browser works in standard ESM resolution.
+          # so @k2b/sync/browser works in standard ESM resolution.
           bunx tsc --project packages/sync-browser/tsconfig.json \
             --declaration \
             --noEmit false \
@@ -117,7 +117,7 @@ jobs:
           VERSION=$(node -p "require('./packages/sync/package.json').version")
           cat > packages/sync/dist/package.json << EOF
           {
-            "name": "@valentinkolb/sync",
+            "name": "@k2b/sync",
             "version": "$VERSION",
             "description": "Distributed sync primitives for TypeScript and Bun — ratelimit, mutex, queue, topic, job, scheduler, ephemeral, retry",
             "main": "index.js",
@@ -139,7 +139,7 @@ jobs:
             "license": "MIT",
             "repository": {
               "type": "git",
-              "url": "git+https://github.com/ValentinKolb/sync.git"
+              "url": "git+https://github.com/k2b-dev/sync.git"
             }
           }
           EOF
@@ -152,6 +152,6 @@ jobs:
       - name: Generate type declarations
         run: bunx tsc --project packages/sync/tsconfig.json --declaration --emitDeclarationOnly --noEmit false --outDir packages/sync/dist
 
-      - name: Publish @valentinkolb/sync
+      - name: Publish @k2b/sync
         run: npm publish --provenance --access public
         working-directory: ./packages/sync/dist

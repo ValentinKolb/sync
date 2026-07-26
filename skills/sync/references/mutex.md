@@ -5,7 +5,7 @@ Distributed lock with retry, TTL auto-expiry, and owner-only release. Same API o
 ## Factory
 
 ```ts
-import { mutex, LockError } from "@valentinkolb/sync";
+import { mutex, LockError } from "@k2b/sync";
 
 const m = mutex({
   id: "checkout",

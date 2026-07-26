@@ -1,17 +1,17 @@
 ---
 name: sync
-description: "Use this skill for @valentinkolb/sync and @valentinkolb/sync/browser — distributed synchronization primitives for TypeScript/Bun (server) and browsers. Covers all 8 modules: ratelimit, mutex, queue, topic, ephemeral, job, scheduler, retry. Use when code imports from `@valentinkolb/sync` or `@valentinkolb/sync/browser`, or when building features that need: rate limiting, distributed locks, durable work queues with at-least-once delivery + DLQ + idempotency, pub/sub with cursor-based replay, TTL-based presence/registry, durable background jobs with retry + lifecycle callbacks, distributed cron scheduling with leader election, or retry helpers with exponential backoff. Also use for migrating v4 code to the v5 rewrite (unified callback API, no Zod peer dep, no registry module)."
+description: "Use this skill for @k2b/sync and @k2b/sync/browser — distributed synchronization primitives for TypeScript/Bun (server) and browsers. Covers all 8 modules: ratelimit, mutex, queue, topic, ephemeral, job, scheduler, retry. Use when code imports from `@k2b/sync` or `@k2b/sync/browser`, or when building features that need: rate limiting, distributed locks, durable work queues with at-least-once delivery + DLQ + idempotency, pub/sub with cursor-based replay, TTL-based presence/registry, durable background jobs with retry + lifecycle callbacks, distributed cron scheduling with leader election, or retry helpers with exponential backoff. Also use for migrating v4 code to the v5 rewrite (unified callback API, no Zod peer dep, no registry module)."
 ---
 
-# @valentinkolb/sync — v5
+# @k2b/sync — v5
 
 Distributed synchronization primitives with an **identical public API** between server (Redis-backed) and browser (in-memory). Change the import; code generally works on both sides.
 
 ## When to use this skill
 
 Trigger for any imports from:
-- `@valentinkolb/sync` (server — Bun + Redis/Valkey/Dragonfly 6.2+)
-- `@valentinkolb/sync/browser` (browser — in-memory)
+- `@k2b/sync` (server — Bun + Redis/Valkey/Dragonfly 6.2+)
+- `@k2b/sync/browser` (browser — in-memory)
 
 Or when the user is building features that need one of the eight modules:
 
@@ -66,7 +66,7 @@ Read the module's reference file in `references/` for full API, gotchas, and usa
 
 ## Browser runtime specifics
 
-`@valentinkolb/sync/browser` has the same API with additive options:
+`@k2b/sync/browser` has the same API with additive options:
 
 - Most configs accept optional `store?: Store` for `createLocalStorageStore()` persistence.
 - Leader election trivially succeeds in a single tab.

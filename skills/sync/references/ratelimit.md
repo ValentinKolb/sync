@@ -5,7 +5,7 @@ Sliding-window rate limiter per identifier. Same API on server and browser.
 ## Factory
 
 ```ts
-import { ratelimit, RateLimitError } from "@valentinkolb/sync";
+import { ratelimit, RateLimitError } from "@k2b/sync";
 
 const limiter = ratelimit({
   id: "api",

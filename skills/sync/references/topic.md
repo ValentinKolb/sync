@@ -5,7 +5,7 @@ Pub/sub with cursor-based replay. Consumer groups for at-least-once delivery, `l
 ## Factory
 
 ```ts
-import { topic } from "@valentinkolb/sync";
+import { topic } from "@k2b/sync";
 
 const t = topic<{ type: string; orderId: string }>({
   id: "order.events",

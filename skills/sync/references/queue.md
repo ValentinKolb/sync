@@ -5,7 +5,7 @@ Durable work queue with at-least-once delivery, lease-based visibility, delayed 
 ## Factory
 
 ```ts
-import { queue } from "@valentinkolb/sync";
+import { queue } from "@k2b/sync";
 
 const q = queue<{ to: string; subject: string }>({
   id: "mail.send",

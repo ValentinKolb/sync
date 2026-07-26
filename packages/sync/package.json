@@ -1,6 +1,6 @@
 {
-  "name": "@valentinkolb/sync",
-  "version": "5.3.0",
+  "name": "@k2b/sync",
+  "version": "5.7.0",
   "description": "Distributed sync primitives for TypeScript and Bun — ratelimit, mutex, queue, topic, job, scheduler, ephemeral, retry",
   "module": "index.ts",
   "type": "module",

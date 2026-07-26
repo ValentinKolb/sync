@@ -1,9 +1,11 @@
-# @valentinkolb/sync
+# @k2b/sync
 
 Synchronization primitives for TypeScript, published as one package with two runtimes:
 
-- **`@valentinkolb/sync`**: Redis-backed (6.2+, Valkey, Dragonfly), built for [Bun](https://bun.sh). For horizontally scaled systems where multiple service instances coordinate via shared state.
-- **`@valentinkolb/sync/browser`**: fully in-memory, zero dependencies. For local-first browser apps that want the same primitives without a server.
+- **`@k2b/sync`**: Redis-backed (6.2+, Valkey, Dragonfly), built for [Bun](https://bun.sh). For horizontally scaled systems where multiple service instances coordinate via shared state.
+- **`@k2b/sync/browser`**: fully in-memory, zero dependencies. For local-first browser apps that want the same primitives without a server.
+
+> Package migration: `@valentinkolb/sync` and the retired `@valentinkolb/sync-browser` package are deprecated. Use `@k2b/sync` and its `/browser` export.
 
 Both runtimes share an **identical public API** — change the import, and code generally works. Type parity is enforced at compile-time (see `parity/`).
 
@@ -13,7 +15,7 @@ Provides eight modules: **ratelimit**, **mutex**, **queue**, **topic**, **epheme
 
 ```bash
 # Server and browser runtimes
-bun add @valentinkolb/sync
+bun add @k2b/sync
 ```
 
 No runtime dependencies. TypeScript is a peer dependency.
@@ -25,7 +27,7 @@ No runtime dependencies. TypeScript is a peer dependency.
 This repository ships a single `sync` agent skill in [`skills/sync/`](./skills/sync) with one reference file per module plus a v4→v5 migration guide. Install with the [Vercel Skills CLI](https://github.com/vercel-labs/skills):
 
 ```bash
-bunx skills add https://github.com/valentinkolb/sync --skill sync
+bunx skills add https://github.com/k2b-dev/sync --skill sync
 ```
 
 ---
@@ -35,7 +37,7 @@ bunx skills add https://github.com/valentinkolb/sync --skill sync
 Sliding window rate limiter.
 
 ```ts
-import { ratelimit, RateLimitError } from "@valentinkolb/sync";
+import { ratelimit, RateLimitError } from "@k2b/sync";
 
 const limiter = ratelimit({ id: "api", limit: 100, windowSecs: 60 });
 
@@ -50,7 +52,7 @@ await limiter.checkOrThrow("user:123"); // throws RateLimitError if over
 Distributed lock with retry, TTL auto-expiry, owner-only release.
 
 ```ts
-import { mutex, LockError } from "@valentinkolb/sync";
+import { mutex, LockError } from "@k2b/sync";
 
 const m = mutex({ id: "checkout", defaultTtl: 5000 });
 
@@ -69,7 +71,7 @@ await m.withLockOrThrow("order:123", async () => {
 Durable work queue with at-least-once delivery, lease-based visibility, delayed messages, idempotency, DLQ.
 
 ```ts
-import { queue } from "@valentinkolb/sync";
+import { queue } from "@k2b/sync";
 
 const q = queue<{ to: string; subject: string }>({
   id: "mail.send",
@@ -100,7 +102,7 @@ Messages exceeding `maxDeliveries` move to DLQ. Extend active leases with `msg.t
 Pub/sub with Redis Streams. Consumer groups for at-least-once delivery, `live()` for best-effort fan-out.
 
 ```ts
-import { topic } from "@valentinkolb/sync";
+import { topic } from "@k2b/sync";
 
 const t = topic<{ type: string; orderId: string }>({
   id: "order.events",
@@ -154,7 +156,7 @@ leased pending deliveries, so `reclaim()` returns an empty completed batch.
 TTL-based key/value with tenant isolation, snapshots with optional prefix filter, and change-stream reader.
 
 ```ts
-import { ephemeral } from "@valentinkolb/sync";
+import { ephemeral } from "@k2b/sync";
 
 const presence = ephemeral<{ userId: string; displayName: string }>({
   id: "notebook.presence",
@@ -185,7 +187,7 @@ for await (const event of presence.reader({ tenantId: "notebook-abc" }).stream()
 Durable background tasks with callback-based lifecycle.
 
 ```ts
-import { job, isRetryableTransportError } from "@valentinkolb/sync";
+import { job, isRetryableTransportError } from "@k2b/sync";
 
 const sendMail = job<{ to: string }, { sent: boolean }>({
   id: "send-mail",
@@ -235,7 +237,7 @@ await sync.submit({ key: "daily" });
 Distributed cron with leader election, callback-based dispatch.
 
 ```ts
-import { scheduler, schedulerControl } from "@valentinkolb/sync";
+import { scheduler, schedulerControl } from "@k2b/sync";
 
 const sched = scheduler({ id: "platform" });
 
@@ -323,7 +325,7 @@ Each item has its own retry lifecycle. Failed items retry independently. Already
 General-purpose retry wrapper with the same callback pattern.
 
 ```ts
-import { retry, isRetryableTransportError } from "@valentinkolb/sync";
+import { retry, isRetryableTransportError } from "@k2b/sync";
 
 const user = await retry({
   run: () => fetchUser(id),
@@ -340,7 +342,7 @@ No `after` defined → first error throws immediately. No `ctx.reschedule` call 
 
 ## Differences between server and browser
 
-The browser runtime (`@valentinkolb/sync/browser`) has the **same public API** but:
+The browser runtime (`@k2b/sync/browser`) has the **same public API** but:
 
 - All state is in-memory (no Redis). Survives within a page/tab; resets on reload unless you pass a `store?: Store`.
 - `scheduler`/`mutex`/`ratelimit`/`topic` optionally accept `store?: Store` for `createLocalStorageStore()` persistence.

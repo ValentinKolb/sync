@@ -1,6 +1,6 @@
 # Parity
 
-This directory enforces **API parity** between `@valentinkolb/sync` (Redis-backed, server) and `@valentinkolb/sync/browser` (in-memory, browser).
+This directory enforces **API parity** between `@k2b/sync` (Redis-backed, server) and `@k2b/sync/browser` (in-memory, browser).
 
 ## Type parity
 
