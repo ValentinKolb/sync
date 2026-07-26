@@ -413,7 +413,7 @@ test("metric() reflects dispatches / failures / reschedules", async () => {
 
   await waitFor(() => {
     const m = worker.metric();
-    return m.dispatches + m.failures >= 2;
+    return m.dispatches >= 2 && m.failures >= 1 && m.reschedules >= 1;
   }, 5_000);
 
   const m = worker.metric();
