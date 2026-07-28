@@ -1,6 +1,6 @@
 import { beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { job } from "../index";
+import { job, queue } from "../index";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 
@@ -147,33 +147,114 @@ test("reschedule via ctx.reschedule keeps key claimed across delayMs window", as
 // Multiple concurrent workers (same definition id)
 // ==========================
 
-test("two workers with same definition id do not double-process the same delivery", async () => {
+test("two live workers with the same id process each key exactly once", async () => {
   const processedBy: string[] = [];
   const sharedPrefix = `sync:job:shared-${Date.now()}`;
 
-  const wa = job({
+  const wa = job<{ n: number }>({
     id: "shared-def",
     prefix: sharedPrefix,
     process: async () => {
       processedBy.push("a");
+      await Bun.sleep(30);
     },
   });
-  const wb = job({
+  const wb = job<{ n: number }>({
     id: "shared-def",
     prefix: sharedPrefix,
     process: async () => {
       processedBy.push("b");
+      await Bun.sleep(30);
     },
   });
 
-  await wa.submit({ key: "k1" });
-  await Bun.sleep(500);
+  // Both handles must actually consume: a second same-id handle used to be a
+  // silent no-op whose process callback was unreachable, so a single consumer
+  // satisfied the old assertion on its own.
+  const keys = Array.from({ length: 12 }, (_, i) => `k${i}`);
+  for (const [index, key] of keys.entries()) {
+    await (index % 2 === 0 ? wa : wb).submit({ key, input: { n: 1 } });
+  }
 
-  expect(processedBy.length).toBe(1);
+  await waitFor(() => processedBy.length >= keys.length, 20_000);
+  await Bun.sleep(500); // let any duplicate surface
+
+  // Exactly one dispatch per key across both workers, and both did work.
+  expect(processedBy.length).toBe(keys.length);
+  expect(processedBy.includes("a")).toBe(true);
+  expect(processedBy.includes("b")).toBe(true);
 
   wa.stop();
   wb.stop();
+}, 30_000);
+
+test("stop cancels the in-flight callback via ctx.signal", async () => {
+  let abortedDuringRun = false;
+  let observedAfterStop = false;
+
+  const worker = job({
+    id: uid("stop-signal"),
+    process: async ({ ctx }) => {
+      // `ctx.signal.aborted` used to be false for the entire life of process,
+      // making the documented cancellation pattern inoperative.
+      for (let i = 0; i < 100; i++) {
+        if (ctx.signal.aborted) {
+          abortedDuringRun = true;
+          return;
+        }
+        await Bun.sleep(20);
+      }
+      observedAfterStop = true;
+    },
+  });
+
+  await worker.submit({ key: "cancel-me" });
+  await Bun.sleep(150);
+  worker.stop();
+  await Bun.sleep(300);
+
+  expect(abortedDuringRun).toBe(true);
+  expect(observedAfterStop).toBe(false);
 });
+
+test("losing the lease during a heartbeat aborts the running callback", async () => {
+  const id = uid("lease-loss-signal");
+  const observed: boolean[] = [];
+  let running = false;
+
+  const worker = job({
+    id,
+    defaults: { leaseMs: 100 },
+    process: async ({ ctx }) => {
+      running = true;
+      // Outlive the lease while another consumer takes the delivery over, then
+      // heartbeat: this attempt must be told to wind down instead of racing the
+      // copy that is now owned by someone else.
+      await Bun.sleep(900);
+      await ctx.heartbeat();
+      observed.push(ctx.signal.aborted);
+    },
+  });
+
+  await worker.submit({ key: "lease-loss" });
+  await waitFor(() => running, 10_000);
+
+  // A second consumer on the same internal work queue: its non-waiting recv
+  // forces maintenance, which reaps the expired lease and hands the message on.
+  const competitor = queue({ id: `${id}:work`, prefix: "sync:job:queue" }).reader();
+  await waitFor(async () => true, 100);
+  let stolen = null;
+  while (!stolen && observed.length === 0) {
+    stolen = await competitor.recv({ wait: false });
+    if (!stolen) await Bun.sleep(50);
+  }
+
+  await waitFor(() => observed.length >= 1, 20_000);
+  worker.stop();
+  await stolen?.ack();
+
+  expect(observed[0]).toBe(true);
+}, 30_000);
 
 // ==========================
 // stop mid-process

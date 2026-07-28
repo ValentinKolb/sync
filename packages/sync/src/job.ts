@@ -168,8 +168,6 @@ type WorkPayload = {
   meta?: Record<string, unknown>;
 };
 
-const activeWorkers = new Map<string, AbortController>();
-
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
 
 // ==========================
@@ -180,7 +178,6 @@ export const job = <Input = void, Result = unknown>(
   config: JobConfig<Input, Result>,
 ): JobHandle<Input> => {
   const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const workerId = `${prefix}:${config.id}`;
   const defaultLeaseMs = Math.max(1, config.defaults?.leaseMs ?? DEFAULT_LEASE_MS);
   const defaultKeyTtlMs = Math.min(
     MAX_KEY_TTL_MS,
@@ -246,14 +243,24 @@ export const job = <Input = void, Result = unknown>(
     return { jobId: String(arr[0]), isNew: Number(arr[1]) === 1 };
   };
 
+  // The worker belongs to this handle, not to the id. Keying it by
+  // `${prefix}:${id}` made a second same-id handle a silent no-op: its process,
+  // after and trace callbacks were never invoked because all work ran through
+  // the first handle's captured closures, and either handle's stop() killed the
+  // other's worker. Concurrent consumers on the same id are already resolved by
+  // the queue's atomic claim and lease.
+  let workerAc: AbortController | null = null;
+  // The controller of the callback currently running, so stop() can cancel it.
+  let activeJobAc: AbortController | null = null;
+
   const startWorker = (): void => {
-    if (activeWorkers.has(workerId)) return;
-    const workerAc = new AbortController();
-    activeWorkers.set(workerId, workerAc);
+    if (workerAc) return;
+    const ac = new AbortController();
+    workerAc = ac;
 
     void (async () => {
       try {
-        while (!workerAc.signal.aborted) {
+        while (!ac.signal.aborted) {
           try {
             const message = await retry({
               run: () =>
@@ -267,7 +274,7 @@ export const job = <Input = void, Result = unknown>(
                   ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
                 }
               },
-              signal: workerAc.signal,
+              signal: ac.signal,
             });
 
             if (!message) continue;
@@ -277,6 +284,7 @@ export const job = <Input = void, Result = unknown>(
             const failureCount = attempt - 1;
             const startedAt = Date.now();
             const jobAc = new AbortController();
+            activeJobAc = jobAc;
 
             const makeCtx = (): JobCtx<Input> => {
               const ctx = {
@@ -286,7 +294,13 @@ export const job = <Input = void, Result = unknown>(
                 failureCount,
                 signal: jobAc.signal,
                 heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
-                  await message.touch({ leaseMs: cfg?.leaseMs ?? payload.leaseMs });
+                  const held = await message.touch({ leaseMs: cfg?.leaseMs ?? payload.leaseMs });
+                  if (!held) {
+                    // The lease is gone: this message is already being
+                    // redelivered elsewhere, so this attempt should wind down.
+                    jobAc.abort();
+                    return;
+                  }
                   // A job that outlives keyTtlMs must not lose its dedup claim.
                   await refreshKey(payload.key, payload.jobId, payload.keyTtlMs);
                 },
@@ -318,8 +332,10 @@ export const job = <Input = void, Result = unknown>(
             try {
               result = await Promise.resolve(config.process({ ctx }));
             } catch (err) {
-              jobAc.abort();
               error = asError(err);
+            } finally {
+              jobAc.abort();
+              activeJobAc = null;
             }
 
             if (error) {
@@ -408,15 +424,12 @@ export const job = <Input = void, Result = unknown>(
               durationMs: Date.now() - startedAt,
             });
           } catch {
-            if (workerAc.signal.aborted) break;
+            if (ac.signal.aborted) break;
             await sleep(25);
           }
         }
       } finally {
-        const current = activeWorkers.get(workerId);
-        if (current === workerAc) {
-          activeWorkers.delete(workerId);
-        }
+        if (workerAc === ac) workerAc = null;
       }
     })();
   };
@@ -475,11 +488,11 @@ export const job = <Input = void, Result = unknown>(
   const metric = (): JobMetrics => ({ ...metrics });
 
   const stop = (): void => {
-    const ac = activeWorkers.get(workerId);
-    if (ac) {
-      ac.abort();
-      activeWorkers.delete(workerId);
-    }
+    workerAc?.abort();
+    workerAc = null;
+    // Cancel the in-flight callback too, so `ctx.signal.aborted` is a usable
+    // cancellation signal rather than something that is always false.
+    activeJobAc?.abort();
   };
 
   return {
