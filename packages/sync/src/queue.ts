@@ -16,6 +16,43 @@ const DEFAULT_PAYLOAD_BYTES = 128 * 1024;
 const MAINTENANCE_BATCH_SIZE = 200;
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 1_000;
 
+// Stored message records are envelopes whose user-controlled parts (`dataJson`,
+// `metaJson`) are opaque pre-serialized JSON strings. Lua may copy them but never
+// decodes and re-encodes them, because Redis' bundled cjson is lossy: an empty
+// array round-trips to an empty object and integers past 14 significant digits
+// lose precision. Records written by <= 5.8.0 carry the decoded values under
+// `data`/`meta` instead; `readMessage` upgrades those in place on first touch,
+// which preserves exactly the fidelity 5.8.0 itself had for them.
+const LUA_MESSAGE_HELPERS = `
+  local function readMessage(raw)
+    local ok, message = pcall(cjson.decode, raw)
+    if not ok or type(message) ~= "table" then return nil end
+    if message.dataJson ~= nil or message.v == 2 then return message end
+    return {
+      v = 2,
+      attempt = tonumber(message.attempt) or 0,
+      enqueuedAt = tonumber(message.enqueuedAt) or 0,
+      orderingKey = message.orderingKey,
+      dataJson = message.data ~= nil and cjson.encode(message.data) or nil,
+      metaJson = message.meta ~= nil and cjson.encode(message.meta) or nil,
+    }
+  end
+
+  local function deadLetter(messageId, message, movedAt, reason, lastError)
+    return cjson.encode({
+      v = 2,
+      messageId = messageId,
+      dataJson = message.dataJson,
+      metaJson = message.metaJson,
+      orderingKey = message.orderingKey,
+      attempts = tonumber(message.attempt) or 0,
+      movedAt = movedAt,
+      reason = reason,
+      lastError = lastError,
+    })
+  end
+`;
+
 const SEND_SCRIPT = `
   local now = tonumber(ARGV[1])
   local delayMs = tonumber(ARGV[2])
@@ -47,11 +84,21 @@ const SEND_SCRIPT = `
 `;
 
 const MAINTENANCE_SCRIPT = `
+  ${LUA_MESSAGE_HELPERS}
+
   local now = tonumber(ARGV[1])
   local maxDeliveries = tonumber(ARGV[2])
   local maxMessageAgeMs = tonumber(ARGV[3])
   local batch = tonumber(ARGV[4])
   local dlqTtlMs = tonumber(ARGV[5])
+
+  local function toDlq(messageId, message, reason)
+    redis.call("HSET", KEYS[7], messageId, deadLetter(messageId, message, now, reason, nil))
+    if dlqTtlMs > 0 then
+      redis.call("PEXPIRE", KEYS[7], tostring(dlqTtlMs))
+    end
+    redis.call("HDEL", KEYS[5], messageId)
+  end
 
   local delayedIds = redis.call("ZRANGEBYSCORE", KEYS[2], "0", tostring(now), "LIMIT", "0", tostring(batch))
   for _, messageId in ipairs(delayedIds) do
@@ -59,24 +106,11 @@ const MAINTENANCE_SCRIPT = `
     if removed > 0 then
       local messageRaw = redis.call("HGET", KEYS[5], messageId)
       if messageRaw then
-        local ok, message = pcall(cjson.decode, messageRaw)
-        if ok then
+        local message = readMessage(messageRaw)
+        if message then
           local enqueuedAt = tonumber(message.enqueuedAt) or now
           if (now - enqueuedAt) > maxMessageAgeMs then
-            local dlq = {
-              messageId = messageId,
-              data = message.data,
-              orderingKey = message.orderingKey,
-              meta = message.meta,
-              attempts = message.attempt or 0,
-              movedAt = now,
-              reason = "expired"
-            }
-            redis.call("HSET", KEYS[7], messageId, cjson.encode(dlq))
-            if dlqTtlMs > 0 then
-              redis.call("PEXPIRE", KEYS[7], tostring(dlqTtlMs))
-            end
-            redis.call("HDEL", KEYS[5], messageId)
+            toDlq(messageId, message, "expired")
           else
             redis.call("LPUSH", KEYS[1], messageId)
           end
@@ -101,39 +135,13 @@ const MAINTENANCE_SCRIPT = `
 
         local messageRaw = redis.call("HGET", KEYS[5], messageId)
         if messageRaw then
-          local mOk, message = pcall(cjson.decode, messageRaw)
-          if mOk then
+          local message = readMessage(messageRaw)
+          if message then
             local enqueuedAt = tonumber(message.enqueuedAt) or now
             if (now - enqueuedAt) > maxMessageAgeMs then
-              local dlqExpired = {
-                messageId = messageId,
-                data = message.data,
-                orderingKey = message.orderingKey,
-                meta = message.meta,
-                attempts = message.attempt or 0,
-                movedAt = now,
-                reason = "expired"
-              }
-              redis.call("HSET", KEYS[7], messageId, cjson.encode(dlqExpired))
-              if dlqTtlMs > 0 then
-                redis.call("PEXPIRE", KEYS[7], tostring(dlqTtlMs))
-              end
-              redis.call("HDEL", KEYS[5], messageId)
+              toDlq(messageId, message, "expired")
             elseif (tonumber(message.attempt) or 0) >= maxDeliveries then
-              local dlqMax = {
-                messageId = messageId,
-                data = message.data,
-                orderingKey = message.orderingKey,
-                meta = message.meta,
-                attempts = message.attempt or 0,
-                movedAt = now,
-                reason = "max_deliveries_exceeded"
-              }
-              redis.call("HSET", KEYS[7], messageId, cjson.encode(dlqMax))
-              if dlqTtlMs > 0 then
-                redis.call("PEXPIRE", KEYS[7], tostring(dlqTtlMs))
-              end
-              redis.call("HDEL", KEYS[5], messageId)
+              toDlq(messageId, message, "max_deliveries_exceeded")
             else
               redis.call("LPUSH", KEYS[1], messageId)
             end
@@ -149,6 +157,8 @@ const MAINTENANCE_SCRIPT = `
 `;
 
 const CLAIM_SCRIPT = `
+  ${LUA_MESSAGE_HELPERS}
+
   local messageId = ARGV[1]
   local deliveryId = ARGV[2]
   local leaseUntil = tonumber(ARGV[3])
@@ -159,8 +169,8 @@ const CLAIM_SCRIPT = `
     return nil
   end
 
-  local ok, message = pcall(cjson.decode, messageRaw)
-  if not ok then
+  local message = readMessage(messageRaw)
+  if not message then
     redis.call("LREM", KEYS[4], 1, messageId)
     redis.call("HDEL", KEYS[1], messageId)
     return nil
@@ -178,18 +188,16 @@ const CLAIM_SCRIPT = `
   redis.call("HSET", KEYS[2], deliveryId, cjson.encode(delivery))
   redis.call("ZADD", KEYS[3], tostring(leaseUntil), deliveryId)
 
-  local result = {
+  return cjson.encode({
     messageId = messageId,
     deliveryId = deliveryId,
     leaseUntil = leaseUntil,
     attempt = message.attempt,
     orderingKey = message.orderingKey,
     enqueuedAt = message.enqueuedAt,
-    meta = message.meta,
-    data = message.data
-  }
-
-  return cjson.encode(result)
+    metaJson = message.metaJson,
+    dataJson = message.dataJson
+  })
 `;
 
 const ACK_SCRIPT = `
@@ -216,6 +224,8 @@ const ACK_SCRIPT = `
 `;
 
 const NACK_SCRIPT = `
+  ${LUA_MESSAGE_HELPERS}
+
   local deliveryId = ARGV[1]
   local now = tonumber(ARGV[2])
   local delayMs = tonumber(ARGV[3])
@@ -247,24 +257,20 @@ const NACK_SCRIPT = `
     return 0
   end
 
-  local mOk, message = pcall(cjson.decode, messageRaw)
-  if not mOk then
+  local message = readMessage(messageRaw)
+  if not message then
     redis.call("HDEL", KEYS[3], messageId)
     return 0
   end
 
   if (tonumber(message.attempt) or 0) >= maxDeliveries then
-    local dlq = {
-      messageId = messageId,
-      data = message.data,
-      orderingKey = message.orderingKey,
-      meta = message.meta,
-      attempts = message.attempt or 0,
-      movedAt = now,
-      reason = reason ~= "" and reason or "max_deliveries_exceeded",
-      lastError = error ~= "" and error or nil
-    }
-    redis.call("HSET", KEYS[7], messageId, cjson.encode(dlq))
+    redis.call("HSET", KEYS[7], messageId, deadLetter(
+      messageId,
+      message,
+      now,
+      reason ~= "" and reason or "max_deliveries_exceeded",
+      error ~= "" and error or nil
+    ))
     if dlqTtlMs > 0 then
       redis.call("PEXPIRE", KEYS[7], tostring(dlqTtlMs))
     end
@@ -400,23 +406,39 @@ export type Queue<T> = QueueReader<T> & {
   reader(): QueueReader<T>;
 };
 
-type StoredMessage<T> = {
-  data: T;
+/**
+ * Stored message envelope, version 2. `dataJson` and `metaJson` hold the
+ * caller's values as opaque pre-serialized JSON so that Lua only ever copies
+ * the strings. Records written by <= 5.8.0 have no `v` and carry decoded
+ * `data`/`meta` instead; Lua upgrades those on first touch.
+ */
+type StoredMessage = {
+  v: 2;
   attempt: number;
-  orderingKey?: string;
-  meta?: Record<string, unknown>;
   enqueuedAt: number;
+  orderingKey?: string;
+  dataJson?: string;
+  metaJson?: string;
 };
 
-type ClaimedMessage<T> = {
-  data: T;
+type ClaimResult = {
   messageId: string;
   deliveryId: string;
   attempt: number;
   leaseUntil: number;
   orderingKey?: string;
   enqueuedAt: number;
-  meta?: Record<string, unknown>;
+  dataJson?: string;
+  metaJson?: string;
+};
+
+const parseOpaque = <T>(json: string | undefined): T | undefined => {
+  if (json === undefined) return undefined;
+  try {
+    return JSON.parse(json) as T;
+  } catch {
+    return undefined;
+  }
 };
 
 export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
@@ -565,9 +587,9 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
           continue;
         }
 
-        let claimed: ClaimedMessage<unknown> | null = null;
+        let claimed: ClaimResult | null = null;
         try {
-          claimed = JSON.parse(claimRaw) as ClaimedMessage<unknown>;
+          claimed = JSON.parse(claimRaw) as ClaimResult;
         } catch {
           claimed = null;
         }
@@ -617,13 +639,13 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
         };
 
         return {
-          data: claimed.data as TData,
+          data: parseOpaque<TData>(claimed.dataJson) as TData,
           messageId: claimed.messageId,
           deliveryId: claimed.deliveryId,
           attempt: claimed.attempt,
           leaseUntil: claimed.leaseUntil,
           orderingKey: claimed.orderingKey,
-          meta: asObject<Record<string, unknown>>(claimed.meta) ?? undefined,
+          meta: asObject<Record<string, unknown>>(parseOpaque(claimed.metaJson)) ?? undefined,
           ack,
           nack,
           touch,
@@ -670,19 +692,32 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     const delayMs = Math.max(0, sendCfg.delayMs ?? 0);
     const idempotencyTtlMs = sendCfg.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS;
 
-    const message: StoredMessage<TData> = {
-      data: sendCfg.data,
-      attempt: 0,
-      orderingKey: sendCfg.orderingKey,
-      meta: sendCfg.meta,
-      enqueuedAt: now,
-    };
+    const dataJson = sendCfg.data === undefined ? undefined : JSON.stringify(sendCfg.data);
+    const metaJson = sendCfg.meta === undefined ? undefined : JSON.stringify(sendCfg.meta);
 
-    const payload = JSON.stringify(message);
-    const payloadBytes = textEncoder.encode(payload).byteLength;
+    // The limit is measured against the logical envelope the caller sees, not
+    // against the stored representation, so that escaping `dataJson` into the
+    // envelope does not silently shrink the accepted payload size.
+    const logical: string[] = [];
+    if (dataJson !== undefined) logical.push(`"data":${dataJson}`);
+    logical.push(`"attempt":0`);
+    if (sendCfg.orderingKey !== undefined) logical.push(`"orderingKey":${JSON.stringify(sendCfg.orderingKey)}`);
+    if (metaJson !== undefined) logical.push(`"meta":${metaJson}`);
+    logical.push(`"enqueuedAt":${now}`);
+    const payloadBytes = textEncoder.encode(`{${logical.join(",")}}`).byteLength;
     if (payloadBytes > maxPayloadBytes) {
       throw new Error(`payload exceeds limit (${maxPayloadBytes} bytes)`);
     }
+
+    const message: StoredMessage = {
+      v: 2,
+      attempt: 0,
+      enqueuedAt: now,
+      orderingKey: sendCfg.orderingKey,
+      dataJson,
+      metaJson,
+    };
+    const payload = JSON.stringify(message);
 
     const idempotencyKey = sendCfg.idempotencyKey
       ? `${keys.idempotencyPrefix}:${sendCfg.idempotencyKey}`

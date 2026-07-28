@@ -522,3 +522,90 @@ test("maintenance requeue + second consumer recv vs original ack", async () => {
   // Queue should now be empty
   expect(await q.recv({ wait: false })).toBeNull();
 });
+
+// ==========================
+// Payload fidelity (opaque JSON)
+// ==========================
+
+const AWKWARD = {
+  empty: [] as number[],
+  emptyObj: {},
+  unicode: "日本😀",
+  big: 9007199254740991,
+  nested: [[], {}] as unknown[],
+  nul: null,
+  deep: { list: [1, [], { inner: [] }] },
+};
+
+test("payload round-trips byte-equivalent JSON across claim and redelivery", async () => {
+  const q = queue<typeof AWKWARD>({
+    id: "opaque-roundtrip",
+    prefix: "test:q",
+  });
+
+  await q.send({ data: AWKWARD, meta: { tags: [], n: 9007199254740991 } });
+
+  // First claim runs the message through the Lua re-encode path once.
+  const first = await q.recv({ wait: false });
+  expect(first?.data).toEqual(AWKWARD);
+  expect(first?.meta).toEqual({ tags: [], n: 9007199254740991 });
+  expect(await first?.nack()).toBe(true);
+
+  // Redelivery runs it through a second time; a lossy encode compounds here.
+  const second = await q.recv({ wait: false });
+  expect(second?.attempt).toBe(2);
+  expect(second?.data).toEqual(AWKWARD);
+  expect(second?.meta).toEqual({ tags: [], n: 9007199254740991 });
+  expect(Array.isArray(second?.data.empty)).toBe(true);
+  expect(await second?.ack()).toBe(true);
+});
+
+test("dead-lettered payload keeps the original JSON shape", async () => {
+  const q = queue<typeof AWKWARD>({
+    id: "opaque-dlq",
+    prefix: "test:q",
+    delivery: { maxDeliveries: 1 },
+  });
+
+  await q.send({ data: AWKWARD });
+  const message = await q.recv({ wait: false });
+  expect(await message?.nack()).toBe(true); // settled by moving it to the DLQ
+  expect(await q.recv({ wait: false })).toBeNull(); // not requeued
+
+  const raw = await redis.send("HGETALL", ["test:q:default:opaque-dlq:dlq"]);
+  const entries = Object.values(raw as Record<string, string>);
+  expect(entries.length).toBe(1);
+  const dlq = JSON.parse(entries[0]!) as { dataJson: string; reason: string };
+  expect(dlq.reason).toBe("max_deliveries_exceeded");
+  expect(JSON.parse(dlq.dataJson)).toEqual(AWKWARD);
+});
+
+test("messages written in the 5.8.0 record format are still delivered", async () => {
+  const q = queue<{ tag: string }>({
+    id: "legacy-record",
+    prefix: "test:q",
+  });
+
+  // Exactly what <= 5.8.0 wrote: decoded `data`/`meta`, no `v`, no `dataJson`.
+  const legacy = JSON.stringify({
+    data: { tag: "from-5.8.0" },
+    attempt: 0,
+    meta: { source: "legacy" },
+    enqueuedAt: Date.now(),
+  });
+  await redis.send("HSET", ["test:q:default:legacy-record:messages", "9001", legacy]);
+  await redis.send("LPUSH", ["test:q:default:legacy-record:ready", "9001"]);
+
+  const message = await q.recv({ wait: false });
+  expect(message?.messageId).toBe("9001");
+  expect(message?.data).toEqual({ tag: "from-5.8.0" });
+  expect(message?.meta).toEqual({ source: "legacy" });
+  expect(message?.attempt).toBe(1);
+
+  // The record is upgraded in place, so redelivery reads the new format.
+  expect(await message?.nack()).toBe(true);
+  const again = await q.recv({ wait: false });
+  expect(again?.data).toEqual({ tag: "from-5.8.0" });
+  expect(again?.attempt).toBe(2);
+  expect(await again?.ack()).toBe(true);
+});
