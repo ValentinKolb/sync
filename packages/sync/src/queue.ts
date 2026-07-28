@@ -75,8 +75,10 @@ const SEND_SCRIPT = `
   local now = tonumber(ARGV[1])
   local delayMs = tonumber(ARGV[2])
   local payload = ARGV[3]
-  local idemKey = ARGV[4]
-  local idemTtlMs = tonumber(ARGV[5])
+  -- Declared as a key, not an argument: a script must declare every key it
+  -- touches for key-routing topologies to route it correctly.
+  local idemKey = KEYS[6]
+  local idemTtlMs = tonumber(ARGV[4])
 
   if idemKey ~= "" then
     local existing = redis.call("GET", idemKey)
@@ -769,8 +771,8 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
 
     const result = await evalScript(
       SEND_SCRIPT,
-      [keys.seq, keys.messages, keys.ready, keys.delayed, keys.notify],
-      [now, delayMs, payload, idempotencyKey, idempotencyTtlMs],
+      [keys.seq, keys.messages, keys.ready, keys.delayed, keys.notify, idempotencyKey],
+      [now, delayMs, payload, idempotencyTtlMs],
     );
 
     const messageId = Array.isArray(result) && typeof result[0] === "string" ? result[0] : String(result);
