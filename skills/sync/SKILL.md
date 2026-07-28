@@ -1,6 +1,6 @@
 ---
 name: sync
-description: "Use this skill for @k2b/sync and @k2b/sync/browser — distributed synchronization primitives for TypeScript/Bun (server) and browsers. Covers all 8 modules: ratelimit, mutex, queue, topic, ephemeral, job, scheduler, retry. Use when code imports from `@k2b/sync` or `@k2b/sync/browser`, or when building features that need: rate limiting, distributed locks, durable work queues with at-least-once delivery + DLQ + idempotency, pub/sub with cursor-based replay, TTL-based presence/registry, durable background jobs with retry + lifecycle callbacks, distributed cron scheduling with leader election, or retry helpers with exponential backoff. Also use for migrating v4 code to the v5 rewrite (unified callback API, no Zod peer dep, no registry module)."
+description: "Use this skill for @k2b/sync and @k2b/sync/browser — distributed synchronization primitives for TypeScript/Bun (server) and browsers. Covers all 9 modules: ratelimit, mutex, queue, topic, ephemeral, job, pump, scheduler, retry. Use when code imports from `@k2b/sync` or `@k2b/sync/browser`, or when building features that need: rate limiting, distributed locks, durable work queues with at-least-once delivery + DLQ + idempotency, pub/sub with cursor-based replay, TTL-based presence/registry, durable background jobs with retry + lifecycle callbacks, durable cursor-based backfills/imports/reindexing, distributed cron scheduling with leader election, or retry helpers with exponential backoff. Also use for migrating v4 code to the v5 rewrite (unified callback API, no Zod peer dep, no registry module)."
 ---
 
 # @k2b/sync — v5
@@ -13,7 +13,7 @@ Trigger for any imports from:
 - `@k2b/sync` (server — Bun + Redis/Valkey/Dragonfly 6.2+)
 - `@k2b/sync/browser` (browser — in-memory)
 
-Or when the user is building features that need one of the eight modules:
+Or when the user is building features that need one of the nine modules:
 
 | Module | Use for |
 |---|---|
@@ -23,6 +23,7 @@ Or when the user is building features that need one of the eight modules:
 | `topic` | Pub/sub with cursor-based replay, consumer-group pending recovery, or `live()` broadcast |
 | `ephemeral` | TTL key/value with `tenantId` isolation, `prefix` filter, change-stream reader |
 | `job` | Durable background tasks with `process` + `after` lifecycle callbacks, typed input, optional trace callback |
+| `pump` | Durable cursor pump for backfills, imports, reindexing, reconciliation, and paginated APIs |
 | `scheduler` | Distributed cron with leader election, `runNumber`, `failureCount`, `ctx.reschedule`, optional per-schedule trace callback, remote manual control |
 | `retry` | General-purpose retry wrapper with the same callback pattern |
 
@@ -50,6 +51,11 @@ mod({
 
 `schedulerControl()` is the generic remote control plane for scheduler-backed background work. It can list known schedules across scheduler ids and request a manual run by `{ schedulerId, scheduleId }`. The request is executed only by a live scheduler instance that registered the handler. `runNow` waits for accepted, not completed; use trace or app-owned audit storage for run outcomes.
 
+`pump()` is separate from the lifecycle callback pattern. It calls `pull()` to
+persist one bounded page, then calls `dispatch()` sequentially and checkpoints
+each accepted item. Its guarantee is at-least-once: a crash can repeat the
+current item, so every item needs a stable `key` and an idempotent sink.
+
 ## Per-module reference
 
 Read the module's reference file in `references/` for full API, gotchas, and usage patterns:
@@ -60,6 +66,7 @@ Read the module's reference file in `references/` for full API, gotchas, and usa
 - [references/mutex.md](references/mutex.md) — distributed lock primitives
 - [references/ratelimit.md](references/ratelimit.md) — sliding-window limiter
 - [references/job.md](references/job.md) — durable jobs with `process`/`after`/`ctx.reschedule`, optional typed `<Input, Result>`
+- [references/pump.md](references/pump.md) — durable cursor pump, recovery semantics, cancellation, and sink composition
 - [references/scheduler.md](references/scheduler.md) — cron + leader election, `create/runNow/delete`, `schedulerControl`, `ctx.runNumber`
 - [references/retry.md](references/retry.md) — general retry wrapper, `ctx.expBackoff` helper
 - [references/migration-v4-v5.md](references/migration-v4-v5.md) — breaking-change guide for code using v4
@@ -137,6 +144,7 @@ Clean by design. Summary:
 
 - **Queue messages** → `ack`/`nack` handles cleanup; terminal = DEL
 - **Job idempotency keys** → released on terminal (DEL), else TTL (default 24h)
+- **Pump active pages** → deleted after cursor commit; terminal state expires after seven days by default
 - **Schedule records** → stay (they ARE the schedule); only `delete({ id })` removes
 - **Scheduler control requests** → queued until a live handler accepts them; ack removes the request
 - **No per-job event streams** (removed in v5)

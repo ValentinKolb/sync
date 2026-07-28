@@ -71,6 +71,19 @@ import type {
   SubmitConfig as S_SubmitConfig,
 } from "../packages/sync/src/job";
 import type {
+  PumpItem as S_PumpItem,
+  PumpStatus as S_PumpStatus,
+  PumpState as S_PumpState,
+  PumpPullContext as S_PumpPullContext,
+  PumpDispatchContext as S_PumpDispatchContext,
+  PumpPullResult as S_PumpPullResult,
+  PumpRetryConfig as S_PumpRetryConfig,
+  PumpTraceEvent as S_PumpTraceEvent,
+  PumpConfig as S_PumpConfig,
+  PumpStartConfig as S_PumpStartConfig,
+  PumpHandle as S_PumpHandle,
+} from "../packages/sync/src/pump";
+import type {
   Scheduler as S_Scheduler,
   SchedulerConfig as S_SchedulerConfig,
   SchedulerInfo as S_SchedulerInfo,
@@ -158,6 +171,19 @@ import type {
   JobTraceEvent as B_JobTraceEvent,
   SubmitConfig as B_SubmitConfig,
 } from "../packages/sync-browser/src/job";
+import type {
+  PumpItem as B_PumpItem,
+  PumpStatus as B_PumpStatus,
+  PumpState as B_PumpState,
+  PumpPullContext as B_PumpPullContext,
+  PumpDispatchContext as B_PumpDispatchContext,
+  PumpPullResult as B_PumpPullResult,
+  PumpRetryConfig as B_PumpRetryConfig,
+  PumpTraceEvent as B_PumpTraceEvent,
+  PumpConfig as B_PumpConfig,
+  PumpStartConfig as B_PumpStartConfig,
+  PumpHandle as B_PumpHandle,
+} from "../packages/sync-browser/src/pump";
 import type {
   Scheduler as B_Scheduler,
   SchedulerConfig as B_SchedulerConfig,
@@ -292,6 +318,30 @@ assertEqual<Equal<S_JobMetrics, B_JobMetrics>>(true);
 assertEqual<Equal<S_JobTraceEvent<{ userId: string }, number>, B_JobTraceEvent<{ userId: string }, number>>>(true);
 assertEqual<Equal<S_SubmitConfig<{ userId: string }>, B_SubmitConfig<{ userId: string }>>>(true);
 assertEqual<Equal<S_SubmitConfig<void>, B_SubmitConfig<void>>>(true);
+
+// ==========================
+// Pump
+// ==========================
+
+type PumpInput = { sourceId: string };
+type PumpCursor = { createdAt: number; id: string };
+type PumpData = { key: string; recordId: string };
+
+assertEqual<Equal<S_PumpItem, B_PumpItem>>(true);
+assertEqual<Equal<S_PumpStatus, B_PumpStatus>>(true);
+assertEqual<Equal<S_PumpState<PumpInput, PumpCursor>, B_PumpState<PumpInput, PumpCursor>>>(true);
+assertEqual<Equal<S_PumpPullContext<PumpInput, PumpCursor>, B_PumpPullContext<PumpInput, PumpCursor>>>(true);
+assertEqual<Equal<S_PumpDispatchContext<PumpInput, PumpData>, B_PumpDispatchContext<PumpInput, PumpData>>>(true);
+assertEqual<Equal<S_PumpPullResult<PumpCursor, PumpData>, B_PumpPullResult<PumpCursor, PumpData>>>(true);
+assertEqual<Equal<S_PumpRetryConfig, B_PumpRetryConfig>>(true);
+assertEqual<Equal<S_PumpTraceEvent<PumpInput, PumpCursor>, B_PumpTraceEvent<PumpInput, PumpCursor>>>(true);
+// PumpConfig differs: browser has optional `store?` additive.
+const _pumpCfgAdditive: B_PumpConfig<PumpInput, PumpCursor, PumpData> =
+  {} as unknown as S_PumpConfig<PumpInput, PumpCursor, PumpData>;
+void _pumpCfgAdditive;
+assertEqual<Equal<S_PumpStartConfig<PumpInput>, B_PumpStartConfig<PumpInput>>>(true);
+assertEqual<Equal<S_PumpStartConfig<void>, B_PumpStartConfig<void>>>(true);
+assertEqual<Equal<S_PumpHandle<PumpInput, PumpCursor>, B_PumpHandle<PumpInput, PumpCursor>>>(true);
 
 // ==========================
 // Scheduler

@@ -9,7 +9,7 @@ Synchronization primitives for TypeScript, published as one package with two run
 
 Both runtimes share an **identical public API** — change the import, and code generally works. Type parity is enforced at compile-time (see `parity/`).
 
-Provides eight modules: **ratelimit**, **mutex**, **queue**, **topic**, **ephemeral**, **job**, **scheduler**, and **retry**. They compose — `job` uses `queue` internally, `scheduler` uses `mutex` for leader election.
+Provides nine modules: **ratelimit**, **mutex**, **queue**, **topic**, **ephemeral**, **job**, **pump**, **scheduler**, and **retry**. They compose — `job` uses `queue` internally, `scheduler` uses `mutex` for leader election.
 
 ## Installation
 
@@ -232,6 +232,79 @@ const sync = job({
 await sync.submit({ key: "daily" });
 ```
 
+## Pump
+
+Durably drain a cursor-based source into an idempotent consumer, one persisted page at a time.
+
+```ts
+import { pump } from "@k2b/sync";
+
+type Cursor = { internalDate: string; id: string };
+
+const messages = pump<
+  { mailboxId: string; workflowId: string },
+  Cursor,
+  { key: string; messageId: string }
+>({
+  id: "mail.sender-rule-backfill",
+
+  pull: async ({ input, cursor, limit, signal }) => {
+    const rows = await loadMessages({
+      mailboxId: input.mailboxId,
+      after: cursor,
+      limit,
+      signal,
+    });
+
+    return {
+      items: rows.map((row) => ({ key: row.id, messageId: row.id })),
+      nextCursor: rows.length === limit
+        ? { internalDate: rows.at(-1)!.internalDate, id: rows.at(-1)!.id }
+        : null,
+    };
+  },
+
+  dispatch: async ({ input, item, signal }) => {
+    await emitWorkflowEvent({
+      scopeId: input.mailboxId,
+      targetWorkflowId: input.workflowId,
+      type: "mail.messageReceived",
+      dedupeKey: item.key,
+      data: { messageId: item.messageId },
+      signal,
+    });
+  },
+});
+
+await messages.start({
+  key: "sender-rule:rule-1:revision-4",
+  input: { mailboxId: "mailbox-1", workflowId: "workflow-1" },
+});
+
+await messages.get({ key: "sender-rule:rule-1:revision-4" });
+await messages.cancel({ key: "sender-rule:rule-1:revision-4" });
+messages.stop(); // local worker only; the durable execution is not canceled
+```
+
+`pump` persists each pulled page before dispatching it and checkpoints the item
+index after every successful dispatch. A crashed node can therefore duplicate
+the current item, but cannot skip it; `dispatch` must use `item.key` with an
+idempotent consumer. The committed cursor advances only after the full page.
+`nextCursor: null` completes the run.
+
+Only `id`, `pull`, and `dispatch` are required. Defaults are `batchSize: 100`,
+no delay between successful pages, a 30-second automatically heartbeated lease,
+10 exponential retry attempts, 128 KiB maximum serialized page size, and seven
+days of terminal-state retention. `input`, `cursor`, items, and `meta` must be
+JSON-serializable. Repeated `start()` calls with the same key return the
+existing execution.
+
+Common durable sinks are `queue.send({ idempotencyKey: item.key })`,
+`job.submit({ key: item.key })`, workflow events with a dedupe key, and
+application-owned idempotent writes. See
+[`skills/sync/references/pump.md`](./skills/sync/references/pump.md) for
+reindexing and external-API examples.
+
 ## Scheduler
 
 Distributed cron with leader election, callback-based dispatch.
@@ -345,7 +418,7 @@ No `after` defined → first error throws immediately. No `ctx.reschedule` call 
 The browser runtime (`@k2b/sync/browser`) has the **same public API** but:
 
 - All state is in-memory (no Redis). Survives within a page/tab; resets on reload unless you pass a `store?: Store`.
-- `scheduler`/`mutex`/`ratelimit`/`topic` optionally accept `store?: Store` for `createLocalStorageStore()` persistence.
+- `scheduler`/`mutex`/`ratelimit`/`topic`/`pump` optionally accept `store?: Store` for `createLocalStorageStore()` persistence.
 - Leader election (scheduler mutex) trivially succeeds in a single tab.
 - Multiple instances with the same id in the same tab share state via module-level maps.
 

@@ -46,6 +46,20 @@ export {
   type SubmitConfig,
 } from "./src/job";
 export {
+  pump,
+  type PumpItem,
+  type PumpStatus,
+  type PumpState,
+  type PumpPullContext,
+  type PumpDispatchContext,
+  type PumpPullResult,
+  type PumpRetryConfig,
+  type PumpTraceEvent,
+  type PumpConfig,
+  type PumpStartConfig,
+  type PumpHandle,
+} from "./src/pump";
+export {
   scheduler,
   type Scheduler,
   type SchedulerConfig,

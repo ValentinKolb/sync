@@ -119,7 +119,7 @@ jobs:
           {
             "name": "@k2b/sync",
             "version": "$VERSION",
-            "description": "Distributed sync primitives for TypeScript and Bun — ratelimit, mutex, queue, topic, job, scheduler, ephemeral, retry",
+            "description": "Distributed sync primitives for TypeScript and Bun — ratelimit, mutex, queue, topic, job, pump, scheduler, ephemeral, retry",
             "main": "index.js",
             "module": "index.js",
             "types": "index.d.ts",
@@ -134,7 +134,7 @@ jobs:
                 "types": "./browser/index.d.ts"
               }
             },
-            "keywords": ["bun", "redis", "valkey", "ratelimit", "mutex", "jobs", "queue", "topic", "scheduler", "ephemeral", "distributed"],
+            "keywords": ["bun", "redis", "valkey", "ratelimit", "mutex", "jobs", "queue", "topic", "pump", "scheduler", "ephemeral", "distributed"],
             "author": "Valentin Kolb",
             "license": "MIT",
             "repository": {

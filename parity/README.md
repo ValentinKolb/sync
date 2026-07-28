@@ -36,6 +36,7 @@ Types that currently have additive fields:
 - `EphemeralConfig` *(not currently — check code)*
 - `SchedulerConfig`
 - `RateLimitConfig`
+- `PumpConfig`
 
 ## Behavior parity
 
@@ -50,6 +51,6 @@ Each shared module has a corresponding test file in both. When adding a new scen
 
 The key behavioral guarantee the lib provides:
 
-> If a worker (`job` or `scheduler`) crashes while `process` is running, another worker (on a different node / browser tab scope) picks up the message via queue lease expiry and re-runs `process`. `after` runs on the node that completed the run.
+> If a worker (`job`, `pump`, or `scheduler`) crashes while a callback is running, another worker can take over after lease expiry. Pump persists its active page and item checkpoint so takeover repeats at most the current dispatch instead of pulling the page again.
 
 This is covered by `packages/sync/tests/fault-*.test.ts` on the server and matching tests on the browser.
