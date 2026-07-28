@@ -132,6 +132,12 @@ type QueueState = {
 export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   type TData = T;
 
+  if (config.ordering?.mode === "ordering_key_partitioned") {
+    // Mirrors the server: the mode is declared but nothing implements it, so it
+    // is rejected rather than silently ignored.
+    throw new Error("ordering.mode 'ordering_key_partitioned' is not implemented; use 'best_effort'");
+  }
+
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
   const defaultLeaseMs = config.delivery?.defaultLeaseMs ?? DEFAULT_LEASE_MS;

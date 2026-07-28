@@ -609,3 +609,25 @@ test("messages written in the 5.8.0 record format are still delivered", async ()
   expect(again?.attempt).toBe(2);
   expect(await again?.ack()).toBe(true);
 });
+
+test("the unimplemented ordering mode is rejected instead of silently ignored", () => {
+  expect(() =>
+    queue({ id: "ordering-reject", prefix: "test:q", ordering: { mode: "ordering_key_partitioned" } }),
+  ).toThrow(/ordering_key_partitioned/);
+
+  // The implemented mode and a bare orderingKey stay accepted.
+  expect(() => queue({ id: "ordering-ok", prefix: "test:q", ordering: { mode: "best_effort" } })).not.toThrow();
+});
+
+test("recv records the consumerId on the delivery record", async () => {
+  const q = queue<{ v: number }>({ id: "consumer-id", prefix: "test:q" });
+
+  await q.send({ data: { v: 1 } });
+  const message = await q.recv({ wait: false, consumerId: "worker-7" });
+  expect(message).not.toBeNull();
+
+  const raw = await redis.send("HGET", ["test:q:default:consumer-id:deliveries", message!.deliveryId]);
+  expect(JSON.parse(raw as string).consumerId).toBe("worker-7");
+
+  expect(await message?.ack()).toBe(true);
+});

@@ -602,3 +602,10 @@ test("tenant isolation between queues", async () => {
   await msg1!.ack();
   await msg2!.ack();
 });
+
+test("the unimplemented ordering mode is rejected instead of silently ignored", () => {
+  expect(() => queue({ id: "ordering-reject", ordering: { mode: "ordering_key_partitioned" } })).toThrow(
+    /ordering_key_partitioned/,
+  );
+  expect(() => queue({ id: "ordering-ok", ordering: { mode: "best_effort" } })).not.toThrow();
+});

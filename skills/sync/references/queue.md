@@ -13,7 +13,7 @@ const q = queue<{ to: string; subject: string }>({
   // tenantId?: string,                      // default: "default"
   // delivery?: { defaultLeaseMs: 30_000, maxDeliveries: 10 },
   // limits?: { payloadBytes, maxMessageAgeMs, maxNackDelayMs, dlqRetentionMs },
-  // ordering?: { mode: "best_effort" | "ordering_key_partitioned", partitions: number },
+  // ordering?: { mode: "best_effort" },   // "ordering_key_partitioned" is not implemented and throws
 });
 ```
 
@@ -26,7 +26,7 @@ type QueueSendConfig<T> = {
   data: T;
   tenantId?: string;
   delayMs?: number;           // deliver after N ms
-  orderingKey?: string;       // FIFO per ordering key (when ordering mode is set)
+  orderingKey?: string;       // stored and delivered back; not an ordering guarantee (see Gotchas)
   idempotencyKey?: string;    // dedupe against this key
   idempotencyTtlMs?: number;
   meta?: Record<string, unknown>;
@@ -91,7 +91,7 @@ const msg2 = await reader.recv({ signal });
 - **DLQ**: after `maxDeliveries` failed attempts, message moves to DLQ. Retention via `dlqRetentionMs` (default 7d).
 - **`ack` / `nack` return bool**: `false` means lease expired before settle (message already redelivered to someone else). Your handler's work is in an ambiguous state — design for at-least-once.
 - **Idempotency key**: dedupes `send` within `idempotencyTtlMs`. Same key returns the same messageId without enqueuing a new message.
-- **`ordering_key_partitioned` mode**: messages with the same `orderingKey` deliver in order within their partition, at the cost of parallelism.
+- **Ordering**: only `best_effort` exists. `orderingKey` is stored and delivered back with the message, but nothing partitions or serialises by it, so concurrent consumers can reorder same-key messages. Constructing a queue with `ordering: { mode: "ordering_key_partitioned" }` throws rather than silently ignoring the guarantee.
 - **`tenantId`**: isolates queue state (separate namespace). Presence in config sets the default; can be overridden per-call.
 
 ## Redis keys (server)

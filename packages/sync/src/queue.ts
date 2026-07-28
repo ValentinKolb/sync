@@ -215,6 +215,7 @@ const CLAIM_SCRIPT = `
   local deliveryId = ARGV[1]
   local leaseUntil = tonumber(ARGV[2])
   local maxSkips = tonumber(ARGV[3])
+  local consumerId = ARGV[4]
 
   local messageId = nil
   local message = nil
@@ -245,7 +246,8 @@ const CLAIM_SCRIPT = `
   local delivery = {
     messageId = messageId,
     leaseUntil = leaseUntil,
-    attempt = message.attempt
+    attempt = message.attempt,
+    consumerId = consumerId ~= "" and consumerId or nil
   }
 
   redis.call("HSET", KEYS[2], deliveryId, cjson.encode(delivery))
@@ -510,6 +512,12 @@ const parseOpaque = <T>(json: string | undefined): T | undefined => {
 export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   type TData = T;
 
+  if (config.ordering?.mode === "ordering_key_partitioned") {
+    // Nothing in this module partitions or serialises by ordering key, so
+    // accepting the option would silently break the per-key order it promises.
+    throw new Error("ordering.mode 'ordering_key_partitioned' is not implemented; use 'best_effort'");
+  }
+
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
   const maxPayloadBytes = config.limits?.payloadBytes ?? DEFAULT_PAYLOAD_BYTES;
@@ -614,7 +622,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
           const claimRaw = await evalScript(
             CLAIM_SCRIPT,
             [keys.messages, keys.deliveries, keys.leases, keys.active, keys.ready],
-            [deliveryId, Date.now() + leaseMs, CLAIM_MAX_SKIPS],
+            [deliveryId, Date.now() + leaseMs, CLAIM_MAX_SKIPS, recvCfg.consumerId ?? ""],
           );
 
           let claimed: ClaimResult | null = null;
