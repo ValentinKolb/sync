@@ -197,3 +197,93 @@ test("worker.stop while process is running does not prevent the in-flight proces
 
   expect(completedNormally).toBe(true);
 });
+
+// ==========================
+// Idempotency claim lifecycle
+// ==========================
+
+test("a claim stranded by a crash before enqueue is re-enqueued, not silently dropped", async () => {
+  const id = uid("stranded-claim");
+  const runs: string[] = [];
+  const j = job<{ v: number }>({
+    id,
+    process: async ({ ctx }) => {
+      runs.push(ctx.key);
+    },
+  });
+
+  // Exactly the state a pod leaves behind when it dies after claimKey and
+  // before workQueue.send: a claim with no queue message, past the grace window.
+  const idemKey = `sync:job:${id}:idempotency:orders/1`;
+  await redis.send("SET", [
+    idemKey,
+    JSON.stringify({ jobId: "77", enqueued: false, claimedAt: Date.now() - 120_000 }),
+  ]);
+
+  const jobId = await j.submit({ key: "orders/1", input: { v: 1 } });
+  expect(jobId).toBe("77"); // the caller's original jobId stays valid
+
+  await waitFor(() => runs.length === 1);
+  expect(runs).toEqual(["orders/1"]);
+  j.stop();
+});
+
+test("a claim still inside the grace window is not enqueued twice", async () => {
+  const id = uid("grace-claim");
+  const j = job<{ v: number }>({ id, process: async () => {} });
+
+  const idemKey = `sync:job:${id}:idempotency:orders/2`;
+  await redis.send("SET", [idemKey, JSON.stringify({ jobId: "88", enqueued: false, claimedAt: Date.now() })]);
+
+  expect(await j.submit({ key: "orders/2", input: { v: 1 } })).toBe("88");
+  // Nothing was enqueued: a concurrent submit still owns that window.
+  expect(await redis.send("LLEN", [`sync:job:queue:default:${id}:work:ready`])).toBe(0);
+  j.stop();
+});
+
+test("a stale terminal release cannot delete a claim a later submit took over", async () => {
+  const id = uid("stale-release");
+  const j = job<{ v: number }>({ id, process: async () => {} });
+
+  const idemKey = `sync:job:${id}:idempotency:orders/3`;
+  await j.submit({ key: "orders/3", input: { v: 1 } });
+  await waitFor(async () => true);
+
+  // A later submit takes the key over under a different jobId.
+  await redis.send("SET", [idemKey, JSON.stringify({ jobId: "999", enqueued: true, claimedAt: Date.now() })]);
+
+  // The first job's terminal release must be a no-op against the new owner.
+  await waitFor(async () => true, 500);
+  const stillThere = await redis.send("GET", [idemKey]);
+  expect(stillThere).not.toBeNull();
+  expect(JSON.parse(stillThere as string).jobId).toBe("999");
+  j.stop();
+});
+
+test("a reschedule chain keeps the idempotency claim alive past keyTtlMs", async () => {
+  const id = uid("ttl-refresh");
+  const idemKey = `sync:job:${id}:idempotency:orders/4`;
+  // Whether the dedup claim was still held at the start of each attempt.
+  const claimHeld: boolean[] = [];
+
+  const j = job<{ v: number }>({
+    id,
+    defaults: { keyTtlMs: 1_000 },
+    process: async () => {
+      claimHeld.push((await redis.send("GET", [idemKey])) !== null);
+      throw new Error("retry me");
+    },
+    after: ({ ctx }) => {
+      if (ctx.error && ctx.failureCount < 6) ctx.reschedule({ delayMs: 500 });
+    },
+  });
+
+  await j.submit({ key: "orders/4", input: { v: 1 } });
+  // Four attempts at ~500ms apart span well past the 1s TTL.
+  await waitFor(() => claimHeld.length >= 4, 20_000);
+  j.stop();
+
+  // Without a refresh the claim expires mid-chain, and a fanout submit would
+  // then enqueue a second concurrent job for the same key.
+  expect(claimHeld.slice(0, 4)).toEqual([true, true, true, true]);
+});

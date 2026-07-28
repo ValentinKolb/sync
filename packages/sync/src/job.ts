@@ -9,22 +9,84 @@ const DEFAULT_LEASE_MS = 30_000;
 const DEFAULT_WORKER_RECV_TIMEOUT_MS = 1_000;
 const DEFAULT_KEY_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_KEY_TTL_MS = 30 * DAY_MS;
+// How long a claim may stay unenqueued before a later submit re-enqueues it.
+// Generous relative to the single `queue.send` it covers, and far below any TTL.
+const ENQUEUE_GRACE_MS = 30_000;
 
-// Claim idempotency key atomically. Returns { jobId, isNew }.
-// If key already exists, returns the existing jobId and isNew=0.
+// Claim the idempotency key atomically. Returns { jobId, isNew }.
+//
+// The stored value records whether the work message actually reached the queue.
+// A pod that died between claiming the key and enqueuing used to strand the key
+// with no message behind it: every later submit returned that orphaned jobId and
+// enqueued nothing, for up to keyTtlMs. A claim that is still unenqueued past
+// the grace window is therefore handed back as new so the caller re-enqueues it,
+// keeping the original jobId valid.
+//
+// Values written by <= 5.8.0 are the bare jobId; those are treated as enqueued.
 const CLAIM_KEY_SCRIPT = `
   local idemKey = KEYS[1]
   local seqKey = KEYS[2]
   local ttlMs = tonumber(ARGV[1])
+  local now = tonumber(ARGV[2])
+  local graceMs = tonumber(ARGV[3])
 
   local existing = redis.call("GET", idemKey)
   if existing then
-    return { existing, 0 }
+    local ok, record = pcall(cjson.decode, existing)
+    if not ok or type(record) ~= "table" or not record.jobId then
+      return { existing, 0 }
+    end
+    if record.enqueued then
+      return { record.jobId, 0 }
+    end
+    if (now - (tonumber(record.claimedAt) or 0)) <= graceMs then
+      -- A concurrent submit is still mid-flight; do not enqueue a second time.
+      return { record.jobId, 0 }
+    end
+    record.claimedAt = now
+    redis.call("SET", idemKey, cjson.encode(record), "PX", tostring(ttlMs))
+    return { record.jobId, 1 }
   end
 
-  local nextId = redis.call("INCR", seqKey)
-  redis.call("SET", idemKey, tostring(nextId), "PX", tostring(ttlMs))
-  return { tostring(nextId), 1 }
+  local nextId = tostring(redis.call("INCR", seqKey))
+  redis.call("SET", idemKey, cjson.encode({ jobId = nextId, enqueued = false, claimedAt = now }), "PX", tostring(ttlMs))
+  return { nextId, 1 }
+`;
+
+// Mark the claim as backed by a real queue message, and refresh its TTL.
+const MARK_ENQUEUED_SCRIPT = `
+  local existing = redis.call("GET", KEYS[1])
+  if not existing then return 0 end
+  local ok, record = pcall(cjson.decode, existing)
+  if not ok or type(record) ~= "table" or record.jobId ~= ARGV[1] then return 0 end
+  record.enqueued = true
+  redis.call("SET", KEYS[1], cjson.encode(record), "PX", tostring(ARGV[2]))
+  return 1
+`;
+
+// Release only our own claim. An unconditional DEL let a slow job's terminal
+// release delete the claim a later submit had already taken over.
+const RELEASE_KEY_SCRIPT = `
+  local existing = redis.call("GET", KEYS[1])
+  if not existing then return 0 end
+  local ok, record = pcall(cjson.decode, existing)
+  if ok and type(record) == "table" and record.jobId then
+    if record.jobId ~= ARGV[1] then return 0 end
+  elseif existing ~= ARGV[1] then
+    return 0
+  end
+  redis.call("DEL", KEYS[1])
+  return 1
+`;
+
+// Keep a claim alive while its job is still running or waiting to retry.
+const REFRESH_KEY_SCRIPT = `
+  local existing = redis.call("GET", KEYS[1])
+  if not existing then return 0 end
+  local ok, record = pcall(cjson.decode, existing)
+  if ok and type(record) == "table" and record.jobId and record.jobId ~= ARGV[1] then return 0 end
+  redis.call("PEXPIRE", KEYS[1], tostring(ARGV[2]))
+  return 1
 `;
 
 // ==========================
@@ -147,12 +209,27 @@ export const job = <Input = void, Result = unknown>(
     reschedules: 0,
   };
 
-  const releaseKey = async (key: string): Promise<void> => {
+  const evalKeyScript = async (script: string, key: string, args: string[]): Promise<unknown> =>
+    await redis.send("EVAL", [script, "1", idempotencyKey(key), ...args]);
+
+  const releaseKey = async (key: string, jobId: JobId): Promise<void> => {
     try {
-      await redis.del(idempotencyKey(key));
+      await evalKeyScript(RELEASE_KEY_SCRIPT, key, [jobId]);
     } catch {
       // best effort — if release fails, TTL will reclaim eventually
     }
+  };
+
+  const refreshKey = async (key: string, jobId: JobId, keyTtlMs: number): Promise<void> => {
+    try {
+      await evalKeyScript(REFRESH_KEY_SCRIPT, key, [jobId, String(keyTtlMs)]);
+    } catch {
+      // best effort — a missed refresh only shortens the dedup window
+    }
+  };
+
+  const markEnqueued = async (key: string, jobId: JobId, keyTtlMs: number): Promise<void> => {
+    await evalKeyScript(MARK_ENQUEUED_SCRIPT, key, [jobId, String(keyTtlMs)]);
   };
 
   const claimKey = async (key: string, keyTtlMs: number): Promise<{ jobId: JobId; isNew: boolean }> => {
@@ -162,6 +239,8 @@ export const job = <Input = void, Result = unknown>(
       idempotencyKey(key),
       keys.seq,
       String(keyTtlMs),
+      String(Date.now()),
+      String(ENQUEUE_GRACE_MS),
     ]);
     const arr = result as [string, number];
     return { jobId: String(arr[0]), isNew: Number(arr[1]) === 1 };
@@ -208,6 +287,8 @@ export const job = <Input = void, Result = unknown>(
                 signal: jobAc.signal,
                 heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
                   await message.touch({ leaseMs: cfg?.leaseMs ?? payload.leaseMs });
+                  // A job that outlives keyTtlMs must not lose its dedup claim.
+                  await refreshKey(payload.key, payload.jobId, payload.keyTtlMs);
                 },
               } as JobCtx<Input>;
               Object.defineProperty(ctx, "duration", {
@@ -218,6 +299,10 @@ export const job = <Input = void, Result = unknown>(
             };
 
             const ctx = makeCtx();
+            // Every delivery renews the claim: while queued work exists for this
+            // key, the key that dedups it must exist too.
+            await refreshKey(payload.key, payload.jobId, payload.keyTtlMs);
+
             const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
 
             await emitTrace(config.trace, {
@@ -283,11 +368,15 @@ export const job = <Input = void, Result = unknown>(
                 reason: "reschedule",
                 error: error?.message,
               });
-              metrics.reschedules += 1;
               if (!nacked) {
                 // Lease expired; message will be redelivered. Key stays claimed.
                 continue;
               }
+              metrics.reschedules += 1;
+              // Hold the claim across the scheduled delay as well as the TTL, so
+              // a backoff chain longer than keyTtlMs cannot lose its dedup claim
+              // and let a fanout submit enqueue a second job for the same key.
+              await refreshKey(payload.key, payload.jobId, Math.min(MAX_KEY_TTL_MS, delayMs + payload.keyTtlMs));
               await emitTrace(config.trace, {
                 type: "rescheduled",
                 jobId: payload.jobId,
@@ -304,7 +393,7 @@ export const job = <Input = void, Result = unknown>(
               // Lease expired; message will be redelivered. Key stays claimed.
               continue;
             }
-            await releaseKey(payload.key);
+            await releaseKey(payload.key, payload.jobId);
 
             if (error) {
               metrics.failures += 1;
@@ -362,9 +451,13 @@ export const job = <Input = void, Result = unknown>(
       });
     } catch (error) {
       // Enqueue failed after claiming key — release the key so resubmit works.
-      await releaseKey(cfg.key);
+      await releaseKey(cfg.key, jobId);
       throw error;
     }
+
+    // Only now is the claim genuinely backed by queued work. A crash before
+    // this point leaves the claim unenqueued, and a later submit re-enqueues it.
+    await markEnqueued(cfg.key, jobId, keyTtlMs);
 
     const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
     await emitTrace(config.trace, {
