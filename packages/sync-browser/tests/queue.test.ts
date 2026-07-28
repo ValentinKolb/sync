@@ -625,3 +625,62 @@ test("dlq entries are readable and drainable", async () => {
   expect(await q.dlqRemove({ messageId: entries[0]!.messageId })).toBe(true);
   expect((await q.dlq()).length).toBe(0);
 });
+
+test("touch defaults to this delivery's lease, not the queue default", async () => {
+  const q = queue<{ v: number }>({
+    id: `touch-lease-${Date.now()}`,
+    delivery: { defaultLeaseMs: 30_000 },
+  });
+
+  await q.send({ data: { v: 1 } });
+  const message = await q.recv({ wait: false, leaseMs: 150 });
+  expect(message).not.toBeNull();
+
+  // Extending by the delivery lease (150ms) must NOT hold it for 30s.
+  expect(await message?.touch()).toBe(true);
+  await Bun.sleep(1_300);
+
+  const redelivered = await q.recv({ wait: false });
+  expect(redelivered).not.toBeNull();
+  expect(redelivered?.messageId).toBe(message?.messageId);
+  expect(redelivered?.attempt).toBe(2);
+});
+
+test("a non-waiting recv forces maintenance instead of waiting out the interval", async () => {
+  const q = queue<{ v: number }>({ id: `force-maint-${Date.now()}` });
+
+  await q.send({ data: { v: 1 } });
+  expect(await q.recv({ wait: false })).not.toBeNull(); // stamps lastMaintenance
+
+  await q.send({ data: { v: 2 }, delayMs: 30 });
+  await Bun.sleep(60);
+
+  // Well inside the 1s maintenance interval: the server promotes this, so the
+  // browser must too rather than reporting a phantom empty queue.
+  const promoted = await q.recv({ wait: false });
+  expect(promoted).not.toBeNull();
+  expect(promoted?.data).toEqual({ v: 2 });
+});
+
+test("payload limit measures the whole envelope, as the server does", async () => {
+  const q = queue<{ v: string }>({ id: `payload-envelope-${Date.now()}`, limits: { payloadBytes: 200 } });
+
+  await expect(
+    q.send({ data: { v: "x".repeat(40) }, meta: { note: "y".repeat(200) } }),
+  ).rejects.toThrow(/payload exceeds limit/);
+});
+
+test("nack and dlq reason strings match the server", async () => {
+  const q = queue<{ v: number }>({
+    id: `strings-${Date.now()}`,
+    delivery: { maxDeliveries: 1 },
+    limits: { maxNackDelayMs: 20 },
+  });
+
+  await q.send({ data: { v: 1 } });
+  const message = await q.recv({ wait: false });
+  await expect(message!.nack({ delayMs: 25 })).rejects.toThrow("delayMs exceeds maxNackDelayMs (20)");
+
+  expect(await message?.nack()).toBe(true);
+  expect((await q.dlq())[0]?.reason).toBe("max_deliveries_exceeded");
+});

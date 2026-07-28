@@ -190,11 +190,13 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   // Maintenance
   // ==========================
 
-  const runMaintenance = (state: QueueState): void => {
+  const runMaintenance = (state: QueueState, force = false): void => {
     const now = Date.now();
 
-    // Rate-limit maintenance
-    if (now - state.lastMaintenance < DEFAULT_MAINTENANCE_INTERVAL_MS) return;
+    // Rate-limit maintenance unless forced. A non-waiting recv forces it, as on
+    // the server, so a polling consumer never sees a phantom empty queue after a
+    // delayed send or a lease expiry.
+    if (!force && now - state.lastMaintenance < DEFAULT_MAINTENANCE_INTERVAL_MS) return;
     state.lastMaintenance = now;
 
     // Promote delayed messages
@@ -224,7 +226,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
           const msg = state.messages.get(delivery.messageId);
           if (msg) {
             if (msg.attempt >= maxDeliveries) {
-              moveToDlq(state, delivery.messageId, msg, "max_deliveries");
+              moveToDlq(state, delivery.messageId, msg, "max_deliveries_exceeded");
             } else {
               state.ready.push(delivery.messageId);
               state.emitter.emit();
@@ -277,7 +279,16 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     const tenantId = resolveTenant(sendCfg.tenantId);
     const state = getState(tenantId);
 
-    const payloadRaw = JSON.stringify(sendCfg.data);
+    // Measure the whole envelope, not just `data`: the server rejects on the
+    // envelope, so measuring less here let a message through that the server
+    // would refuse.
+    const payloadRaw = JSON.stringify({
+      data: sendCfg.data,
+      attempt: 0,
+      orderingKey: sendCfg.orderingKey,
+      meta: sendCfg.meta,
+      enqueuedAt: Date.now(),
+    });
     const payloadBytes = textEncoder.encode(payloadRaw).byteLength;
     if (payloadBytes > maxPayloadBytes) {
       throw new Error(`payload exceeds limit (${maxPayloadBytes} bytes)`);
@@ -332,7 +343,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
       const timeoutMs = recvCfg.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
       const leaseMs = recvCfg.leaseMs ?? defaultLeaseMs;
 
-      runMaintenance(state);
+      runMaintenance(state, !wait);
 
       // Try to claim a message
       const claimed = claimNext(state, leaseMs);
@@ -363,6 +374,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     };
 
     const claimNext = (state: QueueState, leaseMs: number): QueueReceived<TData> | null => {
+      // `leaseMs` is this delivery's resolved lease and is what touch() extends by.
       // FIFO: take first from ready
       while (state.ready.length > 0) {
         const messageId = state.ready.shift()!;
@@ -390,7 +402,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
         state.deliveries.set(deliveryId, delivery);
         state.leases.set(deliveryId, leaseUntil);
 
-        return buildReceived(state, messageId, deliveryId, msg, delivery);
+        return buildReceived(state, messageId, deliveryId, msg, delivery, leaseMs);
       }
       return null;
     };
@@ -401,6 +413,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
       deliveryId: string,
       msg: StoredMessage,
       delivery: DeliveryMeta,
+      deliveryLeaseMs: number,
     ): QueueReceived<TData> | null => {
       let settled = false;
 
@@ -421,7 +434,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
         // Validate BEFORE settling to avoid orphaning the message
         const delayMs = cfg?.delayMs ?? 0;
         if (delayMs > maxNackDelayMs) {
-          throw new Error(`nack delayMs (${delayMs}) exceeds maxNackDelayMs (${maxNackDelayMs})`);
+          throw new Error(`delayMs exceeds maxNackDelayMs (${maxNackDelayMs})`);
         }
 
         settled = true;
@@ -429,7 +442,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
         state.leases.delete(deliveryId);
 
         if (msg.attempt >= maxDeliveries) {
-          moveToDlq(state, messageId, msg, cfg?.reason ?? "max_deliveries", cfg?.error);
+          moveToDlq(state, messageId, msg, cfg?.reason ?? "max_deliveries_exceeded", cfg?.error);
           return true;
         }
 
@@ -446,7 +459,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
       const touch = async (cfg?: { leaseMs?: number }): Promise<boolean> => {
         if (settled) return false;
         if (!state.deliveries.has(deliveryId)) return false;
-        const newLeaseMs = cfg?.leaseMs ?? defaultLeaseMs;
+        const newLeaseMs = cfg?.leaseMs ?? deliveryLeaseMs;
         const newLeaseUntil = Date.now() + newLeaseMs;
         delivery.leaseUntil = newLeaseUntil;
         state.leases.set(deliveryId, newLeaseUntil);
