@@ -392,3 +392,92 @@ test("rapid lease expiry cycle — message survives multiple lease expirations",
   expect(msg!.attempt).toBe(4);
   await msg!.ack();
 });
+
+// ==========================
+// Crash between dequeue and claim
+// ==========================
+
+test("a message orphaned between dequeue and claim is recovered, not lost", async () => {
+  const id = uid("orphan-recovery");
+  const q = queue<{ v: number }>({ id, prefix: "test:fq" });
+  const base = `test:fq:default:${id}`;
+
+  const { messageId } = await q.send({ data: { v: 1 } });
+
+  // Exactly what a <= 5.8.0 consumer left behind when it died after its
+  // LMOVE and before its claim: parked in `active` with no delivery, no lease.
+  const popped = await redis.send("LMOVE", [`${base}:ready`, `${base}:active`, "RIGHT", "LEFT"]);
+  expect(popped).toBe(messageId);
+  expect(await redis.send("HLEN", [`${base}:deliveries`])).toBe(0);
+  expect(await redis.send("LLEN", [`${base}:ready`])).toBe(0);
+
+  const recovered = await q.recv({ wait: false });
+  expect(recovered).not.toBeNull();
+  expect(recovered?.messageId).toBe(messageId);
+  expect(recovered?.data).toEqual({ v: 1 });
+  expect(await recovered?.ack()).toBe(true);
+
+  expect(await redis.send("LLEN", [`${base}:active`])).toBe(0);
+});
+
+test("the reaper leaves genuinely in-flight deliveries alone", async () => {
+  const id = uid("orphan-negative");
+  const q = queue<{ v: number }>({ id, prefix: "test:fq" });
+  const base = `test:fq:default:${id}`;
+
+  await q.send({ data: { v: 1 } });
+  const held = await q.recv({ wait: false, leaseMs: 60_000 });
+  expect(held).not.toBeNull();
+  expect(await redis.send("LLEN", [`${base}:active`])).toBe(1);
+
+  // Force several maintenance passes while the delivery is legitimately held.
+  const other = q.reader();
+  expect(await other.recv({ wait: false })).toBeNull();
+  expect(await other.recv({ wait: false })).toBeNull();
+
+  // Still owned by the original consumer, never requeued behind its back.
+  expect(await redis.send("LLEN", [`${base}:ready`])).toBe(0);
+  expect(await held?.ack()).toBe(true);
+});
+
+// ==========================
+// Maintenance while a consumer is parked
+// ==========================
+
+test("a parked blocking recv still sees a delayed message become due", async () => {
+  const id = uid("parked-delayed");
+  const q = queue<{ v: number }>({ id, prefix: "test:fq" });
+
+  await q.send({ data: { v: 7 }, delayMs: 300 });
+
+  const startedAt = Date.now();
+  const message = await q.recv({ wait: true, timeoutMs: 10_000 });
+  const elapsedMs = Date.now() - startedAt;
+
+  expect(message).not.toBeNull();
+  expect(message?.data).toEqual({ v: 7 });
+  // Maintenance runs on its own cadence while parked, so this must not wait out
+  // the recv timeout.
+  expect(elapsedMs).toBeLessThan(3_000);
+  expect(await message?.ack()).toBe(true);
+});
+
+test("a parked blocking recv still recovers an expired lease", async () => {
+  const id = uid("parked-lease");
+  const q = queue<{ v: number }>({ id, prefix: "test:fq" });
+
+  await q.send({ data: { v: 9 } });
+  const first = await q.recv({ wait: false, leaseMs: 200 });
+  expect(first).not.toBeNull();
+
+  // A second reader parks before the lease expires.
+  const startedAt = Date.now();
+  const redelivered = await q.reader().recv({ wait: true, timeoutMs: 10_000 });
+  const elapsedMs = Date.now() - startedAt;
+
+  expect(redelivered).not.toBeNull();
+  expect(redelivered?.messageId).toBe(first?.messageId);
+  expect(redelivered?.attempt).toBe(2);
+  expect(elapsedMs).toBeLessThan(3_000);
+  expect(await redelivered?.ack()).toBe(true);
+});

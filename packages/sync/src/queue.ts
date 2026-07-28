@@ -1,4 +1,4 @@
-import { redis, RedisClient } from "bun";
+import { redis, RedisClient, sleep } from "bun";
 import { randomUUID } from "crypto";
 import { isRetryableTransportError, retry } from "./retry";
 
@@ -15,6 +15,12 @@ const DEFAULT_IDEMPOTENCY_TTL_MS = 7 * DAY_MS;
 const DEFAULT_PAYLOAD_BYTES = 128 * 1024;
 const MAINTENANCE_BATCH_SIZE = 200;
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 1_000;
+// Longest single block on the notify list. Bounding it keeps a parked consumer
+// running maintenance and re-checking the ready list roughly once a second, so
+// delayed sends and expired leases can no longer wait out a long recv timeout.
+const NOTIFY_BLOCK_MS = 1_000;
+// How many dead ids one claim may drain before giving up for this round.
+const CLAIM_MAX_SKIPS = 32;
 
 // Stored message records are envelopes whose user-controlled parts (`dataJson`,
 // `metaJson`) are opaque pre-serialized JSON strings. Lua may copy them but never
@@ -53,7 +59,19 @@ const LUA_MESSAGE_HELPERS = `
   end
 `;
 
+// Wake one parked consumer. The notify list is a wake-up signal only: it is
+// trimmed, it may lag the ready list, and every consumer re-checks by running
+// CLAIM_SCRIPT, so a lost or surplus token costs latency, never correctness.
+const LUA_NOTIFY_HELPER = `
+  local function notifyReady(notifyKey)
+    redis.call("LPUSH", notifyKey, "1")
+    redis.call("LTRIM", notifyKey, 0, 255)
+  end
+`;
+
 const SEND_SCRIPT = `
+  ${LUA_NOTIFY_HELPER}
+
   local now = tonumber(ARGV[1])
   local delayMs = tonumber(ARGV[2])
   local payload = ARGV[3]
@@ -74,6 +92,7 @@ const SEND_SCRIPT = `
     redis.call("ZADD", KEYS[4], tostring(now + delayMs), messageId)
   else
     redis.call("LPUSH", KEYS[3], messageId)
+    notifyReady(KEYS[5])
   end
 
   if idemKey ~= "" then
@@ -85,6 +104,7 @@ const SEND_SCRIPT = `
 
 const MAINTENANCE_SCRIPT = `
   ${LUA_MESSAGE_HELPERS}
+  ${LUA_NOTIFY_HELPER}
 
   local now = tonumber(ARGV[1])
   local maxDeliveries = tonumber(ARGV[2])
@@ -113,6 +133,7 @@ const MAINTENANCE_SCRIPT = `
             toDlq(messageId, message, "expired")
           else
             redis.call("LPUSH", KEYS[1], messageId)
+            notifyReady(KEYS[8])
           end
         else
           redis.call("HDEL", KEYS[5], messageId)
@@ -144,6 +165,7 @@ const MAINTENANCE_SCRIPT = `
               toDlq(messageId, message, "max_deliveries_exceeded")
             else
               redis.call("LPUSH", KEYS[1], messageId)
+              notifyReady(KEYS[8])
             end
           else
             redis.call("HDEL", KEYS[5], messageId)
@@ -153,28 +175,69 @@ const MAINTENANCE_SCRIPT = `
     end
   end
 
+  -- Reap orphans: ids parked in the active list with no delivery record. The
+  -- atomic claim cannot create these, but a <= 5.8.0 consumer that died between
+  -- its LMOVE and its claim did, and such a message is otherwise unreachable
+  -- forever. Both scans are bounded: the active list holds one entry per
+  -- in-flight delivery, and the batch caps the slice examined per pass.
+  local activeIds = redis.call("LRANGE", KEYS[6], 0, batch - 1)
+  if #activeIds > 0 then
+    local claimed = {}
+    for _, deliveryRaw in ipairs(redis.call("HVALS", KEYS[4])) do
+      local ok, delivery = pcall(cjson.decode, deliveryRaw)
+      if ok and type(delivery) == "table" and delivery.messageId then
+        claimed[delivery.messageId] = true
+      end
+    end
+    for _, messageId in ipairs(activeIds) do
+      if not claimed[messageId] then
+        redis.call("LREM", KEYS[6], 1, messageId)
+        if redis.call("HEXISTS", KEYS[5], messageId) == 1 then
+          redis.call("LPUSH", KEYS[1], messageId)
+          notifyReady(KEYS[8])
+        end
+      end
+    end
+  end
+
   return 1
 `;
 
+// Moving ready -> active and creating the delivery record must be one atomic
+// step. When they were two round-trips, a consumer that died in between left the
+// id parked in the active list with no delivery and no lease, where nothing ever
+// looked for it again: the message was lost permanently. Blocking consumers now
+// wait on a notify list purely as a wake-up signal and always claim through this
+// script.
 const CLAIM_SCRIPT = `
   ${LUA_MESSAGE_HELPERS}
 
-  local messageId = ARGV[1]
-  local deliveryId = ARGV[2]
-  local leaseUntil = tonumber(ARGV[3])
+  local deliveryId = ARGV[1]
+  local leaseUntil = tonumber(ARGV[2])
+  local maxSkips = tonumber(ARGV[3])
 
-  local messageRaw = redis.call("HGET", KEYS[1], messageId)
-  if not messageRaw then
-    redis.call("LREM", KEYS[4], 1, messageId)
-    return nil
+  local messageId = nil
+  local message = nil
+
+  for _ = 1, maxSkips do
+    local candidate = redis.call("RPOPLPUSH", KEYS[5], KEYS[4])
+    if not candidate then return nil end
+
+    local messageRaw = redis.call("HGET", KEYS[1], candidate)
+    if messageRaw then
+      local parsed = readMessage(messageRaw)
+      if parsed then
+        messageId = candidate
+        message = parsed
+        break
+      end
+      redis.call("HDEL", KEYS[1], candidate)
+    end
+    -- Dead id: drop it from active and keep draining.
+    redis.call("LREM", KEYS[4], 1, candidate)
   end
 
-  local message = readMessage(messageRaw)
-  if not message then
-    redis.call("LREM", KEYS[4], 1, messageId)
-    redis.call("HDEL", KEYS[1], messageId)
-    return nil
-  end
+  if not messageId then return nil end
 
   message.attempt = (tonumber(message.attempt) or 0) + 1
   redis.call("HSET", KEYS[1], messageId, cjson.encode(message))
@@ -225,6 +288,7 @@ const ACK_SCRIPT = `
 
 const NACK_SCRIPT = `
   ${LUA_MESSAGE_HELPERS}
+  ${LUA_NOTIFY_HELPER}
 
   local deliveryId = ARGV[1]
   local now = tonumber(ARGV[2])
@@ -282,6 +346,7 @@ const NACK_SCRIPT = `
     redis.call("ZADD", KEYS[6], tostring(now + delayMs), messageId)
   else
     redis.call("LPUSH", KEYS[5], messageId)
+    notifyReady(KEYS[8])
   end
 
   return 1
@@ -335,6 +400,7 @@ const evalScript = async (script: string, keys: string[], args: Array<string | n
 type QueueKeys = {
   seq: string;
   ready: string;
+  notify: string;
   delayed: string;
   leases: string;
   deliveries: string;
@@ -460,6 +526,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     return {
       seq: `${base}:seq`,
       ready: `${base}:ready`,
+      notify: `${base}:notify`,
       delayed: `${base}:delayed`,
       leases: `${base}:leases`,
       deliveries: `${base}:deliveries`,
@@ -475,7 +542,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   const runMaintenance = async (keys: QueueKeys, now: number): Promise<void> => {
     await evalScript(
       MAINTENANCE_SCRIPT,
-      [keys.ready, keys.delayed, keys.leases, keys.deliveries, keys.messages, keys.active, keys.dlq],
+      [keys.ready, keys.delayed, keys.leases, keys.deliveries, keys.messages, keys.active, keys.dlq, keys.notify],
       [now, maxDeliveries, maxMessageAgeMs, MAINTENANCE_BATCH_SIZE, dlqRetentionMs],
     );
   };
@@ -501,103 +568,71 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     const ensureBlockingClient = async (): Promise<RedisClient> => {
       if (blockingClient?.connected) return blockingClient;
       resetBlockingClient();
-      blockingClient = new RedisClient();
-      await blockingClient.connect();
-      return blockingClient;
+      const client = new RedisClient();
+      blockingClient = client;
+      await client.connect();
+      // Return the local handle: a concurrent reset may already have cleared the
+      // slot while this connect was in flight.
+      return client;
     };
 
-    const popMessageId = async (
-      keys: QueueKeys,
-      cfg: Required<Pick<QueueRecvConfig, "wait" | "timeoutMs">> & Pick<QueueRecvConfig, "signal">,
-    ): Promise<string | null> => {
-      if (!cfg.wait) {
-        const popped = await redis.send("LMOVE", [keys.ready, keys.active, "RIGHT", "LEFT"]);
-        return typeof popped === "string" ? popped : null;
-      }
-
-      const timeoutSecs = Math.max(1, Math.ceil(cfg.timeoutMs / 1000));
-
-      if (cfg.signal) {
-        if (cfg.signal.aborted) return null;
-
-        const client = new RedisClient();
-        const onAbort = (): void => {
-          safeClose(client);
-        };
-        cfg.signal.addEventListener("abort", onAbort, { once: true });
-
-        try {
-          if (!client.connected) await client.connect();
-          const popped = await client.send("BLMOVE", [keys.ready, keys.active, "RIGHT", "LEFT", timeoutSecs.toString()]);
-          return typeof popped === "string" ? popped : null;
-        } catch (error) {
-          if (cfg.signal.aborted) return null;
-          throw asError(error);
-        } finally {
-          cfg.signal.removeEventListener("abort", onAbort);
-          safeClose(client);
-        }
-      }
-
+    // Block until someone signals that the ready list may be non-empty. The
+    // result is deliberately discarded — the caller re-checks by claiming.
+    const awaitNotification = async (keys: QueueKeys, waitMs: number): Promise<void> => {
+      const timeoutSecs = Math.max(0.001, waitMs / 1000).toFixed(3);
       try {
         const client = await ensureBlockingClient();
-        const popped = await client.send("BLMOVE", [keys.ready, keys.active, "RIGHT", "LEFT", timeoutSecs.toString()]);
-        return typeof popped === "string" ? popped : null;
-      } catch (error) {
+        await client.send("BRPOP", [keys.notify, timeoutSecs]);
+      } catch {
+        // A broken blocking connection must not spin: drop it, pause briefly and
+        // let the next claim surface a genuine Redis outage.
         resetBlockingClient();
-        throw asError(error);
+        await sleep(25);
       }
     };
 
     const recv = async (recvCfg: QueueRecvConfig = {}): Promise<QueueReceived<TData> | null> => {
       const tenantId = resolveTenant(recvCfg.tenantId);
       const keys = keysForTenant(tenantId);
-      const ts = Date.now();
       const wait = recvCfg.wait ?? true;
-
-      await maybeRunMaintenance(tenantId, keys, ts, !wait);
-
-
       const timeoutMs = recvCfg.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
       const leaseMs = recvCfg.leaseMs ?? defaultLeaseMs;
+      const deadline = Date.now() + timeoutMs;
 
-      for (let i = 0; i < 4; i++) {
-        if (recvCfg.signal?.aborted) return null;
+      const onAbort = (): void => {
+        resetBlockingClient();
+      };
+      recvCfg.signal?.addEventListener("abort", onAbort, { once: true });
 
-        let messageId: string | null = null;
-        try {
-          messageId = await popMessageId(keys, { wait, timeoutMs, signal: recvCfg.signal });
-        } catch (error) {
-          if (!wait) throw asError(error);
-          continue;
-        }
-        if (!messageId) return null;
+      try {
+        while (true) {
+          if (recvCfg.signal?.aborted) return null;
 
-        const deliveryId = randomUUID();
-        const leaseUntil = Date.now() + leaseMs;
+          await maybeRunMaintenance(tenantId, keys, Date.now(), !wait);
 
-        const claimRaw = await evalScript(
-          CLAIM_SCRIPT,
-          [keys.messages, keys.deliveries, keys.leases, keys.active],
-          [messageId, deliveryId, leaseUntil],
-        );
+          const deliveryId = randomUUID();
+          const claimRaw = await evalScript(
+            CLAIM_SCRIPT,
+            [keys.messages, keys.deliveries, keys.leases, keys.active, keys.ready],
+            [deliveryId, Date.now() + leaseMs, CLAIM_MAX_SKIPS],
+          );
 
-        if (typeof claimRaw !== "string") {
-          if (!wait) return null;
-          continue;
-        }
+          let claimed: ClaimResult | null = null;
+          if (typeof claimRaw === "string") {
+            try {
+              claimed = JSON.parse(claimRaw) as ClaimResult;
+            } catch {
+              claimed = null;
+            }
+          }
 
-        let claimed: ClaimResult | null = null;
-        try {
-          claimed = JSON.parse(claimRaw) as ClaimResult;
-        } catch {
-          claimed = null;
-        }
-
-        if (!claimed) {
-          if (!wait) return null;
-          continue;
-        }
+          if (!claimed) {
+            if (!wait) return null;
+            const remainingMs = deadline - Date.now();
+            if (remainingMs <= 0) return null;
+            await awaitNotification(keys, Math.min(NOTIFY_BLOCK_MS, remainingMs));
+            continue;
+          }
 
         const ack = async (): Promise<boolean> => {
           const result = await evalScript(
@@ -616,7 +651,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
 
           const result = await evalScript(
             NACK_SCRIPT,
-            [keys.deliveries, keys.leases, keys.messages, keys.active, keys.ready, keys.delayed, keys.dlq],
+            [keys.deliveries, keys.leases, keys.messages, keys.active, keys.ready, keys.delayed, keys.dlq, keys.notify],
             [
               claimed.deliveryId,
               Date.now(),
@@ -650,9 +685,10 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
           nack,
           touch,
         };
+        }
+      } finally {
+        recvCfg.signal?.removeEventListener("abort", onAbort);
       }
-
-      return null;
     };
 
     const stream = async function* (streamCfg: QueueRecvConfig = {}): AsyncIterable<QueueReceived<TData>> {
@@ -725,7 +761,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
 
     const result = await evalScript(
       SEND_SCRIPT,
-      [keys.seq, keys.messages, keys.ready, keys.delayed],
+      [keys.seq, keys.messages, keys.ready, keys.delayed, keys.notify],
       [now, delayMs, payload, idempotencyKey, idempotencyTtlMs],
     );
 
