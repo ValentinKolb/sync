@@ -188,6 +188,8 @@ try {
 
 `schedulerControl.runNow()` waits for a live scheduler instance to accept the request. It does not wait for the handler to finish and it does not serialize handler results or errors. Use `trace`, metrics, or app-owned audit storage for completion visibility.
 
+**A timeout does not cancel the request.** `SchedulerControlTimeoutError` means no instance accepted within `timeoutMs`; the request stays queued and may still be picked up. Retrying with a fresh `requestId` therefore risks a second execution — pass the *same* `requestId` to retry idempotently. If dispatch keeps failing, the request is reported as unavailable after a few attempts instead of being replayed indefinitely.
+
 ## Common pattern: cron + job fanout (batch item retry)
 
 When you need "every N minutes, process all dirty items; each item retries independently":

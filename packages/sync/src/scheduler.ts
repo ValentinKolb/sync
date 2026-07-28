@@ -19,6 +19,9 @@ const DEFAULT_LEASE_MS = 5_000;
 const DEFAULT_HEARTBEAT_MS = 500;
 const DEFAULT_TICK_MS = 500;
 const DEFAULT_BATCH_SIZE = 200;
+// How many times one manual-run request may be retried before it is reported as
+// failed instead of replayed indefinitely.
+const CONTROL_MAX_ATTEMPTS = 3;
 
 // Upsert: creates or updates the schedule record. Preserves runNumber always;
 // preserves nextRunAt/failureCount iff cron/tz unchanged.
@@ -674,13 +677,28 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
       await markSchedulerControlAccepted(prefix, request.requestId);
       const touchTimer = setInterval(() => {
-        void message.touch({ leaseMs: controlLeaseMs });
+        // Without the catch a transient Redis error here becomes an unhandled
+        // rejection, which terminates the process under Bun and Node defaults.
+        void message.touch({ leaseMs: controlLeaseMs }).catch(() => {});
       }, Math.floor(controlLeaseMs / 3));
       try {
         await serializeDispatch(scheduleId, () => dispatchOne(schedule, handler, "manual"));
         await message.ack();
       } catch (error) {
-        await message.nack({ delayMs: 250, reason: "control-dispatch-error", error: asError(error).message });
+        // The control queue has effectively unlimited deliveries, so an
+        // unconditional nack replayed the user's callback every 250ms for the
+        // whole message-age window. Give up after a bounded number of attempts
+        // and report it, rather than storming.
+        if (message.attempt >= CONTROL_MAX_ATTEMPTS) {
+          await markSchedulerControlUnavailable(
+            prefix,
+            request.requestId,
+            `schedulerControl.runNow: dispatch failed after ${message.attempt} attempts: ${asError(error).message}`,
+          );
+          await message.ack();
+        } else {
+          await message.nack({ delayMs: 250, reason: "control-dispatch-error", error: asError(error).message });
+        }
       } finally {
         clearInterval(touchTimer);
       }

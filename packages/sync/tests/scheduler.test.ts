@@ -831,3 +831,42 @@ test("schedules written in the 5.8.0 record format keep their meta", async () =>
   expect(info?.meta).toEqual({ source: "5.8.0" });
   expect(info?.runNumber).toBe(4);
 });
+
+test("a repeatedly failing control dispatch is reported, not replayed forever", async () => {
+  const schedId = uid("control-storm");
+  const sched = scheduler({ id: schedId, prefix: "test:sched", dispatch: { tickMs: 50 } });
+  activeSchedulers.push(sched);
+
+  let runs = 0;
+  await sched.create({
+    id: "boom",
+    cron: "0 3 * * *", // never naturally due
+    process: async () => {
+      runs += 1;
+    },
+  });
+  sched.start();
+
+  // Corrupt the due ZSET so the terminal write inside dispatchOne fails on every
+  // attempt. The schedule record itself stays readable, so the control loop
+  // accepts the request and then fails while persisting.
+  const dueKey = `test:sched:${schedId}:due`;
+  await redis.send("DEL", [dueKey]);
+  await redis.send("SET", [dueKey, "corrupt"]);
+
+  const control = schedulerControl({ prefix: "test:sched" });
+  await control.runNow({ schedulerId: schedId, scheduleId: "boom", timeoutMs: 3_000 }).catch(() => {});
+
+  await Bun.sleep(2_500);
+  const settled = runs;
+  await Bun.sleep(2_000);
+
+  // The control queue allows effectively unlimited deliveries, so an
+  // unconditional nack replayed the user's callback about every 250ms for the
+  // full five-minute message-age window.
+  expect(settled).toBeGreaterThanOrEqual(1);
+  expect(settled).toBeLessThanOrEqual(3);
+  expect(runs).toBe(settled);
+
+  await redis.send("DEL", [dueKey]);
+}, 30_000);
