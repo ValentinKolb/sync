@@ -39,6 +39,16 @@ type PersistedState = {
   nextRunAt: number;
   failureCount: number;
   updatedAt: number;
+  /**
+   * The cron and tz this state belongs to. Without them, "persisted state
+   * exists" was read as "cron unchanged", so a schedule persisted under an old
+   * expression kept its old nextRunAt after the app shipped a new one — for up
+   * to a day — and carried a stale failureCount with it. Absent on records
+   * written by <= 5.8.0, which are then treated as belonging to a different
+   * expression and reset, matching the server.
+   */
+  cron?: string;
+  tz?: string;
 };
 
 export type SchedulerMetrics = {
@@ -102,9 +112,17 @@ export type SchedulerConfig = {
     tickMs?: number;
     batchSize?: number;
   };
-  /** Optional store to persist schedule state across tab reloads.
-   *  Default: MemoryStore (state lost on refresh).
-   *  Pass a localStorage-backed store to survive tab closes. */
+  /**
+   * Optional store to persist schedule state across tab reloads, and the store
+   * leader election coordinates through. Default: a MemoryStore shared by all
+   * handles with this id in this tab, so state is lost on refresh.
+   *
+   * Pass a localStorage-backed store to survive tab closes. Note that it buys
+   * durability, not cross-tab mutual exclusion: `mutex.acquire` is a
+   * check-then-set, which is atomic only because a tab is single-threaded, so
+   * two tabs racing the same localStorage lock can both win. Treat multi-tab
+   * dispatch as at-least-once.
+   */
   store?: Store;
 };
 
@@ -182,19 +200,22 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   }
   const schedules = sharedSchedules.get(schedulesKey)!;
 
-  // Shared mutex store so leader election coordinates across instances
+  // Leader election coordinates through the caller's store when one is given,
+  // so two handles sharing a store also share the lock. It used to always build
+  // its own MemoryStore, so handles sharing schedule state each held their own
+  // leader lock and both dispatched the same slot.
   const sharedMutexKey = `${prefix}:${config.id}:leader:store`;
   if (!sharedMutexStores.has(sharedMutexKey)) {
     sharedMutexStores.set(sharedMutexKey, createMemoryStore());
   }
-  const sharedMutexStore = sharedMutexStores.get(sharedMutexKey)!;
+  const leaderStore = config.store ?? sharedMutexStores.get(sharedMutexKey)!;
 
   const leaderMutex = mutex({
     id: `${config.id}:leader`,
     prefix: `${prefix}:leader`,
     defaultTtl: leaseMs,
     retryCount: 0,
-    store: sharedMutexStore,
+    store: leaderStore,
   });
 
   const persistedStateKey = (scheduleId: string): string =>
@@ -216,6 +237,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       nextRunAt,
       failureCount,
       updatedAt: Number(value.updatedAt) || Date.now(),
+      ...(typeof value.cron === "string" ? { cron: value.cron } : {}),
+      ...(typeof value.tz === "string" ? { tz: value.tz } : {}),
     };
   };
 
@@ -226,6 +249,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       nextRunAt: schedule.nextRunAt,
       failureCount: schedule.failureCount,
       updatedAt: schedule.updatedAt,
+      cron: schedule.cron,
+      tz: schedule.tz,
     };
     store.set(persistedStateKey(schedule.id), state);
   };
@@ -487,20 +512,14 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       stored.runNumber = persisted.runNumber;
     }
 
-    // Preserve nextRunAt/failureCount only if cron/tz unchanged
-    const cronUnchanged =
-      (existing && existing.cron === cfg.cron && existing.tz === tz) ||
-      (!existing && persisted !== null);
-
-    if (cronUnchanged) {
-      if (existing && existing.cron === cfg.cron && existing.tz === tz) {
-        stored.nextRunAt = existing.nextRunAt;
-        stored.failureCount = existing.failureCount;
-      } else if (persisted) {
-        // Resume from persisted state on tab reopen
-        stored.nextRunAt = persisted.nextRunAt <= nowMs ? firstRunAt : persisted.nextRunAt;
-        stored.failureCount = persisted.failureCount;
-      }
+    // Preserve nextRunAt/failureCount only if cron/tz are genuinely unchanged.
+    if (existing && existing.cron === cfg.cron && existing.tz === tz) {
+      stored.nextRunAt = existing.nextRunAt;
+      stored.failureCount = existing.failureCount;
+    } else if (!existing && persisted && persisted.cron === cfg.cron && persisted.tz === tz) {
+      // Resume from persisted state on tab reopen.
+      stored.nextRunAt = persisted.nextRunAt <= nowMs ? firstRunAt : persisted.nextRunAt;
+      stored.failureCount = persisted.failureCount;
     }
 
     const created = !existing;

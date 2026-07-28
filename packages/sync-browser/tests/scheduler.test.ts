@@ -1,5 +1,6 @@
 import { test, expect, afterEach } from "bun:test";
 import { scheduler, type Scheduler, type SchedulerTraceEvent } from "../src/scheduler";
+import { createMemoryStore } from "../src/store";
 import {
   SchedulerControlNotFoundError,
   SchedulerControlTimeoutError,
@@ -704,4 +705,127 @@ test("schedulerControl runNow waits for acceptance rather than returning immedia
 
   await schedulerControl({ prefix }).runNow({ schedulerId: s.id, scheduleId: "slow", timeoutMs: 5_000 });
   expect(accepted).toBe(true);
+});
+
+// ==========================
+// Persistence and leader election across handles
+// ==========================
+
+const seedPersistedState = async (
+  prefix: string,
+  schedulerId: string,
+  scheduleId: string,
+  state: Record<string, unknown>,
+): Promise<ReturnType<typeof createMemoryStore>> => {
+  const store = createMemoryStore();
+  store.set(`${prefix}:${schedulerId}:state:${scheduleId}`, state);
+  return store;
+};
+
+test("a persisted schedule does not resume a stale nextRunAt after the cron changes", async () => {
+  const prefix = uid("persist-cron");
+  const schedulerId = uid("persist-cron-id");
+  const stale = Date.now() + 20 * 60 * 60_000; // tomorrow 03:00-ish
+
+  // Exactly what a previous tab wrote while the app shipped "0 3 * * *".
+  const store = await seedPersistedState(prefix, schedulerId, "report", {
+    version: 1,
+    runNumber: 3,
+    nextRunAt: stale,
+    failureCount: 2,
+    updatedAt: Date.now(),
+    cron: "0 3 * * *",
+    tz: "UTC",
+  });
+
+  const s = scheduler({ id: schedulerId, prefix, store });
+  await s.create({ id: "report", cron: "*/5 * * * *", tz: "UTC", process: async () => {} });
+
+  const info = (await s.get({ id: "report" }))!;
+  // "State exists" used to be read as "cron unchanged", so the new expression
+  // did not take effect for up to a day and a stale failureCount carried over.
+  expect(info.nextRunAt).not.toBe(stale);
+  expect(info.nextRunAt - Date.now()).toBeLessThan(6 * 60_000);
+  expect(info.failureCount).toBe(0);
+});
+
+test("a persisted schedule does resume when the cron is unchanged", async () => {
+  const prefix = uid("persist-same");
+  const schedulerId = uid("persist-same-id");
+  const resumeAt = Date.now() + 20 * 60 * 60_000;
+
+  const store = await seedPersistedState(prefix, schedulerId, "report", {
+    version: 1,
+    runNumber: 3,
+    nextRunAt: resumeAt,
+    failureCount: 2,
+    updatedAt: Date.now(),
+    cron: "0 3 * * *",
+    tz: "UTC",
+  });
+
+  const s = scheduler({ id: schedulerId, prefix, store });
+  await s.create({ id: "report", cron: "0 3 * * *", tz: "UTC", process: async () => {} });
+
+  const info = (await s.get({ id: "report" }))!;
+  expect(info.nextRunAt).toBe(resumeAt);
+  expect(info.failureCount).toBe(2);
+});
+
+test("persisted state written by 5.8.0 is reset rather than resumed blindly", async () => {
+  const prefix = uid("persist-legacy");
+  const schedulerId = uid("persist-legacy-id");
+  const stale = Date.now() + 20 * 60 * 60_000;
+
+  // <= 5.8.0 recorded no cron/tz, so its cron cannot be verified.
+  const store = await seedPersistedState(prefix, schedulerId, "report", {
+    version: 1,
+    runNumber: 3,
+    nextRunAt: stale,
+    failureCount: 2,
+    updatedAt: Date.now(),
+  });
+
+  const s = scheduler({ id: schedulerId, prefix, store });
+  await s.create({ id: "report", cron: "*/5 * * * *", tz: "UTC", process: async () => {} });
+
+  const info = (await s.get({ id: "report" }))!;
+  expect(info.nextRunAt).not.toBe(stale);
+  expect(info.failureCount).toBe(0);
+});
+
+test("handles sharing a store share one leader lock", async () => {
+  const store = createMemoryStore();
+  const prefix = uid("leader-store");
+  const schedulerId = uid("leader-store-id");
+
+  const a = scheduler({ id: schedulerId, prefix, store, leader: { leaseMs: 5_000 } });
+  const b = scheduler({ id: schedulerId, prefix, store, leader: { leaseMs: 5_000 } });
+  activeSchedulers.push(a, b);
+
+  a.start();
+  b.start();
+  await waitFor(() => a.metric().isLeader || b.metric().isLeader);
+  await Bun.sleep(150);
+
+  // Leader election used to always build its own MemoryStore, so two handles
+  // sharing a store each held their own lock and both dispatched every slot.
+  expect([a.metric().isLeader, b.metric().isLeader].filter(Boolean).length).toBe(1);
+});
+
+test("handles with different explicit stores do not share a leader lock", async () => {
+  const prefix = uid("leader-split");
+  const schedulerId = uid("leader-split-id");
+
+  // An explicit Store scopes coordination to the handles sharing that Store.
+  const a = scheduler({ id: schedulerId, prefix, store: createMemoryStore(), leader: { leaseMs: 5_000 } });
+  const b = scheduler({ id: schedulerId, prefix, store: createMemoryStore(), leader: { leaseMs: 5_000 } });
+  activeSchedulers.push(a, b);
+
+  a.start();
+  b.start();
+  await waitFor(() => a.metric().isLeader && b.metric().isLeader);
+
+  expect(a.metric().isLeader).toBe(true);
+  expect(b.metric().isLeader).toBe(true);
 });
