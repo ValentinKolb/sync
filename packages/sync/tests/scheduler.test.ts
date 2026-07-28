@@ -783,3 +783,51 @@ test("schedulerControl runNow reports not found for missing schedules", async ()
     schedulerControl().runNow({ schedulerId: uid("missing-scheduler"), scheduleId: "missing", timeoutMs: 100 }),
   ).rejects.toBeInstanceOf(SchedulerControlNotFoundError);
 });
+
+test("schedule meta round-trips byte-equivalent JSON", async () => {
+  const sched = scheduler({ id: uid("meta-fidelity"), prefix: "test:sched" });
+  const meta = {
+    tags: [] as string[],
+    emptyObj: {},
+    unicode: "日本😀",
+    big: 9007199254740991,
+    nested: [[], {}] as unknown[],
+  };
+
+  await sched.create({ id: "s1", cron: "0 3 * * *", meta, process: async () => {} });
+  expect((await sched.get({ id: "s1" }))?.meta).toEqual(meta);
+
+  // An update re-runs the record through the upsert script a second time.
+  await sched.create({ id: "s1", cron: "0 4 * * *", meta, process: async () => {} });
+  const after = await sched.get({ id: "s1" });
+  expect(after?.meta).toEqual(meta);
+  expect(Array.isArray((after?.meta as { tags: unknown }).tags)).toBe(true);
+
+  const listed = (await sched.list()).find((s) => s.id === "s1");
+  expect(listed?.meta).toEqual(meta);
+});
+
+test("schedules written in the 5.8.0 record format keep their meta", async () => {
+  const id = uid("meta-legacy");
+  const sched = scheduler({ id, prefix: "test:sched" });
+
+  await redis.send("SET", [
+    `test:sched:${id}:schedule:legacy`,
+    JSON.stringify({
+      id: "legacy",
+      cron: "0 3 * * *",
+      tz: "UTC",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      nextRunAt: Date.now() + 60_000,
+      runNumber: 4,
+      failureCount: 0,
+      meta: { source: "5.8.0" },
+    }),
+  ]);
+  await redis.send("SADD", [`test:sched:${id}:index`, "legacy"]);
+
+  const info = await sched.get({ id: "legacy" });
+  expect(info?.meta).toEqual({ source: "5.8.0" });
+  expect(info?.runNumber).toBe(4);
+});

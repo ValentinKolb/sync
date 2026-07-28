@@ -100,7 +100,13 @@ type StoredSchedule = {
   runNumber: number;
   failureCount: number;
   lastError?: string;
-  meta?: Record<string, unknown>;
+  /**
+   * Caller `meta` as an opaque pre-serialized JSON string. Lua copies it and
+   * never decodes it: Redis' cjson turns an empty array into an empty object and
+   * loses precision past 14 significant digits. Records written by <= 5.8.0
+   * carry a decoded `meta` instead and are normalized on read.
+   */
+  metaJson?: string;
 };
 
 export type SchedulerMetrics = {
@@ -217,12 +223,23 @@ const parseSchedule = (raw: string | null): StoredSchedule | null => {
       runNumber: Number(value.runNumber) || 0,
       failureCount: Number(value.failureCount) || 0,
       ...(typeof value.lastError === "string" ? { lastError: value.lastError } : {}),
-      ...(value.meta && typeof value.meta === "object"
-        ? { meta: value.meta as Record<string, unknown> }
-        : {}),
+      ...(typeof value.metaJson === "string"
+        ? { metaJson: value.metaJson }
+        : value.meta && typeof value.meta === "object"
+          ? { metaJson: JSON.stringify(value.meta) }
+          : {}),
     };
   } catch {
     return null;
+  }
+};
+
+const parseMeta = (metaJson: string): Record<string, unknown> | undefined => {
+  try {
+    const value = JSON.parse(metaJson) as unknown;
+    return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
   }
 };
 
@@ -236,7 +253,7 @@ const asInfo = (schedule: StoredSchedule): SchedulerInfo => ({
   runNumber: schedule.runNumber,
   failureCount: schedule.failureCount,
   ...(schedule.lastError ? { lastError: schedule.lastError } : {}),
-  ...(schedule.meta ? { meta: schedule.meta } : {}),
+  ...(schedule.metaJson !== undefined ? { meta: parseMeta(schedule.metaJson) } : {}),
 });
 
 // ==========================
@@ -616,7 +633,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       nextRunAt: firstRunAt,
       runNumber: 0,
       failureCount: 0,
-      meta: cfg.meta,
+      ...(cfg.meta === undefined ? {} : { metaJson: JSON.stringify(cfg.meta) }),
     };
 
     const resultRaw = await redis.send("EVAL", [

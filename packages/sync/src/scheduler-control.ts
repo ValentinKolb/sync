@@ -118,10 +118,25 @@ const parseSchedule = (raw: string | null): StoredSchedule | null => {
       runNumber: Number(value.runNumber) || 0,
       failureCount: Number(value.failureCount) || 0,
       ...(typeof value.lastError === "string" ? { lastError: value.lastError } : {}),
-      ...(value.meta && typeof value.meta === "object" ? { meta: value.meta as Record<string, unknown> } : {}),
+      // `metaJson` is the opaque form the scheduler stores; `meta` is how
+      // <= 5.8.0 wrote it.
+      ...(typeof value.metaJson === "string"
+        ? { meta: parseMeta(value.metaJson) }
+        : value.meta && typeof value.meta === "object"
+          ? { meta: value.meta as Record<string, unknown> }
+          : {}),
     };
   } catch {
     return null;
+  }
+};
+
+const parseMeta = (metaJson: string): Record<string, unknown> | undefined => {
+  try {
+    const value = JSON.parse(metaJson) as unknown;
+    return value && typeof value === "object" ? (value as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
   }
 };
 
