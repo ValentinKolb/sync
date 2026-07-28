@@ -475,3 +475,39 @@ test("a run whose record advanced underneath it cannot overwrite the newer state
   expect(after?.nextRunAt).toBe(newer.nextRunAt);
   expect(s.metric().staleWrites).toBeGreaterThan(0);
 }, 30_000);
+
+test("stop cancels the in-flight schedule callback via ctx.signal", async () => {
+  const schedId = uid("stop-signal");
+  const s = makeScheduler(schedId);
+
+  let abortedDuringRun = false;
+  let ranToCompletion = false;
+  let started = false;
+
+  await s.create({
+    id: "long",
+    cron: "0 3 * * *", // manual only
+    tz: "UTC",
+    process: async ({ ctx }) => {
+      started = true;
+      // `ctx.signal.aborted` used to be false for the whole life of process.
+      for (let i = 0; i < 100; i++) {
+        if (ctx.signal.aborted) {
+          abortedDuringRun = true;
+          return;
+        }
+        await Bun.sleep(20);
+      }
+      ranToCompletion = true;
+    },
+  });
+
+  s.start();
+  const run = s.runNow({ id: "long" }).catch(() => {});
+  await waitFor(() => started, 10_000);
+  await s.stop();
+  await run;
+
+  expect(abortedDuringRun).toBe(true);
+  expect(ranToCompletion).toBe(false);
+}, 30_000);

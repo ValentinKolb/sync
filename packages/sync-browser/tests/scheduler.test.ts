@@ -594,3 +594,36 @@ test("schedulerControl runNow reports not found for missing schedules", async ()
     }),
   ).rejects.toBeInstanceOf(SchedulerControlNotFoundError);
 });
+
+test("stop cancels the in-flight schedule callback via ctx.signal", async () => {
+  const s = scheduler({ id: `stop-signal-${Date.now()}` });
+
+  let abortedDuringRun = false;
+  let ranToCompletion = false;
+  let started = false;
+
+  await s.create({
+    id: "long",
+    cron: "0 3 * * *",
+    process: async ({ ctx }) => {
+      started = true;
+      for (let i = 0; i < 100; i++) {
+        if (ctx.signal.aborted) {
+          abortedDuringRun = true;
+          return;
+        }
+        await Bun.sleep(10);
+      }
+      ranToCompletion = true;
+    },
+  });
+
+  s.start();
+  const run = s.runNow({ id: "long" }).catch(() => {});
+  while (!started) await Bun.sleep(5);
+  await s.stop();
+  await run;
+
+  expect(abortedDuringRun).toBe(true);
+  expect(ranToCompletion).toBe(false);
+});

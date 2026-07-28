@@ -334,6 +334,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   let running = false;
   let loopPromise: Promise<void> | null = null;
   let heartbeatPromise: Promise<void> | null = null;
+  // Controllers of the callbacks currently running, so stop() can cancel them.
+  const activeRuns = new Set<AbortController>();
   let currentLeaderLock: Lock | null = null;
   let lastHeartbeatAt = 0;
 
@@ -450,6 +452,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     const failureCountBefore = schedule.failureCount;
     const startedAt = Date.now();
     const jobAc = new AbortController();
+    activeRuns.add(jobAc);
 
     const makeCtx = (): ScheduleCtx => {
       const ctx = {
@@ -482,8 +485,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     try {
       result = await Promise.resolve(handler.process({ ctx }));
     } catch (err) {
-      jobAc.abort();
       error = asError(err);
+    } finally {
+      jobAc.abort();
+      activeRuns.delete(jobAc);
     }
 
     if (error) {
@@ -838,6 +843,9 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const stop = async (): Promise<void> => {
     if (!running) return;
     running = false;
+    // Cancel in-flight callbacks so `ctx.signal.aborted` is a usable
+    // cancellation signal instead of something that is always false.
+    for (const ac of activeRuns) ac.abort();
     await Promise.all([loopPromise, heartbeatPromise]);
     loopPromise = null;
     heartbeatPromise = null;
