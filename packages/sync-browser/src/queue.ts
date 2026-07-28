@@ -78,9 +78,23 @@ export type QueueReader<T> = {
   stream(cfg?: QueueRecvConfig): AsyncIterable<QueueReceived<T>>;
 };
 
+export type QueueDeadLetter<T> = {
+  messageId: string;
+  data: T;
+  attempts: number;
+  movedAt: number;
+  reason: string;
+  orderingKey?: string;
+  meta?: Record<string, unknown>;
+  lastError?: string;
+};
+
 export type Queue<T> = QueueReader<T> & {
   send(cfg: QueueSendConfig<T>): Promise<{ messageId: string }>;
   reader(): QueueReader<T>;
+  /** Oldest dead letters first. Read-only; use `dlqRemove` to drain. */
+  dlq(cfg?: { tenantId?: string; limit?: number }): Promise<Array<QueueDeadLetter<T>>>;
+  dlqRemove(cfg: { messageId: string; tenantId?: string }): Promise<boolean>;
 };
 
 // ==========================
@@ -110,6 +124,7 @@ type DlqEntry = {
   attempts: number;
   movedAt: number;
   reason: string;
+  lastError?: string;
 };
 
 type QueueState = {
@@ -234,7 +249,13 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     }
   };
 
-  const moveToDlq = (state: QueueState, messageId: string, msg: StoredMessage, reason: string): void => {
+  const moveToDlq = (
+    state: QueueState,
+    messageId: string,
+    msg: StoredMessage,
+    reason: string,
+    lastError?: string,
+  ): void => {
     state.dlq.set(messageId, {
       messageId,
       data: msg.data,
@@ -243,6 +264,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
       attempts: msg.attempt,
       movedAt: Date.now(),
       reason,
+      lastError,
     });
     state.messages.delete(messageId);
   };
@@ -407,7 +429,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
         state.leases.delete(deliveryId);
 
         if (msg.attempt >= maxDeliveries) {
-          moveToDlq(state, messageId, msg, cfg?.reason ?? "max_deliveries");
+          moveToDlq(state, messageId, msg, cfg?.reason ?? "max_deliveries", cfg?.error);
           return true;
         }
 
@@ -461,6 +483,21 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     return { recv, stream };
   };
 
+  const dlq = async (cfg: { tenantId?: string; limit?: number } = {}): Promise<Array<QueueDeadLetter<TData>>> => {
+    const state = getState(resolveTenant(cfg.tenantId));
+    runMaintenance(state);
+    const limit = Math.max(1, cfg.limit ?? 100);
+    return [...state.dlq.values()]
+      .sort((a, b) => a.movedAt - b.movedAt)
+      .slice(0, limit)
+      .map((entry) => ({ ...entry, data: entry.data as TData }));
+  };
+
+  const dlqRemove = async (cfg: { messageId: string; tenantId?: string }): Promise<boolean> => {
+    const state = getState(resolveTenant(cfg.tenantId));
+    return state.dlq.delete(cfg.messageId);
+  };
+
   const defaultReader = createReader();
 
   return {
@@ -468,5 +505,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     recv: defaultReader.recv,
     stream: defaultReader.stream,
     reader: () => createReader(),
+    dlq,
+    dlqRemove,
   };
 };

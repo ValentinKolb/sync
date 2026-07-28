@@ -44,8 +44,13 @@ const LUA_MESSAGE_HELPERS = `
     }
   end
 
-  local function deadLetter(messageId, message, movedAt, reason, lastError)
-    return cjson.encode({
+  -- Dead letters live in one hash with a movedAt-scored index. Retention is
+  -- enforced per entry against that index; the whole-key TTL is only a
+  -- last-resort sweep for a queue that goes permanently idle. Previously the
+  -- single whole-key PEXPIRE was refreshed by every insert, so a steady trickle
+  -- of failures kept the hash alive forever while a pause dropped fresh entries.
+  local function writeDeadLetter(dlqKey, indexKey, messageId, message, movedAt, reason, lastError, ttlMs)
+    redis.call("HSET", dlqKey, messageId, cjson.encode({
       v = 2,
       messageId = messageId,
       dataJson = message.dataJson,
@@ -55,8 +60,20 @@ const LUA_MESSAGE_HELPERS = `
       movedAt = movedAt,
       reason = reason,
       lastError = lastError,
-    })
+    }))
+    redis.call("ZADD", indexKey, tostring(movedAt), messageId)
+
+    if ttlMs > 0 then
+      local stale = redis.call("ZRANGEBYSCORE", indexKey, "-inf", tostring(movedAt - ttlMs))
+      for _, staleId in ipairs(stale) do
+        redis.call("HDEL", dlqKey, staleId)
+        redis.call("ZREM", indexKey, staleId)
+      end
+      redis.call("PEXPIRE", dlqKey, tostring(ttlMs))
+      redis.call("PEXPIRE", indexKey, tostring(ttlMs))
+    end
   end
+
 `;
 
 // Wake one parked consumer. The notify list is a wake-up signal only: it is
@@ -115,10 +132,7 @@ const MAINTENANCE_SCRIPT = `
   local dlqTtlMs = tonumber(ARGV[5])
 
   local function toDlq(messageId, message, reason)
-    redis.call("HSET", KEYS[7], messageId, deadLetter(messageId, message, now, reason, nil))
-    if dlqTtlMs > 0 then
-      redis.call("PEXPIRE", KEYS[7], tostring(dlqTtlMs))
-    end
+    writeDeadLetter(KEYS[7], KEYS[9], messageId, message, now, reason, nil, dlqTtlMs)
     redis.call("HDEL", KEYS[5], messageId)
   end
 
@@ -332,16 +346,16 @@ const NACK_SCRIPT = `
   end
 
   if (tonumber(message.attempt) or 0) >= maxDeliveries then
-    redis.call("HSET", KEYS[7], messageId, deadLetter(
+    writeDeadLetter(
+      KEYS[7],
+      KEYS[9],
       messageId,
       message,
       now,
       reason ~= "" and reason or "max_deliveries_exceeded",
-      error ~= "" and error or nil
-    ))
-    if dlqTtlMs > 0 then
-      redis.call("PEXPIRE", KEYS[7], tostring(dlqTtlMs))
-    end
+      error ~= "" and error or nil,
+      dlqTtlMs
+    )
     redis.call("HDEL", KEYS[3], messageId)
     return 2
   end
@@ -411,6 +425,7 @@ type QueueKeys = {
   messages: string;
   active: string;
   dlq: string;
+  dlqIndex: string;
   idempotencyPrefix: string;
 };
 
@@ -471,9 +486,23 @@ export type QueueReader<T> = {
   stream(cfg?: QueueRecvConfig): AsyncIterable<QueueReceived<T>>;
 };
 
+export type QueueDeadLetter<T> = {
+  messageId: string;
+  data: T;
+  attempts: number;
+  movedAt: number;
+  reason: string;
+  orderingKey?: string;
+  meta?: Record<string, unknown>;
+  lastError?: string;
+};
+
 export type Queue<T> = QueueReader<T> & {
   send(cfg: QueueSendConfig<T>): Promise<{ messageId: string }>;
   reader(): QueueReader<T>;
+  /** Oldest dead letters first. Read-only; use `dlqRemove` to drain. */
+  dlq(cfg?: { tenantId?: string; limit?: number }): Promise<Array<QueueDeadLetter<T>>>;
+  dlqRemove(cfg: { messageId: string; tenantId?: string }): Promise<boolean>;
 };
 
 /**
@@ -543,6 +572,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
       messages: `${base}:messages`,
       active: `${base}:active`,
       dlq: `${base}:dlq`,
+      dlqIndex: `${base}:dlq:index`,
       idempotencyPrefix: `${base}:idempotency`,
     };
   };
@@ -552,7 +582,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   const runMaintenance = async (keys: QueueKeys, now: number): Promise<void> => {
     await evalScript(
       MAINTENANCE_SCRIPT,
-      [keys.ready, keys.delayed, keys.leases, keys.deliveries, keys.messages, keys.active, keys.dlq, keys.notify],
+      [keys.ready, keys.delayed, keys.leases, keys.deliveries, keys.messages, keys.active, keys.dlq, keys.notify, keys.dlqIndex],
       [now, maxDeliveries, maxMessageAgeMs, MAINTENANCE_BATCH_SIZE, dlqRetentionMs],
     );
   };
@@ -661,7 +691,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
 
           const result = await evalScript(
             NACK_SCRIPT,
-            [keys.deliveries, keys.leases, keys.messages, keys.active, keys.ready, keys.delayed, keys.dlq, keys.notify],
+            [keys.deliveries, keys.leases, keys.messages, keys.active, keys.ready, keys.delayed, keys.dlq, keys.notify, keys.dlqIndex],
             [
               claimed.deliveryId,
               Date.now(),
@@ -779,6 +809,80 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     return { messageId };
   };
 
+  const parseDeadLetter = (raw: unknown): QueueDeadLetter<TData> | null => {
+    if (typeof raw !== "string") return null;
+    let record: {
+      messageId?: string;
+      dataJson?: string;
+      metaJson?: string;
+      orderingKey?: string;
+      attempts?: number;
+      movedAt?: number;
+      reason?: string;
+      lastError?: string;
+      data?: unknown;
+      meta?: unknown;
+    };
+    try {
+      record = JSON.parse(raw) as typeof record;
+    } catch {
+      return null;
+    }
+    if (!record.messageId) return null;
+    return {
+      messageId: record.messageId,
+      // `data`/`meta` are how <= 5.8.0 wrote dead letters.
+      data: (record.dataJson !== undefined ? parseOpaque<TData>(record.dataJson) : (record.data as TData)) as TData,
+      meta:
+        asObject<Record<string, unknown>>(
+          record.metaJson !== undefined ? parseOpaque(record.metaJson) : record.meta,
+        ) ?? undefined,
+      orderingKey: record.orderingKey,
+      attempts: record.attempts ?? 0,
+      movedAt: record.movedAt ?? 0,
+      reason: record.reason ?? "unknown",
+      lastError: record.lastError,
+    };
+  };
+
+  const dlq = async (cfg: { tenantId?: string; limit?: number } = {}): Promise<Array<QueueDeadLetter<TData>>> => {
+    const keys = keysForTenant(resolveTenant(cfg.tenantId));
+    const limit = Math.max(1, cfg.limit ?? 100);
+
+    // Entries written by <= 5.8.0 have no index member. Backfill once so the
+    // index stays the single ordering source afterwards.
+    const [indexed, stored] = await Promise.all([
+      redis.send("ZCARD", [keys.dlqIndex]),
+      redis.send("HLEN", [keys.dlq]),
+    ]);
+    if (Number(stored) > Number(indexed)) {
+      const all = (await redis.send("HGETALL", [keys.dlq])) as Record<string, string>;
+      const members: string[] = [];
+      for (const [messageId, raw] of Object.entries(all ?? {})) {
+        members.push(String(parseDeadLetter(raw)?.movedAt ?? 0), messageId);
+      }
+      if (members.length > 0) await redis.send("ZADD", [keys.dlqIndex, ...members]);
+    }
+
+    const ids = (await redis.send("ZRANGE", [keys.dlqIndex, "0", String(limit - 1)])) as string[];
+    if (!Array.isArray(ids) || ids.length === 0) return [];
+
+    const raws = (await redis.send("HMGET", [keys.dlq, ...ids])) as unknown[];
+    const entries: Array<QueueDeadLetter<TData>> = [];
+    for (const raw of raws) {
+      const entry = parseDeadLetter(raw);
+      if (entry) entries.push(entry);
+    }
+    return entries;
+  };
+
+  const dlqRemove = async (cfg: { messageId: string; tenantId?: string }): Promise<boolean> => {
+    const keys = keysForTenant(resolveTenant(cfg.tenantId));
+    const removed = await redis.send("HDEL", [keys.dlq, cfg.messageId]);
+    await redis.send("ZREM", [keys.dlqIndex, cfg.messageId]);
+    return Number(removed) > 0;
+  };
+
   const defaultReader = createReader();
   const reader = (): QueueReader<TData> => createReader();
 
@@ -787,5 +891,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     recv: defaultReader.recv,
     stream: defaultReader.stream,
     reader,
+    dlq,
+    dlqRemove,
   };
 };

@@ -631,3 +631,77 @@ test("recv records the consumerId on the delivery record", async () => {
 
   expect(await message?.ack()).toBe(true);
 });
+
+test("dlq entries are readable, drainable and bounded per entry", async () => {
+  const q = queue<{ v: number }>({
+    id: "dlq-api",
+    prefix: "test:q",
+    delivery: { maxDeliveries: 1 },
+    limits: { dlqRetentionMs: 60_000 },
+  });
+
+  await q.send({ data: { v: 1 } });
+  const first = await q.recv({ wait: false });
+  await first?.nack({ error: "boom" });
+
+  await q.send({ data: { v: 2 } });
+  const second = await q.recv({ wait: false });
+  await second?.nack();
+
+  const entries = await q.dlq();
+  expect(entries.length).toBe(2);
+  expect(entries.map((e) => e.data.v)).toEqual([1, 2]); // oldest first
+  expect(entries[0]?.reason).toBe("max_deliveries_exceeded");
+  expect(entries[0]?.lastError).toBe("boom");
+  expect(entries[0]?.attempts).toBe(1);
+
+  expect(await q.dlqRemove({ messageId: entries[0]!.messageId })).toBe(true);
+  expect(await q.dlqRemove({ messageId: entries[0]!.messageId })).toBe(false);
+  expect((await q.dlq()).length).toBe(1);
+});
+
+test("dlq retention drops entries older than the window without dropping fresh ones", async () => {
+  const q = queue<{ v: number }>({
+    id: "dlq-retention",
+    prefix: "test:q",
+    delivery: { maxDeliveries: 1 },
+    limits: { dlqRetentionMs: 120 },
+  });
+
+  await q.send({ data: { v: 1 } });
+  await (await q.recv({ wait: false }))?.nack();
+  expect((await q.dlq()).length).toBe(1);
+
+  await Bun.sleep(200);
+
+  // A later failure must not keep the stale entry alive, and must survive itself.
+  await q.send({ data: { v: 2 } });
+  await (await q.recv({ wait: false }))?.nack();
+
+  const entries = await q.dlq();
+  expect(entries.length).toBe(1);
+  expect(entries[0]?.data).toEqual({ v: 2 });
+});
+
+test("dead letters written in the 5.8.0 format are still listed", async () => {
+  const q = queue<{ tag: string }>({ id: "dlq-legacy", prefix: "test:q" });
+
+  await redis.send("HSET", [
+    "test:q:default:dlq-legacy:dlq",
+    "4242",
+    JSON.stringify({
+      messageId: "4242",
+      data: { tag: "old" },
+      meta: { source: "legacy" },
+      attempts: 3,
+      movedAt: Date.now(),
+      reason: "expired",
+    }),
+  ]);
+
+  const entries = await q.dlq();
+  expect(entries.length).toBe(1);
+  expect(entries[0]?.data).toEqual({ tag: "old" });
+  expect(entries[0]?.meta).toEqual({ source: "legacy" });
+  expect(entries[0]?.reason).toBe("expired");
+});

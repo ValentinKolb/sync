@@ -609,3 +609,19 @@ test("the unimplemented ordering mode is rejected instead of silently ignored", 
   );
   expect(() => queue({ id: "ordering-ok", ordering: { mode: "best_effort" } })).not.toThrow();
 });
+
+test("dlq entries are readable and drainable", async () => {
+  const q = queue<{ v: number }>({ id: `dlq-api-${Date.now()}`, delivery: { maxDeliveries: 1 } });
+
+  await q.send({ data: { v: 1 } });
+  const message = await q.recv({ wait: false });
+  await message?.nack({ error: "boom" });
+
+  const entries = await q.dlq();
+  expect(entries.length).toBe(1);
+  expect(entries[0]?.data).toEqual({ v: 1 });
+  expect(entries[0]?.lastError).toBe("boom");
+
+  expect(await q.dlqRemove({ messageId: entries[0]!.messageId })).toBe(true);
+  expect((await q.dlq()).length).toBe(0);
+});

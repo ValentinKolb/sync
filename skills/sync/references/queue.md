@@ -88,7 +88,7 @@ const msg2 = await reader.recv({ signal });
 ## Gotchas
 
 - **Lease**: every received message has a lease. If you don't `ack`/`nack` within `leaseMs`, maintenance redelivers it with `attempt++`. Long-running handlers should `touch({ leaseMs })` periodically.
-- **DLQ**: after `maxDeliveries` failed attempts, message moves to DLQ. Retention via `dlqRetentionMs` (default 7d).
+- **DLQ**: after `maxDeliveries` failed attempts, message moves to DLQ. Retention is per entry via `dlqRetentionMs` (default 7d), enforced against a `movedAt`-scored index, so a steady trickle of failures cannot keep old entries alive and a pause cannot drop fresh ones. Read them with `q.dlq({ limit })` (oldest first) and drain with `q.dlqRemove({ messageId })`.
 - **`ack` / `nack` return bool**: `false` means lease expired before settle (message already redelivered to someone else). Your handler's work is in an ambiguous state — design for at-least-once.
 - **Idempotency key**: dedupes `send` within `idempotencyTtlMs`. Same key returns the same messageId without enqueuing a new message.
 - **Ordering**: only `best_effort` exists. `orderingKey` is stored and delivered back with the message, but nothing partitions or serialises by it, so concurrent consumers can reorder same-key messages. Constructing a queue with `ordering: { mode: "ordering_key_partitioned" }` throws rather than silently ignoring the guarantee.
@@ -97,6 +97,7 @@ const msg2 = await reader.recv({ signal });
 ## Redis keys (server)
 
 - `{prefix}:{tenantId}:{id}:seq` — messageId counter
+- `{prefix}:{tenantId}:{id}:dlq:index` — ZSET messageId → movedAt (DLQ retention index)
 - `{prefix}:{tenantId}:{id}:messages` — hash messageId → payload
 - `{prefix}:{tenantId}:{id}:ready` — list (FIFO ready queue)
 - `{prefix}:{tenantId}:{id}:delayed` — sorted set of delayed messages
