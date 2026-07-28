@@ -99,43 +99,49 @@ test("when leader stops, a second pod takes over and continues dispatch", async 
 // Orphaned schedule record
 // ==========================
 
-test("orphaned due schedule (no handler) advances past slot and doesn't spin", async () => {
+test("a leader without the handler hands the slot to a pod that has it", async () => {
   const schedId = uid("orphan");
-  const s = makeScheduler(schedId);
+  const owner = makeScheduler(schedId);
 
-  await s.create({
+  let runs = 0;
+  await owner.create({
     id: "oh",
     cron: "* * * * *",
     tz: "UTC",
-    process: async () => {},
+    process: async () => {
+      runs += 1;
+    },
   });
 
+  // Force the slot due.
   const keyPrefix = `sync:scheduler:${schedId}`;
   const raw = await redis.get(`${keyPrefix}:schedule:oh`);
   const parsed = JSON.parse(raw as string);
-  parsed.nextRunAt = Date.now() - 1000;
+  parsed.nextRunAt = Date.now() - 1_000;
   await redis.set(`${keyPrefix}:schedule:oh`, JSON.stringify(parsed));
   await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed.nextRunAt), "oh"]);
 
-  const fresh = scheduler({
+  // A pod that registered no handler. Leases are sticky, so if it advances past
+  // slots it cannot serve it starves the schedule forever while `get()` keeps
+  // reporting a healthy record with a frozen runNumber.
+  const handlerless = scheduler({
     id: schedId,
     leader: { leaseMs: 1_000, heartbeatMs: 100 },
     dispatch: { tickMs: 100 },
   });
-  activeSchedulers.push(fresh);
-  fresh.start();
+  activeSchedulers.push(handlerless);
+  handlerless.start();
+  owner.start();
 
-  await waitFor(
-    async () => {
-      const info = await fresh.get({ id: "oh" });
-      return info !== null && info.nextRunAt > Date.now();
-    },
-    5_000,
-  );
+  await waitFor(() => runs >= 1, 20_000);
 
-  const info = await fresh.get({ id: "oh" });
-  expect(info?.runNumber).toBe(0);
-});
+  const info = await owner.get({ id: "oh" });
+  expect(runs).toBeGreaterThanOrEqual(1);
+  expect(info?.runNumber).toBeGreaterThanOrEqual(1);
+  // The slot was served, not skipped: nextRunAt advanced past a real run.
+  expect(info?.nextRunAt).toBeGreaterThan(Date.now());
+  expect(handlerless.metric().unservedSlots).toBeGreaterThan(0);
+}, 30_000);
 
 // ==========================
 // Failing process
@@ -283,3 +289,189 @@ test("ctx.reschedule persists nextRunAt so another pod can continue", async () =
   await waitFor(() => s2Runs >= 1, 5_000);
   expect(s2Runs).toBeGreaterThanOrEqual(1);
 });
+
+// ==========================
+// Fenced state transitions
+// ==========================
+
+test("a callback longer than the lease neither loses leadership nor clobbers state", async () => {
+  const schedId = uid("long-callback");
+  const runs: string[] = [];
+
+  const mk = (tag: string): Scheduler => {
+    const s = scheduler({
+      id: schedId,
+      leader: { leaseMs: 600, heartbeatMs: 100 },
+      dispatch: { tickMs: 100 },
+    });
+    activeSchedulers.push(s);
+    return s;
+  };
+
+  const a = mk("a");
+  const b = mk("b");
+
+  for (const [tag, s] of [["a", a], ["b", b]] as const) {
+    await s.create({
+      id: "nightly",
+      cron: "* * * * *",
+      tz: "UTC",
+      process: async () => {
+        runs.push(tag);
+        // Four times the lease: on the old tick loop the heartbeat could not run
+        // at all while this was awaited, so the lease lapsed mid-run.
+        await Bun.sleep(2_400);
+      },
+    });
+  }
+
+  const keyPrefix = `sync:scheduler:${schedId}`;
+  const raw = await redis.get(`${keyPrefix}:schedule:nightly`);
+  const parsed = JSON.parse(raw as string);
+  parsed.nextRunAt = Date.now() - 1_000;
+  await redis.set(`${keyPrefix}:schedule:nightly`, JSON.stringify(parsed));
+  await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed.nextRunAt), "nightly"]);
+
+  a.start();
+  b.start();
+
+  await waitFor(() => runs.length >= 1, 20_000);
+  await Bun.sleep(3_500); // outlive the callback and several leases
+
+  // The slot ran once, and runNumber advanced exactly once — never regressing
+  // and never colliding through a stale pod's terminal write.
+  expect(runs.length).toBe(1);
+  const info = await a.get({ id: "nightly" });
+  expect(info?.runNumber).toBe(1);
+  expect(info?.nextRunAt).toBeGreaterThan(Date.now());
+}, 40_000);
+
+test("deleting a schedule mid-run does not resurrect it", async () => {
+  const schedId = uid("delete-mid-run");
+  const s = makeScheduler(schedId);
+
+  let started = false;
+  await s.create({
+    id: "doomed",
+    cron: "* * * * *",
+    tz: "UTC",
+    process: async () => {
+      started = true;
+      await Bun.sleep(800);
+    },
+  });
+
+  const keyPrefix = `sync:scheduler:${schedId}`;
+  const raw = await redis.get(`${keyPrefix}:schedule:doomed`);
+  const parsed = JSON.parse(raw as string);
+  parsed.nextRunAt = Date.now() - 1_000;
+  await redis.set(`${keyPrefix}:schedule:doomed`, JSON.stringify(parsed));
+  await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed.nextRunAt), "doomed"]);
+
+  s.start();
+  await waitFor(() => started, 20_000);
+
+  await s.delete({ id: "doomed" });
+  await Bun.sleep(1_500); // let the in-flight run reach its terminal write
+
+  // The terminal write must not re-create a record the index set no longer
+  // lists: that record would be invisible to every listing API, unbounded in
+  // Redis, and still dispatchable by any pod holding the handler.
+  expect(await redis.send("EXISTS", [`${keyPrefix}:schedule:doomed`])).toBe(0);
+  expect(await redis.send("ZSCORE", [`${keyPrefix}:due`, "doomed"])).toBeNull();
+  expect(await s.get({ id: "doomed" })).toBeNull();
+  expect(await s.list()).toEqual([]);
+}, 30_000);
+
+test("runNow concurrent with cron dispatch never rewinds nextRunAt or runNumber", async () => {
+  const schedId = uid("runnow-race");
+  const s = makeScheduler(schedId);
+
+  await s.create({
+    id: "cleanup",
+    cron: "* * * * *",
+    tz: "UTC",
+    process: async () => {
+      await Bun.sleep(300);
+    },
+  });
+
+  const keyPrefix = `sync:scheduler:${schedId}`;
+  const before = JSON.parse((await redis.get(`${keyPrefix}:schedule:cleanup`)) as string);
+  const slot = Date.now() - 1_000;
+  await redis.set(`${keyPrefix}:schedule:cleanup`, JSON.stringify({ ...before, nextRunAt: slot }));
+  await redis.send("ZADD", [`${keyPrefix}:due`, String(slot), "cleanup"]);
+
+  // Sample the durable record throughout the race.
+  const samples: Array<{ runNumber: number; nextRunAt: number }> = [];
+  let sampling = true;
+  const sampler = (async () => {
+    while (sampling) {
+      const info = await s.get({ id: "cleanup" });
+      if (info) samples.push({ runNumber: info.runNumber, nextRunAt: info.nextRunAt });
+      await Bun.sleep(20);
+    }
+  })();
+
+  s.start();
+  // Fire a manual run into the same window the tick loop is dispatching.
+  await s.runNow({ id: "cleanup" }).catch(() => {});
+  await Bun.sleep(1_500);
+  sampling = false;
+  await sampler;
+
+  expect(samples.length).toBeGreaterThan(5);
+  // An unsynchronised read-modify-write let the manual run persist a stale
+  // snapshot, rewinding nextRunAt to a slot that was already due again and
+  // reusing a runNumber the cron run had taken.
+  for (let i = 1; i < samples.length; i++) {
+    expect(samples[i]!.runNumber).toBeGreaterThanOrEqual(samples[i - 1]!.runNumber);
+    expect(samples[i]!.nextRunAt).toBeGreaterThanOrEqual(samples[i - 1]!.nextRunAt);
+  }
+
+  const after = samples[samples.length - 1]!;
+  expect(after.runNumber).toBeGreaterThanOrEqual(1);
+  expect(after.nextRunAt).toBeGreaterThan(slot);
+}, 30_000);
+
+test("a run whose record advanced underneath it cannot overwrite the newer state", async () => {
+  const schedId = uid("stale-persist");
+  const s = makeScheduler(schedId);
+  const keyPrefix = `sync:scheduler:${schedId}`;
+
+  let inProcess = false;
+  let release = (): void => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await s.create({
+    id: "report",
+    cron: "0 3 * * *", // never naturally due; this run is manual only
+    tz: "UTC",
+    process: async () => {
+      inProcess = true;
+      await held;
+    },
+  });
+
+  // Start a manual run and park it inside the callback. It captured
+  // runNumber = 0 and will try to persist runNumber = 1.
+  const manual = s.runNow({ id: "report" });
+  await waitFor(() => inProcess, 10_000);
+
+  // Meanwhile another dispatcher completes a run for the same schedule.
+  const current = JSON.parse((await redis.get(`${keyPrefix}:schedule:report`)) as string);
+  const newer = { ...current, runNumber: 7, nextRunAt: Date.now() + 3_600_000, updatedAt: Date.now() };
+  await redis.set(`${keyPrefix}:schedule:report`, JSON.stringify(newer));
+
+  release();
+  await manual;
+
+  // The parked run's terminal write was derived from runNumber = 0, so it must
+  // be refused rather than rewinding the record to its own stale snapshot.
+  const after = await s.get({ id: "report" });
+  expect(after?.runNumber).toBe(7);
+  expect(after?.nextRunAt).toBe(newer.nextRunAt);
+  expect(s.metric().staleWrites).toBeGreaterThan(0);
+}, 30_000);

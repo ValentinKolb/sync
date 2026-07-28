@@ -78,11 +78,45 @@ const DELETE_SCRIPT = `
   return 1
 `;
 
-// Persist after a dispatch: updates schedule record and due zset atomically.
-// (Index set is unaffected; only populated on create, removed on delete.)
+// Persist after a dispatch. Every durable scheduler mutation goes through here,
+// and it refuses to write unless all three fences hold:
+//
+//  1. the schedule record still exists — a delete during an in-flight run must
+//     not resurrect it as a record the index set no longer lists;
+//  2. the leader key still holds our token — a pod whose lease lapsed during a
+//     long callback must not clobber the new leader's state;
+//  3. the stored runNumber is still the one this run was derived from — a
+//     concurrent manual and cron dispatch must not collide or rewind nextRunAt.
+//
+// A refusal returns 0 and the run's state change is dropped, which is the safe
+// direction: the surviving record belongs to whoever still holds the fence.
+//
+// Only the counters this run owns are patched onto the stored record, so a
+// field written by someone else in the meantime is preserved, and `metaJson`
+// stays an opaque string.
 const PERSIST_SCRIPT = `
-  redis.call("SET", KEYS[1], ARGV[1])
-  redis.call("ZADD", KEYS[2], ARGV[2], ARGV[3])
+  local raw = redis.call("GET", KEYS[1])
+  if not raw then return 0 end
+
+  if ARGV[3] ~= "" and redis.call("GET", KEYS[3]) ~= ARGV[3] then return 0 end
+
+  local ok, existing = pcall(cjson.decode, raw)
+  if not ok or type(existing) ~= "table" then return 0 end
+  if tostring(tonumber(existing.runNumber) or 0) ~= ARGV[2] then return 0 end
+
+  local patch = cjson.decode(ARGV[4])
+  existing.runNumber = patch.runNumber
+  existing.nextRunAt = patch.nextRunAt
+  existing.failureCount = patch.failureCount
+  existing.updatedAt = patch.updatedAt
+  if patch.lastError ~= nil and patch.lastError ~= cjson.null then
+    existing.lastError = patch.lastError
+  else
+    existing.lastError = nil
+  end
+
+  redis.call("SET", KEYS[1], cjson.encode(existing))
+  redis.call("ZADD", KEYS[2], tostring(patch.nextRunAt), ARGV[1])
   return 1
 `;
 
@@ -116,6 +150,10 @@ export type SchedulerMetrics = {
   failures: number;
   reschedules: number;
   tickErrors: number;
+  /** Durable writes a fence refused: lost lease, deleted schedule, or a concurrent dispatch. */
+  staleWrites: number;
+  /** Due slots this instance was leader for but had no handler to serve. */
+  unservedSlots: number;
   lastTickAt: number | null;
 };
 
@@ -288,11 +326,14 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     failures: 0,
     reschedules: 0,
     tickErrors: 0,
+    staleWrites: 0,
+    unservedSlots: 0,
     lastTickAt: null,
   };
 
   let running = false;
   let loopPromise: Promise<void> | null = null;
+  let heartbeatPromise: Promise<void> | null = null;
   let currentLeaderLock: Lock | null = null;
   let lastHeartbeatAt = 0;
 
@@ -320,12 +361,13 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   };
 
   const maintainLeadership = async (): Promise<void> => {
-    if (!currentLeaderLock) return;
+    const lock = currentLeaderLock;
+    if (!lock) return;
     const nowMs = Date.now();
     if (nowMs - lastHeartbeatAt < heartbeatMs) return;
-    const ok = await leaderMutex.extend(currentLeaderLock, leaseMs);
     lastHeartbeatAt = nowMs;
-    if (!ok) {
+    const ok = await leaderMutex.extend(lock, leaseMs);
+    if (!ok && currentLeaderLock === lock) {
       currentLeaderLock = null;
       setLeader(false);
     }
@@ -342,16 +384,52 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     setLeader(false);
   };
 
-  const persist = async (schedule: StoredSchedule): Promise<void> => {
-    await redis.send("EVAL", [
+  /**
+   * @param expectedRunNumber the runNumber this run was derived from
+   * @param requireLeadership cron dispatch must own the lease; a manual run,
+   *   which legitimately happens on any pod holding the handler, must not
+   * @returns false when a fence refused the write
+   */
+  const persist = async (
+    schedule: StoredSchedule,
+    expectedRunNumber: number,
+    requireLeadership: boolean,
+  ): Promise<boolean> => {
+    const leaderToken = requireLeadership ? (currentLeaderLock?.value ?? null) : "";
+    if (leaderToken === null) return false;
+
+    const result = await redis.send("EVAL", [
       PERSIST_SCRIPT,
-      "2",
+      "3",
       scheduleKey(schedule.id),
       dueKey,
-      JSON.stringify(schedule),
-      String(schedule.nextRunAt),
+      currentLeaderLock?.resource ?? `${prefix}:leader:${config.id}:leader:active`,
       schedule.id,
+      String(expectedRunNumber),
+      leaderToken,
+      JSON.stringify({
+        runNumber: schedule.runNumber,
+        nextRunAt: schedule.nextRunAt,
+        failureCount: schedule.failureCount,
+        updatedAt: schedule.updatedAt,
+        lastError: schedule.lastError ?? null,
+      }),
     ]);
+    const persisted = Number(result) > 0;
+    if (!persisted) metrics.staleWrites += 1;
+    return persisted;
+  };
+
+  // One dispatch per schedule at a time in this process, so a manual run and a
+  // cron run of the same schedule cannot interleave their read-modify-writes.
+  // One entry per schedule id, replaced rather than appended, so this is bounded
+  // by the number of schedules this instance knows about.
+  const dispatchChains = new Map<string, Promise<unknown>>();
+  const serializeDispatch = (scheduleId: string, run: () => Promise<void>): Promise<void> => {
+    const previous = dispatchChains.get(scheduleId) ?? Promise.resolve();
+    const next = previous.then(run, run);
+    dispatchChains.set(scheduleId, next.catch(() => {}));
+    return next;
   };
 
   // Run a single schedule: increment runNumber, invoke process + after, update state, persist.
@@ -365,6 +443,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   ): Promise<void> => {
     const advanceCron = trigger === "cron";
     const slotTs = schedule.nextRunAt;
+    // The value the terminal write is fenced against.
+    const expectedRunNumber = schedule.runNumber;
     schedule.runNumber += 1;
     const runNumber = schedule.runNumber;
     const failureCountBefore = schedule.failureCount;
@@ -465,7 +545,11 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
     schedule.updatedAt = Date.now();
 
-    await persist(schedule);
+    // Cron dispatch must still own the lease; a manual run legitimately happens
+    // on any pod holding the handler.
+    const persisted = await persist(schedule, expectedRunNumber, advanceCron);
+    if (!persisted) return;
+
     if (traceRescheduled) {
       await emitTrace(handler.trace, {
         type: "rescheduled",
@@ -505,15 +589,17 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
       const handler = handlers.get(scheduleId);
       if (!handler) {
-        // Handler not registered on this pod. Advance past this slot so another
-        // leader (on a pod that did register) can pick it up at the next tick.
-        schedule.nextRunAt = nextCronTimestamp(schedule.cron, schedule.tz, Date.now());
-        schedule.updatedAt = Date.now();
-        await persist(schedule);
-        continue;
+        // Do not advance a slot this pod cannot serve. Advancing made leadership
+        // a black hole: leases are sticky, so the same handler-less leader kept
+        // winning and skipping slot after slot while `get()`/`list()` showed a
+        // healthy schedule with a frozen runNumber. Step down instead, so a pod
+        // that did register the handler can take over and actually run it.
+        metrics.unservedSlots += 1;
+        await relinquishLeadership();
+        return;
       }
 
-      await dispatchOne(schedule, handler, "cron");
+      await serializeDispatch(scheduleId, () => dispatchOne(schedule, handler, "cron"));
     }
   };
 
@@ -586,7 +672,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         void message.touch({ leaseMs: controlLeaseMs });
       }, Math.floor(controlLeaseMs / 3));
       try {
-        await dispatchOne(schedule, handler, "manual");
+        await serializeDispatch(scheduleId, () => dispatchOne(schedule, handler, "manual"));
         await message.ack();
       } catch (error) {
         await message.nack({ delayMs: 250, reason: "control-dispatch-error", error: asError(error).message });
@@ -603,7 +689,6 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         await refreshControlHandlers();
         await dispatchControlRequests();
         await tryAcquireLeadership();
-        await maintainLeadership();
         if (currentLeaderLock) {
           await dispatchDue();
         }
@@ -612,6 +697,22 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         metrics.tickErrors += 1;
       }
       await sleep(tickMs);
+    }
+  };
+
+  // The lease heartbeat runs on its own loop, not on the tick loop. On the tick
+  // loop it could not run at all while a dispatch was in flight, so any handler
+  // that outlived leaseMs — an ordinary batch job — silently dropped the lease,
+  // let a second pod take over and dispatch the same slot, and then wrote its
+  // own stale state over the new leader's.
+  const heartbeatLoop = async (): Promise<void> => {
+    while (running) {
+      try {
+        await maintainLeadership();
+      } catch {
+        metrics.tickErrors += 1;
+      }
+      await sleep(Math.max(50, Math.floor(heartbeatMs / 2)));
     }
   };
 
@@ -696,8 +797,11 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     if (!handler) throw new Error(`runNow: no handler registered for schedule ${cfg.id} on this pod`);
 
     // `runNow` does not advance cron — regular schedule continues as before,
-    // unless user explicitly calls ctx.reschedule in after.
-    await dispatchOne(schedule, handler, "manual");
+    // unless user explicitly calls ctx.reschedule in after. Serialising it
+    // against tick dispatch is what keeps that promise: an unsynchronised
+    // read-modify-write let a manual run persist a stale snapshot and rewind
+    // nextRunAt, making the slot immediately due again.
+    await serializeDispatch(cfg.id, () => dispatchOne(schedule, handler, "manual"));
   };
 
   const get = async (cfg: { id: string }): Promise<SchedulerInfo | null> => {
@@ -728,13 +832,15 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     if (running) return;
     running = true;
     loopPromise = loop();
+    heartbeatPromise = heartbeatLoop();
   };
 
   const stop = async (): Promise<void> => {
     if (!running) return;
     running = false;
-    await loopPromise;
+    await Promise.all([loopPromise, heartbeatPromise]);
     loopPromise = null;
+    heartbeatPromise = null;
     await removeControlHandlers();
     await relinquishLeadership();
   };

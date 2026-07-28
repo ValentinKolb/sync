@@ -48,6 +48,10 @@ export type SchedulerMetrics = {
   failures: number;
   reschedules: number;
   tickErrors: number;
+  /** Durable writes a fence refused. Always 0 here: a tab has no competing writer. */
+  staleWrites: number;
+  /** Due slots this instance was leader for but had no handler to serve. */
+  unservedSlots: number;
   lastTickAt: number | null;
 };
 
@@ -240,6 +244,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     failures: 0,
     reschedules: 0,
     tickErrors: 0,
+    staleWrites: 0,
+    unservedSlots: 0,
     lastTickAt: null,
   };
 
@@ -417,10 +423,11 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
       const handler = handlers.get(schedule.id);
       if (!handler) {
-        schedule.nextRunAt = nextCronTimestamp(schedule.cron, schedule.tz, Date.now());
-        schedule.updatedAt = Date.now();
-        writePersistedState(schedule);
-        continue;
+        // Mirror the server: do not advance a slot this instance cannot serve,
+        // or the schedule silently never runs while its record looks healthy.
+        metrics.unservedSlots += 1;
+        await relinquishLeadership();
+        return;
       }
 
       await dispatchOne(schedule, handler, "cron");
