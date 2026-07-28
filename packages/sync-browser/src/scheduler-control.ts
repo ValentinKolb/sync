@@ -63,7 +63,8 @@ type BrowserScheduleRegistration = {
   schedulerId: string;
   scheduleId: string;
   getInfo: () => SchedulerInfo | null;
-  runNow: () => Promise<void>;
+  /** Resolves `onAccepted` once the run has been accepted, before it completes. */
+  runNow: (onAccepted?: () => void) => Promise<void>;
   available: boolean;
 };
 
@@ -82,7 +83,8 @@ export const registerBrowserSchedulerControl = (cfg: {
   scheduleId: string;
   instanceId: string;
   getInfo: () => SchedulerInfo | null;
-  runNow: () => Promise<void>;
+  /** Resolves `onAccepted` once the run has been accepted, before it completes. */
+  runNow: (onAccepted?: () => void) => Promise<void>;
 }): void => {
   const key = groupKey(cfg.prefix, cfg.schedulerId, cfg.scheduleId);
   const group = registrations.get(key) ?? new Map<string, BrowserScheduleRegistration>();
@@ -175,20 +177,41 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
       );
     }
 
-    await Promise.race([
-      Promise.resolve().then(() => {
-        void registration.runNow().catch(() => {});
-      }),
-      new Promise<never>((_, reject) => {
-        setTimeout(() => {
-          reject(
-            new SchedulerControlTimeoutError(
-              `schedulerControl.runNow: timed out waiting for live handler to accept ${cfg.schedulerId}/${cfg.scheduleId}`,
-            ),
-          );
-        }, timeoutMs);
-      }),
-    ]);
+    // Wait for the run to be *accepted*, exactly as the server does. The first
+    // arm used to be `Promise.resolve().then(...)`, which settles on the next
+    // microtask no matter what the run does: the race always resolved
+    // immediately, every error was swallowed by a bare catch, and the timeout
+    // branch was unreachable while its timer stayed pending for timeoutMs.
+    let settleAccepted: () => void = () => {};
+    let failAccepted: (error: unknown) => void = () => {};
+    const accepted = new Promise<void>((resolve, reject) => {
+      settleAccepted = resolve;
+      failAccepted = reject;
+    });
+
+    const run = registration.runNow(() => settleAccepted());
+    // A failure before acceptance is the caller's to see; one after acceptance
+    // is not, because this call does not wait for completion.
+    void run.catch((error: unknown) => failAccepted(error));
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        accepted,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(
+              new SchedulerControlTimeoutError(
+                `schedulerControl.runNow: timed out waiting for live handler to accept ${cfg.schedulerId}/${cfg.scheduleId}`,
+              ),
+            );
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      // Left pending on every call before, so repeated clicks piled up timers.
+      clearTimeout(timer);
+    }
   };
 
   return { list, runNow };

@@ -520,7 +520,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         const current = schedules.get(cfg.id);
         return current ? asInfo(current) : null;
       },
-      runNow: () => runNow({ id: cfg.id }),
+      runNow: (onAccepted) => runNow({ id: cfg.id }, onAccepted),
     });
     if (running) {
       setBrowserSchedulerControlAvailable({ prefix, schedulerId: config.id, instanceId, available: true });
@@ -549,12 +549,14 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     deletePersistedState(cfg.id);
   };
 
-  const runNow = async (cfg: { id: string }): Promise<void> => {
+  const runNow = async (cfg: { id: string }, onAccepted?: () => void): Promise<void> => {
     const schedule = schedules.get(cfg.id);
     if (!schedule) throw new Error(`runNow: schedule ${cfg.id} not found`);
     const handler = handlers.get(cfg.id);
     if (!handler) throw new Error(`runNow: no handler registered for schedule ${cfg.id}`);
 
+    // Everything that decides acceptance has been checked; the run is now ours.
+    onAccepted?.();
     await dispatchOne(schedule, handler, "manual");
   };
 

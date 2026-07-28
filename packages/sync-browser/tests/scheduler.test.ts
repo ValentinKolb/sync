@@ -2,8 +2,12 @@ import { test, expect, afterEach } from "bun:test";
 import { scheduler, type Scheduler, type SchedulerTraceEvent } from "../src/scheduler";
 import {
   SchedulerControlNotFoundError,
+  SchedulerControlTimeoutError,
   SchedulerControlUnavailableError,
+  registerBrowserSchedulerControl,
   schedulerControl,
+  setBrowserSchedulerControlAvailable,
+  unregisterBrowserSchedulerControl,
 } from "../src/scheduler-control";
 
 let counter = 0;
@@ -626,4 +630,78 @@ test("stop cancels the in-flight schedule callback via ctx.signal", async () => 
 
   expect(abortedDuringRun).toBe(true);
   expect(ranToCompletion).toBe(false);
+});
+
+test("schedulerControl runNow surfaces a pre-acceptance error instead of reporting success", async () => {
+  const prefix = uid("control-error-prefix");
+  const schedulerId = uid("control-error");
+  // Two same-id instances share the module-level schedule map, so deleting on
+  // one empties it for the other while the other's control registration stays.
+  const a = makeScheduler(schedulerId, { prefix });
+  const b = makeScheduler(schedulerId, { prefix });
+
+  for (const s of [a, b]) {
+    await s.create({ id: "vanishing", cron: "0 3 * * *", tz: "UTC", process: async () => {} });
+  }
+  b.start();
+  await a.delete({ id: "vanishing" });
+
+  // b's scheduler.runNow now throws "schedule not found" before accepting. That
+  // error used to be swallowed by a bare catch, so a UI "Run now" button
+  // reported success on failure.
+  await expect(
+    schedulerControl({ prefix }).runNow({ schedulerId, scheduleId: "vanishing", timeoutMs: 1_000 }),
+  ).rejects.toThrow();
+});
+
+test("schedulerControl runNow times out when nothing accepts", async () => {
+  const prefix = uid("control-timeout-prefix");
+  const schedulerId = uid("control-timeout");
+
+  // A registration that is available but never accepts. The timeout branch was
+  // unreachable before, because the first race arm always settled immediately.
+  registerBrowserSchedulerControl({
+    prefix,
+    schedulerId,
+    scheduleId: "stuck",
+    instanceId: "test-instance",
+    getInfo: () => ({
+      id: "stuck",
+      cron: "0 3 * * *",
+      tz: "UTC",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      nextRunAt: Date.now() + 60_000,
+      runNumber: 0,
+      failureCount: 0,
+    }),
+    runNow: () => new Promise<void>(() => {}),
+  });
+  setBrowserSchedulerControlAvailable({ prefix, schedulerId, instanceId: "test-instance", available: true });
+
+  await expect(
+    schedulerControl({ prefix }).runNow({ schedulerId, scheduleId: "stuck", timeoutMs: 150 }),
+  ).rejects.toThrow(SchedulerControlTimeoutError);
+
+  unregisterBrowserSchedulerControl({ prefix, schedulerId, scheduleId: "stuck", instanceId: "test-instance" });
+});
+
+test("schedulerControl runNow waits for acceptance rather than returning immediately", async () => {
+  const prefix = uid("control-accept-prefix");
+  const s = makeScheduler(uid("control-accept"), { prefix });
+
+  let accepted = false;
+  await s.create({
+    id: "slow",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async () => {
+      accepted = true;
+      await Bun.sleep(200);
+    },
+  });
+  s.start();
+
+  await schedulerControl({ prefix }).runNow({ schedulerId: s.id, scheduleId: "slow", timeoutMs: 5_000 });
+  expect(accepted).toBe(true);
 });
