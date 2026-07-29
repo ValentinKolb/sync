@@ -47,7 +47,7 @@ test("reader recv with wait: false returns null when empty", async () => {
   expect(message).toBeNull();
 });
 
-test("reader reclaim is an empty parity operation in the in-memory runtime", async () => {
+test("reader reclaim is empty when the group has no pending deliveries", async () => {
   const store = createMemoryStore();
   const reader = topic({ id: "reclaim", prefix: "test:bt", store }).reader("workers");
   if (!reader.reclaim) throw new Error("Expected topic reclaim support");
@@ -58,6 +58,46 @@ test("reader reclaim is an empty parity operation in the in-memory runtime", asy
   });
   await expect(reader.reclaim({ minIdleMs: -1 })).rejects.toThrow("minIdleMs must be a non-negative number");
   await expect(reader.reclaim({ count: 0 })).rejects.toThrow("count must be an integer between 1 and 1000");
+});
+
+test("reclaim advances from the returned cursor", async () => {
+  const store = createMemoryStore();
+  const t = topic<{ value: number }>({ id: "reclaim-cursor", prefix: "test:bt", store });
+  const original = t.reader("workers", { consumerId: "original" });
+
+  for (const value of [1, 2, 3]) {
+    await t.pub({ data: { value } });
+    expect(await original.recv({ wait: false })).not.toBeNull();
+  }
+
+  const recovery = t.reader("workers", { consumerId: "recovery" });
+  const first = await recovery.reclaim({ minIdleMs: 0, cursor: "0-0", count: 1 });
+  expect(first.entries).toHaveLength(1);
+  expect(first.entries[0]?.kind === "delivery" && first.entries[0].delivery.data.value).toBe(1);
+
+  const second = await recovery.reclaim({ minIdleMs: 0, cursor: first.nextCursor, count: 1 });
+  expect(second.entries).toHaveLength(1);
+  expect(second.entries[0]?.kind === "delivery" && second.entries[0].delivery.data.value).toBe(2);
+
+  const third = await recovery.reclaim({ minIdleMs: 0, cursor: second.nextCursor, count: 1 });
+  expect(third.entries).toHaveLength(1);
+  expect(third.entries[0]?.kind === "delivery" && third.entries[0].delivery.data.value).toBe(3);
+  expect(third.nextCursor).toBe("0-0");
+});
+
+test("close is terminal for a reader", async () => {
+  const reader = topic({ id: "closed-reader", prefix: "test:bt", store: createMemoryStore() }).reader("workers");
+  await reader.close();
+  await reader.close();
+
+  await expect(reader.recv({ wait: false })).rejects.toThrow("topic reader is closed");
+  await expect(reader.reclaim({ minIdleMs: 0 })).rejects.toThrow("topic reader is closed");
+
+  const seen: unknown[] = [];
+  for await (const message of reader.stream({ wait: false })) {
+    seen.push(message);
+  }
+  expect(seen).toEqual([]);
 });
 
 test("topic preserves undefined data", async () => {

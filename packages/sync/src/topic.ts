@@ -184,7 +184,7 @@ export type TopicReader<T> = {
   recv(cfg?: TopicRecvConfig): Promise<TopicDelivery<T> | null>;
   reclaim?(cfg?: TopicReclaimConfig): Promise<TopicReclaimResult<T>>;
   stream(cfg?: TopicRecvConfig): AsyncIterable<TopicDelivery<T>>;
-  /** Release the reader's blocking connection. Idempotent. */
+  /** Permanently close the reader and release its resources. Idempotent. */
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
 };
@@ -363,10 +363,38 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     // Callers with a stable identity can supply one; close() cleans up the rest.
     const consumer = readerCfg.consumerId ?? `consumer:${process.pid}:${randomUUID()}`;
     let blockingClient: RedisClient | null = null;
+    const usedKeys = new Set<string>();
     // Number of stream() loops currently using the blocking client. Without it,
     // the first loop to exit closed the socket a concurrent loop was blocked on.
     let blockingUsers = 0;
     let closed = false;
+    let closePromise: Promise<void> | null = null;
+    let activeOperations = 0;
+    let operationsIdle = Promise.resolve();
+    let resolveOperationsIdle: (() => void) | null = null;
+
+    const assertOpen = (): void => {
+      if (closed) throw new Error("topic reader is closed");
+    };
+
+    const runOperation = async <R>(operation: () => Promise<R>): Promise<R> => {
+      assertOpen();
+      if (activeOperations === 0) {
+        operationsIdle = new Promise<void>((resolve) => {
+          resolveOperationsIdle = resolve;
+        });
+      }
+      activeOperations += 1;
+      try {
+        return await operation();
+      } finally {
+        activeOperations -= 1;
+        if (activeOperations === 0) {
+          resolveOperationsIdle?.();
+          resolveOperationsIdle = null;
+        }
+      }
+    };
 
     const resetBlockingClient = (): void => {
       if (!blockingClient) return;
@@ -401,19 +429,25 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
      * would remove those entries from the group PEL, where they can never be
      * redelivered or reclaimed again.
      */
-    const close = async (): Promise<void> => {
-      if (closed) return;
+    const close = (): Promise<void> => {
+      if (closePromise) return closePromise;
       closed = true;
       blockingUsers = 0;
       resetBlockingClient();
-      try {
-        const key = streamKey(resolveTenant());
-        const pending = await redis.send("XPENDING", [key, group, "-", "+", "1", consumer]);
-        if (Array.isArray(pending) && pending.length > 0) return;
-        await redis.send("XGROUP", ["DELCONSUMER", key, group, consumer]);
-      } catch {
-        // Best effort: the group or stream may be gone already.
-      }
+      closePromise = (async () => {
+        await operationsIdle;
+        for (const key of usedKeys) {
+          try {
+            const pending = await redis.send("XPENDING", [key, group, "-", "+", "1", consumer]);
+            if (Array.isArray(pending) && pending.length === 0) {
+              await redis.send("XGROUP", ["DELCONSUMER", key, group, consumer]);
+            }
+          } catch {
+            // Best effort: the group or stream may be gone already.
+          }
+        }
+      })();
+      return closePromise;
     };
 
     const blockingReadGroup = async (args: string[], signal?: AbortSignal): Promise<unknown> => {
@@ -428,7 +462,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
         const client = await ensureBlockingClient();
         return await client.send("XREADGROUP", args);
       } catch (error) {
-        if (signal?.aborted) return null;
+        if (signal?.aborted || closed) return null;
         resetBlockingClient();
         throw asError(error);
       } finally {
@@ -464,9 +498,14 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       commit: createCommit(key, entry.id, consumer),
     });
 
-    const recv = async (recvCfg: TopicRecvConfig = {}, retriedAfterNoGroup = false): Promise<TopicDelivery<TData> | null> => {
+    const recvInternal = async (
+      recvCfg: TopicRecvConfig,
+      retriedAfterNoGroup = false,
+    ): Promise<TopicDelivery<TData> | null> => {
+      if (closed) return null;
       const tenantId = resolveTenant(recvCfg.tenantId);
       const key = streamKey(tenantId);
+      usedKeys.add(key);
       await ensureGroup(key, group);
 
       const wait = recvCfg.wait ?? true;
@@ -494,7 +533,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       } catch (error) {
         if (retriedAfterNoGroup || !isNoGroupError(error)) throw error;
         forgetGroup(key, group);
-        return await recv(recvCfg, true);
+        return await recvInternal(recvCfg, true);
       }
 
       const entry = parseFirstStreamEntry(result);
@@ -508,14 +547,22 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
         // one bad envelope as end-of-drain and yielded nothing at all — making
         // exactly one message of progress per run on a 500-message backlog.
         await createCommit(key, entry.id, consumer)();
-        return await recv(recvCfg, retriedAfterNoGroup);
+        return await recvInternal(recvCfg, retriedAfterNoGroup);
       }
       return createDelivery(entry, stored.value, key);
     };
 
-    const reclaim = async (reclaimCfg: TopicReclaimConfig = {}): Promise<TopicReclaimResult<TData>> => {
+    const recv = async (recvCfg: TopicRecvConfig = {}): Promise<TopicDelivery<TData> | null> =>
+      await runOperation(() => recvInternal(recvCfg));
+
+    const reclaimInternal = async (
+      reclaimCfg: TopicReclaimConfig,
+      retriedAfterNoGroup = false,
+    ): Promise<TopicReclaimResult<TData>> => {
+      if (closed) return { nextCursor: "0-0", entries: [] };
       const tenantId = resolveTenant(reclaimCfg.tenantId);
       const key = streamKey(tenantId);
+      usedKeys.add(key);
       await ensureGroup(key, group);
 
       const minIdleMs = reclaimCfg.minIdleMs ?? 60_000;
@@ -525,15 +572,22 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
         throw new Error(`count must be an integer between 1 and ${MAX_RECLAIM_COUNT}`);
       }
 
-      const raw = await redis.send("XAUTOCLAIM", [
-        key,
-        group,
-        consumer,
-        String(minIdleMs),
-        reclaimCfg.cursor ?? "0-0",
-        "COUNT",
-        String(count),
-      ]);
+      let raw: unknown;
+      try {
+        raw = await redis.send("XAUTOCLAIM", [
+          key,
+          group,
+          consumer,
+          String(minIdleMs),
+          reclaimCfg.cursor ?? "0-0",
+          "COUNT",
+          String(count),
+        ]);
+      } catch (error) {
+        if (retriedAfterNoGroup || !isNoGroupError(error)) throw error;
+        forgetGroup(key, group);
+        return await reclaimInternal(reclaimCfg, true);
+      }
       const claimed = parseAutoClaimResult(raw);
       const entries: TopicReclaimedDelivery<TData>[] = claimed.entries.map((entry) => {
         const stored = parsePayload(entry);
@@ -556,22 +610,31 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       return { nextCursor: claimed.nextCursor, entries };
     };
 
+    const reclaim = async (reclaimCfg: TopicReclaimConfig = {}): Promise<TopicReclaimResult<TData>> =>
+      await runOperation(() => reclaimInternal(reclaimCfg));
+
     const stream = async function* (streamCfg: TopicRecvConfig = {}): AsyncIterable<TopicDelivery<TData>> {
       const wait = streamCfg.wait ?? true;
       blockingUsers += 1;
       try {
-        while (!streamCfg.signal?.aborted) {
-          const message = wait
-            ? await retry({
-                run: () => recv(streamCfg),
-                after: ({ ctx }) => {
-                  if (ctx.error && isRetryableTransportError(ctx.error)) {
-                    ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
-                  }
-                },
-                signal: streamCfg.signal,
-              })
-            : await recv(streamCfg);
+        while (!closed && !streamCfg.signal?.aborted) {
+          let message: TopicDelivery<TData> | null;
+          try {
+            message = wait
+              ? await retry({
+                  run: () => recv(streamCfg),
+                  after: ({ ctx }) => {
+                    if (ctx.error && isRetryableTransportError(ctx.error)) {
+                      ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
+                    }
+                  },
+                  signal: streamCfg.signal,
+                })
+              : await recv(streamCfg);
+          } catch (error) {
+            if (closed) break;
+            throw error;
+          }
           if (message) {
             yield message;
             continue;

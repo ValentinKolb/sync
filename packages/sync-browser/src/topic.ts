@@ -118,7 +118,7 @@ export type TopicReader<T> = {
   recv(cfg?: TopicRecvConfig): Promise<TopicDelivery<T> | null>;
   reclaim?(cfg?: TopicReclaimConfig): Promise<TopicReclaimResult<T>>;
   stream(cfg?: TopicRecvConfig): AsyncIterable<TopicDelivery<T>>;
-  /** Release reader resources. Idempotent. In-memory readers hold no connection. */
+  /** Permanently close the reader and release its resources. Idempotent. */
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
 };
@@ -269,6 +269,12 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
 
   const reader = (group = "default", readerCfg: TopicReaderConfig = {}): RecoverableTopicReader<TData> => {
     const consumerId = readerCfg.consumerId ?? `consumer:${randomId()}`;
+    const closeController = new AbortController();
+    let closed = false;
+
+    const assertOpen = (): void => {
+      if (closed) throw new Error("topic reader is closed");
+    };
 
     const deliverEntry = (
       entry: EventLogEntry,
@@ -334,6 +340,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     };
 
     const recv = async (recvCfg: TopicRecvConfig = {}): Promise<TopicDelivery<TData> | null> => {
+      assertOpen();
       const tenantId = resolveTenant(recvCfg.tenantId);
       const log = getEventLog(tenantId);
       const state = groupState(tenantId, group);
@@ -348,7 +355,9 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       const ac = new AbortController();
       const timeout = setTimeout(() => ac.abort(), timeoutMs);
       const onUserAbort = (): void => ac.abort();
+      const onReaderClose = (): void => ac.abort();
       if (recvCfg.signal) recvCfg.signal.addEventListener("abort", onUserAbort, { once: true });
+      closeController.signal.addEventListener("abort", onReaderClose, { once: true });
 
       try {
         for await (const _entry of log.subscribe(state.delivered, ac.signal)) {
@@ -360,6 +369,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       } finally {
         clearTimeout(timeout);
         if (recvCfg.signal) recvCfg.signal.removeEventListener("abort", onUserAbort);
+        closeController.signal.removeEventListener("abort", onReaderClose);
       }
 
       return null;
@@ -368,7 +378,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     const stream = async function* (streamCfg: TopicRecvConfig = {}): AsyncIterable<TopicDelivery<TData>> {
       const wait = streamCfg.wait ?? true;
 
-      while (!streamCfg.signal?.aborted) {
+      while (!closed && !streamCfg.signal?.aborted) {
         const message = await recv(streamCfg);
         if (message) {
           yield message;
@@ -384,6 +394,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
      * uncommitted work unrecoverable — the cursor had already advanced past it.
      */
     const reclaim = async (reclaimCfg: TopicReclaimConfig = {}): Promise<TopicReclaimResult<TData>> => {
+      assertOpen();
       const minIdleMs = reclaimCfg.minIdleMs ?? 60_000;
       if (!Number.isFinite(minIdleMs) || minIdleMs < 0) throw new Error("minIdleMs must be a non-negative number");
       const count = reclaimCfg.count ?? 25;
@@ -395,15 +406,17 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       const log = getEventLog(tenantId);
       const state = groupState(tenantId, group);
       const now = Date.now();
+      const cursor = Number(reclaimCfg.cursor ?? "0-0") || 0;
 
-      const stale = [...state.inFlight.entries()]
-        .filter(([, held]) => now - held.at >= minIdleMs)
-        .sort(([a], [b]) => Number(a) - Number(b))
-        .slice(0, count);
+      const candidates = [...state.inFlight.entries()]
+        .filter(([eventId, held]) => Number(eventId) > cursor && now - held.at >= minIdleMs)
+        .sort(([a], [b]) => Number(a) - Number(b));
+      const stale = candidates.slice(0, count);
 
       const entries: Array<TopicReclaimedDelivery<TData>> = [];
       let lastId = "0-0";
       for (const [eventId] of stale) {
+        lastId = eventId;
         const found = log.range(String(Number(eventId) - 1), 1).find((e) => e.id === eventId);
         if (!found) {
           state.inFlight.delete(eventId);
@@ -431,7 +444,6 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
             rawPayload: typeof raw === "string" ? raw : null,
             commit,
           });
-          lastId = found.id;
           continue;
         }
 
@@ -448,15 +460,15 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
             commit,
           },
         });
-        lastId = found.id;
       }
 
-      return { nextCursor: lastId, entries };
+      return { nextCursor: candidates.length > stale.length ? lastId : "0-0", entries };
     };
 
     const close = async (): Promise<void> => {
-      // No connection to release in memory; present so the same teardown code
-      // works on both runtimes.
+      if (closed) return;
+      closed = true;
+      closeController.abort();
     };
 
     return { group, recv, reclaim, stream, close, [Symbol.asyncDispose]: close };

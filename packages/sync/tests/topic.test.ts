@@ -356,6 +356,25 @@ test("reclaim advances across an ineligible pending prefix", async () => {
   expect(second.entries.every((entry) => entry.kind === "delivery")).toBe(true);
 });
 
+test("reclaim recreates a consumer group removed after it was cached", async () => {
+  const id = "reclaim-nogroup";
+  const key = `test:t:default:${id}:stream`;
+  const group = "workers";
+  const t = topic<{ value: number }>({ id, prefix: "test:t" });
+  const reader = t.reader(group, { consumerId: "recovery" });
+
+  await t.pub({ data: { value: 1 } });
+  const first = await reader.recv({ wait: false });
+  expect(await first?.commit()).toBe(true);
+  await redis.send("XGROUP", ["DESTROY", key, group]);
+
+  await expect(reader.reclaim({ minIdleMs: 0 })).resolves.toEqual({
+    nextCursor: "0-0",
+    entries: [],
+  });
+  expect((await reader.recv({ wait: false }))?.data.value).toBe(1);
+});
+
 test("tenant isolation separates topic streams", async () => {
   const t = topic({
     id: "tenant-iso",
@@ -719,6 +738,58 @@ test("reader.close releases the blocking connection", async () => {
   // Without close() there was no way to reach the socket at all, so a reader
   // created per request leaked one connection per request.
   expect(await connectedClients()).toBeLessThan(clientsDuring);
+});
+
+test("reader.close cleans every used tenant without deleting pending consumers", async () => {
+  const id = "close-tenants";
+  const group = "workers";
+  const consumerId = "tenant-reader";
+  const t = topic<{ value: number }>({ id, prefix: "test:t" });
+  const reader = t.reader(group, { consumerId });
+
+  await t.pub({ tenantId: "committed", data: { value: 1 } });
+  await t.pub({ tenantId: "pending", data: { value: 2 } });
+  const committed = await reader.recv({ tenantId: "committed", wait: false });
+  const pending = await reader.recv({ tenantId: "pending", wait: false });
+  expect(await committed?.commit()).toBe(true);
+  expect(pending).not.toBeNull();
+
+  await reader.close();
+
+  const committedConsumers = await redis.send("XINFO", [
+    "CONSUMERS",
+    `test:t:committed:${id}:stream`,
+    group,
+  ]);
+  const pendingConsumers = await redis.send("XINFO", [
+    "CONSUMERS",
+    `test:t:pending:${id}:stream`,
+    group,
+  ]);
+  expect(committedConsumers).toEqual([]);
+  expect(pendingConsumers).toEqual([
+    expect.arrayContaining(["name", consumerId, "pending", 1]),
+  ]);
+});
+
+test("close is terminal for a reader", async () => {
+  const id = "closed-reader";
+  const key = `test:t:default:${id}:stream`;
+  const t = topic({ id, prefix: "test:t" });
+  await t.pub({ data: { value: 1 } });
+  const reader = t.reader("workers");
+  await reader.close();
+  await reader.close();
+
+  await expect(reader.recv({ wait: false })).rejects.toThrow("topic reader is closed");
+  await expect(reader.reclaim({ minIdleMs: 0 })).rejects.toThrow("topic reader is closed");
+  expect(await redis.send("XINFO", ["GROUPS", key])).toEqual([]);
+
+  const seen: unknown[] = [];
+  for await (const message of reader.stream({ wait: false })) {
+    seen.push(message);
+  }
+  expect(seen).toEqual([]);
 });
 
 test("two concurrent streams from one reader do not close each other's connection", async () => {
