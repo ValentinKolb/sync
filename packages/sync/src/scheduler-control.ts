@@ -155,7 +155,7 @@ const scheduleIndexKey = (prefix: string, schedulerId: string): string => `${pre
 export const encodeSchedulerKeyPart = (value: string): string =>
   value.replaceAll("%", "%25").replaceAll(":", "%3A");
 export const schedulerScheduleKey = (prefix: string, schedulerId: string, scheduleId: string): string =>
-  `${prefix}:${encodeSchedulerKeyPart(schedulerId)}:schedule:${scheduleId}`;
+  `${prefix}:v2:${encodeSchedulerKeyPart(schedulerId)}:schedule:${scheduleId}`;
 const legacySchedulerScheduleKey = (prefix: string, schedulerId: string, scheduleId: string): string =>
   `${prefix}:${schedulerId}:schedule:${scheduleId}`;
 const handlerIndexKey = (prefix: string, schedulerId: string, scheduleId: string): string =>

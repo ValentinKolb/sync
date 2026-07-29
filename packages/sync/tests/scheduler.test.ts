@@ -14,6 +14,7 @@ import {
   markSchedulerControlPending,
   markSchedulerControlUnavailable,
   refreshSchedulerControlRequestBinding,
+  schedulerScheduleKey,
   schedulerControlQueue,
   type SchedulerControlRequest,
 } from "../src/scheduler-control";
@@ -212,10 +213,11 @@ test("scheduler dispatches due schedules via tick loop", async () => {
   });
 
   const keyPrefix = `sync:scheduler:${s.id}`;
-  const raw = await redis.get(`${keyPrefix}:schedule:tick`);
+  const recordKey = schedulerScheduleKey("sync:scheduler", s.id, "tick");
+  const raw = await redis.get(recordKey);
   const parsed = JSON.parse(raw as string);
   parsed.nextRunAt = Date.now() - 1000;
-  await redis.set(`${keyPrefix}:schedule:tick`, JSON.stringify(parsed));
+  await redis.set(recordKey, JSON.stringify(parsed));
   await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed.nextRunAt), "tick"]);
 
   s.start();
@@ -237,10 +239,11 @@ test("nextRunAt advances after successful dispatch", async () => {
   });
 
   const keyPrefix = `sync:scheduler:${s.id}`;
-  const raw = await redis.get(`${keyPrefix}:schedule:a`);
+  const recordKey = schedulerScheduleKey("sync:scheduler", s.id, "a");
+  const raw = await redis.get(recordKey);
   const parsed = JSON.parse(raw as string);
   parsed.nextRunAt = Date.now() - 1000;
-  await redis.set(`${keyPrefix}:schedule:a`, JSON.stringify(parsed));
+  await redis.set(recordKey, JSON.stringify(parsed));
   await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed.nextRunAt), "a"]);
 
   s.start();
@@ -592,10 +595,11 @@ test("ctx.trigger is 'cron' when dispatched via tick loop", async () => {
 
   // Force due
   const keyPrefix = `sync:scheduler:${s.id}`;
-  const raw = await redis.get(`${keyPrefix}:schedule:t`);
+  const recordKey = schedulerScheduleKey("sync:scheduler", s.id, "t");
+  const raw = await redis.get(recordKey);
   const parsed = JSON.parse(raw as string);
   parsed.nextRunAt = Date.now() - 1000;
-  await redis.set(`${keyPrefix}:schedule:t`, JSON.stringify(parsed));
+  await redis.set(recordKey, JSON.stringify(parsed));
   await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed.nextRunAt), "t"]);
 
   s.start();
@@ -989,6 +993,40 @@ test("colon-rich scheduler and schedule ids keep durable records distinct", asyn
   const listed = await schedulerControl({ prefix }).list();
   expect(listed.find((entry) => entry.schedulerId === "a:schedule:b")?.scheduleId).toBe("c");
   expect(listed.find((entry) => entry.schedulerId === "a")?.scheduleId).toBe("b:schedule:c");
+});
+
+test("a new colliding target cannot overwrite an unmigrated legacy schedule", async () => {
+  const prefix = `test:sched:${uid("mixed-record-identity")}`;
+  const legacyKey = `${prefix}:a:schedule:b:schedule:c`;
+  await redis.set(
+    legacyKey,
+    JSON.stringify({
+      id: "c",
+      cron: "0 1 * * *",
+      tz: "UTC",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      nextRunAt: Date.now() + 60_000,
+      runNumber: 9,
+      failureCount: 0,
+      metaJson: JSON.stringify({ owner: "legacy" }),
+    }),
+  );
+
+  const current = makeScheduler("a", { prefix });
+  await current.create({
+    id: "b:schedule:c",
+    cron: "0 2 * * *",
+    meta: { owner: "current" },
+    process: async () => {},
+  });
+
+  expect((await current.get({ id: "b:schedule:c" }))?.meta).toEqual({ owner: "current" });
+  expect(JSON.parse((await redis.get(legacyKey)) as string).id).toBe("c");
+
+  const legacy = makeScheduler("a:schedule:b", { prefix });
+  expect((await legacy.get({ id: "c" }))?.runNumber).toBe(9);
+  expect((await legacy.get({ id: "c" }))?.meta).toEqual({ owner: "legacy" });
 });
 
 test("scheduler control request identities include the full prefix", async () => {

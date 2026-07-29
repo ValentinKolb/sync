@@ -1,6 +1,7 @@
 import { beforeEach, afterEach, expect, test } from "bun:test";
 import { redis } from "bun";
 import { scheduler, type Scheduler } from "../index";
+import { schedulerScheduleKey } from "../src/scheduler-control";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 
@@ -66,10 +67,11 @@ test("when leader stops, a second pod takes over and continues dispatch", async 
   });
 
   const keyPrefix = `sync:scheduler:${schedId}`;
-  const raw = await redis.get(`${keyPrefix}:schedule:x`);
+  const recordKey = schedulerScheduleKey("sync:scheduler", schedId, "x");
+  const raw = await redis.get(recordKey);
   const parsed = JSON.parse(raw as string);
   parsed.nextRunAt = Date.now() - 1000;
-  await redis.set(`${keyPrefix}:schedule:x`, JSON.stringify(parsed));
+  await redis.set(recordKey, JSON.stringify(parsed));
   await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed.nextRunAt), "x"]);
 
   s1.start();
@@ -84,10 +86,10 @@ test("when leader stops, a second pod takes over and continues dispatch", async 
     await s2.stop();
   }
 
-  const raw2 = await redis.get(`${keyPrefix}:schedule:x`);
+  const raw2 = await redis.get(recordKey);
   const parsed2 = JSON.parse(raw2 as string);
   parsed2.nextRunAt = Date.now() - 1000;
-  await redis.set(`${keyPrefix}:schedule:x`, JSON.stringify(parsed2));
+  await redis.set(recordKey, JSON.stringify(parsed2));
   await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed2.nextRunAt), "x"]);
 
   const initialTotal = runsOnS1 + runsOnS2;
@@ -115,10 +117,11 @@ test("a leader without the handler hands the slot to a pod that has it", async (
 
   // Force the slot due.
   const keyPrefix = `sync:scheduler:${schedId}`;
-  const raw = await redis.get(`${keyPrefix}:schedule:oh`);
+  const recordKey = schedulerScheduleKey("sync:scheduler", schedId, "oh");
+  const raw = await redis.get(recordKey);
   const parsed = JSON.parse(raw as string);
   parsed.nextRunAt = Date.now() - 1_000;
-  await redis.set(`${keyPrefix}:schedule:oh`, JSON.stringify(parsed));
+  await redis.set(recordKey, JSON.stringify(parsed));
   await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed.nextRunAt), "oh"]);
 
   // A pod that registered no handler. Leases are sticky, so if it advances past
@@ -197,12 +200,13 @@ test("broken (unparseable) schedule record is cleaned up by the dispatch loop", 
   });
 
   const keyPrefix = `sync:scheduler:${schedId}`;
-  await redis.set(`${keyPrefix}:schedule:b`, "not valid json");
+  const recordKey = schedulerScheduleKey("sync:scheduler", schedId, "b");
+  await redis.set(recordKey, "not valid json");
   await redis.send("ZADD", [`${keyPrefix}:due`, String(Date.now() - 1000), "b"]);
 
   s.start();
   await waitFor(async () => {
-    const raw = await redis.get(`${keyPrefix}:schedule:b`);
+    const raw = await redis.get(recordKey);
     return raw === null;
   }, 5_000);
 
@@ -327,10 +331,11 @@ test("a callback longer than the lease neither loses leadership nor clobbers sta
   }
 
   const keyPrefix = `sync:scheduler:${schedId}`;
-  const raw = await redis.get(`${keyPrefix}:schedule:nightly`);
+  const recordKey = schedulerScheduleKey("sync:scheduler", schedId, "nightly");
+  const raw = await redis.get(recordKey);
   const parsed = JSON.parse(raw as string);
   parsed.nextRunAt = Date.now() - 1_000;
-  await redis.set(`${keyPrefix}:schedule:nightly`, JSON.stringify(parsed));
+  await redis.set(recordKey, JSON.stringify(parsed));
   await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed.nextRunAt), "nightly"]);
 
   a.start();
@@ -363,10 +368,11 @@ test("deleting a schedule mid-run does not resurrect it", async () => {
   });
 
   const keyPrefix = `sync:scheduler:${schedId}`;
-  const raw = await redis.get(`${keyPrefix}:schedule:doomed`);
+  const recordKey = schedulerScheduleKey("sync:scheduler", schedId, "doomed");
+  const raw = await redis.get(recordKey);
   const parsed = JSON.parse(raw as string);
   parsed.nextRunAt = Date.now() - 1_000;
-  await redis.set(`${keyPrefix}:schedule:doomed`, JSON.stringify(parsed));
+  await redis.set(recordKey, JSON.stringify(parsed));
   await redis.send("ZADD", [`${keyPrefix}:due`, String(parsed.nextRunAt), "doomed"]);
 
   s.start();
@@ -378,7 +384,7 @@ test("deleting a schedule mid-run does not resurrect it", async () => {
   // The terminal write must not re-create a record the index set no longer
   // lists: that record would be invisible to every listing API, unbounded in
   // Redis, and still dispatchable by any pod holding the handler.
-  expect(await redis.send("EXISTS", [`${keyPrefix}:schedule:doomed`])).toBe(0);
+  expect(await redis.send("EXISTS", [recordKey])).toBe(0);
   expect(await redis.send("ZSCORE", [`${keyPrefix}:due`, "doomed"])).toBeNull();
   expect(await s.get({ id: "doomed" })).toBeNull();
   expect(await s.list()).toEqual([]);
@@ -398,9 +404,10 @@ test("runNow concurrent with cron dispatch never rewinds nextRunAt or runNumber"
   });
 
   const keyPrefix = `sync:scheduler:${schedId}`;
-  const before = JSON.parse((await redis.get(`${keyPrefix}:schedule:cleanup`)) as string);
+  const recordKey = schedulerScheduleKey("sync:scheduler", schedId, "cleanup");
+  const before = JSON.parse((await redis.get(recordKey)) as string);
   const slot = Date.now() - 1_000;
-  await redis.set(`${keyPrefix}:schedule:cleanup`, JSON.stringify({ ...before, nextRunAt: slot }));
+  await redis.set(recordKey, JSON.stringify({ ...before, nextRunAt: slot }));
   await redis.send("ZADD", [`${keyPrefix}:due`, String(slot), "cleanup"]);
 
   // Sample the durable record throughout the race.
@@ -581,9 +588,10 @@ test("a run whose record advanced underneath it cannot overwrite the newer state
   await waitFor(() => inProcess, 10_000);
 
   // Meanwhile another dispatcher completes a run for the same schedule.
-  const current = JSON.parse((await redis.get(`${keyPrefix}:schedule:report`)) as string);
+  const recordKey = schedulerScheduleKey("sync:scheduler", schedId, "report");
+  const current = JSON.parse((await redis.get(recordKey)) as string);
   const newer = { ...current, runNumber: 7, nextRunAt: Date.now() + 3_600_000, updatedAt: Date.now() };
-  await redis.set(`${keyPrefix}:schedule:report`, JSON.stringify(newer));
+  await redis.set(recordKey, JSON.stringify(newer));
 
   release();
   await expect(manual).rejects.toThrow("scheduler dispatch state changed");
@@ -671,9 +679,10 @@ test("stop fences a cron run suspended while acquiring leadership", async () => 
   });
 
   const keyPrefix = `sync:scheduler:${schedId}`;
-  const schedule = JSON.parse((await redis.get(`${keyPrefix}:schedule:due`)) as string);
+  const recordKey = schedulerScheduleKey("sync:scheduler", schedId, "due");
+  const schedule = JSON.parse((await redis.get(recordKey)) as string);
   schedule.nextRunAt = Date.now() - 1_000;
-  await redis.set(`${keyPrefix}:schedule:due`, JSON.stringify(schedule));
+  await redis.set(recordKey, JSON.stringify(schedule));
   await redis.send("ZADD", [`${keyPrefix}:due`, String(schedule.nextRunAt), "due"]);
 
   const originalSend = redis.send.bind(redis);
@@ -708,6 +717,53 @@ test("stop fences a cron run suspended while acquiring leadership", async () => 
   }
 }, 20_000);
 
+test("stop fences a cron run suspended while reading the due index", async () => {
+  const schedId = uid("stop-due-read");
+  const s = makeScheduler(schedId);
+  let runs = 0;
+  await s.create({
+    id: "due",
+    cron: "0 3 * * *",
+    process: async () => {
+      runs += 1;
+    },
+  });
+
+  const keyPrefix = `sync:scheduler:${schedId}`;
+  const recordKey = schedulerScheduleKey("sync:scheduler", schedId, "due");
+  const schedule = JSON.parse((await redis.get(recordKey)) as string);
+  schedule.nextRunAt = Date.now() - 1_000;
+  await redis.set(recordKey, JSON.stringify(schedule));
+  await redis.send("ZADD", [`${keyPrefix}:due`, String(schedule.nextRunAt), "due"]);
+
+  const originalSend = redis.send.bind(redis);
+  let releaseRead = (): void => {};
+  const readGate = new Promise<void>((resolve) => {
+    releaseRead = resolve;
+  });
+  let readStarted = false;
+  redis.send = (async (command, args) => {
+    const result = await originalSend(command, args);
+    if (!readStarted && command === "ZRANGEBYSCORE" && args[0] === `${keyPrefix}:due`) {
+      readStarted = true;
+      await readGate;
+    }
+    return result;
+  }) as typeof redis.send;
+
+  try {
+    s.start();
+    await waitFor(() => readStarted);
+    const stopped = s.stop();
+    releaseRead();
+    await stopped;
+    expect(runs).toBe(0);
+  } finally {
+    releaseRead();
+    redis.send = originalSend as typeof redis.send;
+  }
+}, 20_000);
+
 test("non-finite batchSize falls back to a usable default", async () => {
   const schedId = uid("batch-size-nan");
   const s = makeScheduler(schedId, {
@@ -723,9 +779,10 @@ test("non-finite batchSize falls back to a usable default", async () => {
   });
 
   const keyPrefix = `sync:scheduler:${schedId}`;
-  const schedule = JSON.parse((await redis.get(`${keyPrefix}:schedule:due`)) as string);
+  const recordKey = schedulerScheduleKey("sync:scheduler", schedId, "due");
+  const schedule = JSON.parse((await redis.get(recordKey)) as string);
   schedule.nextRunAt = Date.now() - 1_000;
-  await redis.set(`${keyPrefix}:schedule:due`, JSON.stringify(schedule));
+  await redis.set(recordKey, JSON.stringify(schedule));
   await redis.send("ZADD", [`${keyPrefix}:due`, String(schedule.nextRunAt), "due"]);
 
   s.start();

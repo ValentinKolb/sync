@@ -681,9 +681,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     options?: {
       onAcquired?: () => Promise<void> | void;
       shouldContinue?: () => boolean;
+      generation?: number;
     },
   ): Promise<void> => {
-    const generation = dispatchGeneration;
+    const generation = options?.generation ?? dispatchGeneration;
     await serializeDispatch(scheduleId, async () => {
       let dispatchLock = await dispatchMutex.acquire(scheduleId, leaseMs);
       if (trigger === "cron" && !dispatchLock) return;
@@ -745,7 +746,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     });
   };
 
-  const dispatchDue = async (): Promise<void> => {
+  const dispatchDue = async (generation: number): Promise<void> => {
     const nowMs = Date.now();
     const dueIdsRaw = await redis.send("ZRANGEBYSCORE", [
       dueKey,
@@ -755,6 +756,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       "0",
       String(batchSize),
     ]);
+    if (!running || generation !== dispatchGeneration) return;
     if (!Array.isArray(dueIdsRaw) || dueIdsRaw.length === 0) return;
 
     const dueIds = dueIdsRaw.map((v) => String(v));
@@ -763,6 +765,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       if (!currentLeaderLock) break;
 
       const raw = await readSchedulerScheduleRaw(prefix, config.id, scheduleId);
+      if (!running || generation !== dispatchGeneration) return;
       const schedule = parseSchedule(raw);
       if (!schedule) {
         // Broken record: clean up
@@ -795,7 +798,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         return;
       }
 
-      await dispatchSchedule(scheduleId, "cron");
+      await dispatchSchedule(scheduleId, "cron", { generation, shouldContinue: () => running });
     }
   };
 
@@ -932,15 +935,17 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
   const loop = async (): Promise<void> => {
     while (running) {
+      const generation = dispatchGeneration;
       try {
         await dispatchControlRequests();
+        if (!running || generation !== dispatchGeneration) break;
         await tryAcquireLeadership();
-        if (!running) {
+        if (!running || generation !== dispatchGeneration) {
           await relinquishLeadership();
           break;
         }
         if (currentLeaderLock) {
-          await dispatchDue();
+          await dispatchDue(generation);
         }
         metrics.lastTickAt = Date.now();
       } catch {
