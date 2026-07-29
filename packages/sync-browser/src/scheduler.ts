@@ -18,6 +18,9 @@ const DEFAULT_BATCH_SIZE = 200;
 const MIN_LEASE_MS = 500;
 const MIN_HEARTBEAT_MS = 100;
 
+const normalizeMs = (value: number | undefined, fallback: number, minimum: number): number =>
+  Math.max(minimum, Math.floor(value !== undefined && Number.isFinite(value) ? value : fallback));
+
 // ==========================
 // Types
 // ==========================
@@ -189,17 +192,12 @@ const asInfo = (schedule: StoredSchedule): SchedulerInfo => ({
 
 export const scheduler = (config: SchedulerConfig): Scheduler => {
   const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const configuredLeaseMs = config.leader?.leaseMs ?? DEFAULT_LEASE_MS;
-  const leaseMs = Math.max(MIN_LEASE_MS, Number.isFinite(configuredLeaseMs) ? configuredLeaseMs : DEFAULT_LEASE_MS);
-  const configuredHeartbeatMs = config.leader?.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const leaseMs = normalizeMs(config.leader?.leaseMs, DEFAULT_LEASE_MS, MIN_LEASE_MS);
   const heartbeatMs = Math.min(
-    Math.max(
-      MIN_HEARTBEAT_MS,
-      Number.isFinite(configuredHeartbeatMs) ? configuredHeartbeatMs : DEFAULT_HEARTBEAT_MS,
-    ),
+    normalizeMs(config.leader?.heartbeatMs, DEFAULT_HEARTBEAT_MS, MIN_HEARTBEAT_MS),
     Math.floor(leaseMs / 3),
   );
-  const tickMs = Math.max(50, config.dispatch?.tickMs ?? DEFAULT_TICK_MS);
+  const tickMs = normalizeMs(config.dispatch?.tickMs, DEFAULT_TICK_MS, 50);
   const batchSize = Math.max(1, config.dispatch?.batchSize ?? DEFAULT_BATCH_SIZE);
   const store = config.store ?? createMemoryStore();
   const instanceId = crypto.randomUUID();
@@ -326,7 +324,13 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const serializeDispatch = (scheduleId: string, run: () => Promise<void>): Promise<void> => {
     const previous = dispatchChains.get(scheduleId) ?? Promise.resolve();
     const next = previous.then(run, run);
-    dispatchChains.set(scheduleId, next.catch(() => {}));
+    const settled = next.catch(() => {});
+    dispatchChains.set(scheduleId, settled);
+    void settled.then(() => {
+      if (dispatchChains.get(scheduleId) === settled) {
+        dispatchChains.delete(scheduleId);
+      }
+    });
     return next;
   };
 

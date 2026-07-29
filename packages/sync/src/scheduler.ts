@@ -25,6 +25,9 @@ const CONTROL_MAX_ATTEMPTS = 3;
 const MIN_LEASE_MS = 500;
 const MIN_HEARTBEAT_MS = 100;
 
+const normalizeMs = (value: number | undefined, fallback: number, minimum: number): number =>
+  Math.max(minimum, Math.floor(value !== undefined && Number.isFinite(value) ? value : fallback));
+
 // Upsert: creates or updates the schedule record. Preserves runNumber always;
 // preserves nextRunAt/failureCount iff cron/tz unchanged.
 // Returns [1 = created | 2 = updated, stored nextRunAt].
@@ -305,17 +308,12 @@ const asInfo = (schedule: StoredSchedule): SchedulerInfo => ({
 
 export const scheduler = (config: SchedulerConfig): Scheduler => {
   const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const configuredLeaseMs = config.leader?.leaseMs ?? DEFAULT_LEASE_MS;
-  const leaseMs = Math.max(MIN_LEASE_MS, Number.isFinite(configuredLeaseMs) ? configuredLeaseMs : DEFAULT_LEASE_MS);
-  const configuredHeartbeatMs = config.leader?.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const leaseMs = normalizeMs(config.leader?.leaseMs, DEFAULT_LEASE_MS, MIN_LEASE_MS);
   const heartbeatMs = Math.min(
-    Math.max(
-      MIN_HEARTBEAT_MS,
-      Number.isFinite(configuredHeartbeatMs) ? configuredHeartbeatMs : DEFAULT_HEARTBEAT_MS,
-    ),
+    normalizeMs(config.leader?.heartbeatMs, DEFAULT_HEARTBEAT_MS, MIN_HEARTBEAT_MS),
     Math.floor(leaseMs / 3),
   );
-  const tickMs = Math.max(50, config.dispatch?.tickMs ?? DEFAULT_TICK_MS);
+  const tickMs = normalizeMs(config.dispatch?.tickMs, DEFAULT_TICK_MS, 50);
   const batchSize = Math.max(1, config.dispatch?.batchSize ?? DEFAULT_BATCH_SIZE);
   const controlHandlerTtlMs = Math.max(5_000, tickMs * 4);
   const controlHeartbeatMs = Math.max(500, Math.floor(controlHandlerTtlMs / 3));

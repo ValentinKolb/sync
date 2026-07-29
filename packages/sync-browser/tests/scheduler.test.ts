@@ -873,6 +873,35 @@ test("handles with different explicit stores do not share a leader lock", async 
   expect(b.metric().isLeader).toBe(true);
 });
 
+test("fractional scheduler timings are normalized to integer milliseconds", async () => {
+  const delays: number[] = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((...args: unknown[]) => {
+    const delay = args[1];
+    if (typeof delay === "number") delays.push(delay);
+    return Reflect.apply(originalSetTimeout, globalThis, args);
+  }) as typeof setTimeout;
+
+  try {
+    const s = makeScheduler(uid("integer-timing"), {
+      store: createMemoryStore(),
+      leader: { leaseMs: 500.9, heartbeatMs: 100.9 },
+      dispatch: { tickMs: 50.9 },
+    });
+    await s.create({ id: "idle", cron: "0 3 * * *", process: async () => {} });
+    s.start();
+    await waitFor(() => s.metric().isLeader);
+    await Bun.sleep(120);
+    await s.stop();
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+
+  expect(delays).toContain(500);
+  expect(delays).toContain(50);
+  expect(delays.every(Number.isInteger)).toBe(true);
+});
+
 test("leader heartbeat survives a callback longer than the configured lease", async () => {
   const prefix = uid("leader-long-prefix");
   const schedulerId = uid("leader-long");
