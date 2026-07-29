@@ -8,7 +8,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_LEASE_MS = 30_000;
 const DEFAULT_WORKER_RECV_TIMEOUT_MS = 1_000;
 const DEFAULT_KEY_TTL_MS = 24 * 60 * 60 * 1000;
+const MIN_KEY_TTL_MS = 1_000;
 const MAX_KEY_TTL_MS = 30 * DAY_MS;
+const MAX_JOB_DELAY_MS = MAX_KEY_TTL_MS - MIN_KEY_TTL_MS;
+const MAX_JOB_MESSAGE_AGE_MS = Number.MAX_SAFE_INTEGER;
 // How long a claim may stay unenqueued before a later submit re-enqueues it.
 // Generous relative to the single `queue.send` it covers, and far below any TTL.
 const ENQUEUE_GRACE_MS = 30_000;
@@ -84,7 +87,11 @@ const REFRESH_KEY_SCRIPT = `
   local existing = redis.call("GET", KEYS[1])
   if not existing then return 0 end
   local ok, record = pcall(cjson.decode, existing)
-  if ok and type(record) == "table" and record.jobId and record.jobId ~= ARGV[1] then return 0 end
+  if ok and type(record) == "table" and record.jobId then
+    if record.jobId ~= ARGV[1] then return 0 end
+  elseif existing ~= ARGV[1] then
+    return 0
+  end
   redis.call("PEXPIRE", KEYS[1], tostring(ARGV[2]))
   return 1
 `;
@@ -169,6 +176,18 @@ type WorkPayload = {
 };
 
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
+const requireSafeInteger = (name: string, value: number, min: number, max = Number.MAX_SAFE_INTEGER): number => {
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new RangeError(`${name} must be a safe integer between ${min} and ${max}`);
+  }
+  return value;
+};
+
+const requireFutureDuration = (name: string, value: number, min: number): number =>
+  requireSafeInteger(name, value, min, Number.MAX_SAFE_INTEGER - Date.now());
+
+const resolveDelayMs = (name: string, value = 0): number =>
+  requireSafeInteger(name, value, 0, MAX_JOB_DELAY_MS);
 
 // ==========================
 // Factory
@@ -178,10 +197,16 @@ export const job = <Input = void, Result = unknown>(
   config: JobConfig<Input, Result>,
 ): JobHandle<Input> => {
   const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const defaultLeaseMs = Math.max(1, config.defaults?.leaseMs ?? DEFAULT_LEASE_MS);
-  const defaultKeyTtlMs = Math.min(
+  const defaultLeaseMs = requireFutureDuration(
+    "defaults.leaseMs",
+    config.defaults?.leaseMs ?? DEFAULT_LEASE_MS,
+    1,
+  );
+  const defaultKeyTtlMs = requireSafeInteger(
+    "defaults.keyTtlMs",
+    config.defaults?.keyTtlMs ?? DEFAULT_KEY_TTL_MS,
+    MIN_KEY_TTL_MS,
     MAX_KEY_TTL_MS,
-    Math.max(1_000, config.defaults?.keyTtlMs ?? DEFAULT_KEY_TTL_MS),
   );
 
   const keys = {
@@ -197,6 +222,10 @@ export const job = <Input = void, Result = unknown>(
     delivery: {
       defaultLeaseMs,
       maxDeliveries: Number.MAX_SAFE_INTEGER, // reschedule is user-controlled via ctx.reschedule
+    },
+    limits: {
+      maxMessageAgeMs: MAX_JOB_MESSAGE_AGE_MS,
+      maxNackDelayMs: MAX_JOB_DELAY_MS,
     },
   });
 
@@ -217,9 +246,14 @@ export const job = <Input = void, Result = unknown>(
     }
   };
 
+  const extendKey = async (key: string, jobId: JobId, keyTtlMs: number): Promise<boolean> => {
+    const result = await evalKeyScript(REFRESH_KEY_SCRIPT, key, [jobId, String(keyTtlMs)]);
+    return Number(result) > 0;
+  };
+
   const refreshKey = async (key: string, jobId: JobId, keyTtlMs: number): Promise<void> => {
     try {
-      await evalKeyScript(REFRESH_KEY_SCRIPT, key, [jobId, String(keyTtlMs)]);
+      await extendKey(key, jobId, keyTtlMs);
     } catch {
       // best effort — a missed refresh only shortens the dedup window
     }
@@ -295,6 +329,7 @@ export const job = <Input = void, Result = unknown>(
 
             try {
               const keepLease = async (leaseMs = payload.leaseMs): Promise<boolean> => {
+                requireFutureDuration("heartbeat.leaseMs", leaseMs, 1);
                 const held = await message.touch({ leaseMs });
                 if (!held) {
                   leaseLost = true;
@@ -306,6 +341,10 @@ export const job = <Input = void, Result = unknown>(
                 return true;
               };
               const canceled = (): boolean => ac.signal.aborted || leaseLost || jobAc.signal.aborted;
+              const renewIfActive = async (leaseMs = payload.leaseMs): Promise<boolean> => {
+                if (canceled() || !(await keepLease(leaseMs))) return false;
+                return !canceled();
+              };
 
               const ctx = {
                 jobId: payload.jobId,
@@ -322,9 +361,9 @@ export const job = <Input = void, Result = unknown>(
                 enumerable: true,
               });
 
-              // Every delivery renews the claim: while queued work exists for
-              // this key, the key that dedups it must exist too.
-              await refreshKey(payload.key, payload.jobId, payload.keyTtlMs);
+              // Queue recv uses the handle default. Apply this submission's
+              // lease before trace or user code can outlive the wrong lease.
+              if (!(await renewIfActive(payload.leaseMs))) continue;
 
               const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
 
@@ -335,7 +374,7 @@ export const job = <Input = void, Result = unknown>(
                 ...traceInput,
                 attempt,
               });
-              if (canceled()) continue;
+              if (!(await renewIfActive())) continue;
 
               let result: Result | undefined;
               let error: Error | undefined;
@@ -344,7 +383,7 @@ export const job = <Input = void, Result = unknown>(
               } catch (err) {
                 error = asError(err);
               }
-              if (canceled() || !(await keepLease())) continue;
+              if (!(await renewIfActive())) continue;
 
               if (error) {
                 await emitTrace(config.trace, {
@@ -365,14 +404,16 @@ export const job = <Input = void, Result = unknown>(
                   durationMs: Date.now() - startedAt,
                 });
               }
-              if (canceled()) continue;
+              if (!(await renewIfActive())) continue;
 
-              let rescheduleRequested: { delayMs?: number } | null = null;
+              let rescheduleRequested: { delayMs: number } | null = null;
               const afterCtx: JobAfterCtx<Input, Result> = Object.create(ctx) as JobAfterCtx<Input, Result>;
               if (error) afterCtx.error = error;
               if (!error) afterCtx.data = result;
               afterCtx.reschedule = (rcfg?: { delayMs?: number }): void => {
-                rescheduleRequested = { delayMs: rcfg?.delayMs };
+                rescheduleRequested = {
+                  delayMs: resolveDelayMs("reschedule.delayMs", rcfg?.delayMs),
+                };
               };
               afterCtx.expBackoff = (bcfg?: BackoffOptions): number => expBackoff(failureCount + 1, bcfg);
               afterCtx.metric = metrics;
@@ -384,10 +425,16 @@ export const job = <Input = void, Result = unknown>(
                   // after errors are swallowed — transport decision is made by ctx.reschedule flag
                 }
               }
-              if (canceled() || !(await keepLease())) continue;
+              if (!(await renewIfActive())) continue;
 
               if (rescheduleRequested) {
-                const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
+                const delayMs = (rescheduleRequested as { delayMs: number }).delayMs;
+                const extended = await extendKey(
+                  payload.key,
+                  payload.jobId,
+                  Math.min(MAX_KEY_TTL_MS, delayMs + payload.keyTtlMs),
+                );
+                if (!extended || canceled()) continue;
                 const nacked = await message.nack({
                   delayMs,
                   reason: "reschedule",
@@ -398,13 +445,6 @@ export const job = <Input = void, Result = unknown>(
                   continue;
                 }
                 metrics.reschedules += 1;
-                // Hold the claim across the scheduled delay as well as the TTL,
-                // so a long backoff cannot lose its dedup claim.
-                await refreshKey(
-                  payload.key,
-                  payload.jobId,
-                  Math.min(MAX_KEY_TTL_MS, delayMs + payload.keyTtlMs),
-                );
                 await emitTrace(config.trace, {
                   type: "rescheduled",
                   jobId: payload.jobId,
@@ -455,9 +495,18 @@ export const job = <Input = void, Result = unknown>(
   const submit = async (cfg: SubmitConfig<Input>): Promise<JobId> => {
     if (!cfg.key) throw new Error("submit: key is required");
 
-    const leaseMs = Math.max(1, cfg.leaseMs ?? defaultLeaseMs);
-    const keyTtlMs = Math.min(MAX_KEY_TTL_MS, Math.max(1_000, cfg.keyTtlMs ?? defaultKeyTtlMs));
-    const delayMs = cfg.at !== undefined ? Math.max(0, cfg.at - Date.now()) : Math.max(0, cfg.delayMs ?? 0);
+    const leaseMs = requireFutureDuration("submit.leaseMs", cfg.leaseMs ?? defaultLeaseMs, 1);
+    const keyTtlMs = requireSafeInteger(
+      "submit.keyTtlMs",
+      cfg.keyTtlMs ?? defaultKeyTtlMs,
+      MIN_KEY_TTL_MS,
+      MAX_KEY_TTL_MS,
+    );
+    const now = Date.now();
+    const delayMs =
+      cfg.at !== undefined
+        ? resolveDelayMs("submit.at", Math.max(0, requireSafeInteger("submit.at", cfg.at, 0) - now))
+        : resolveDelayMs("submit.delayMs", cfg.delayMs);
     const initialKeyTtlMs = Math.min(MAX_KEY_TTL_MS, delayMs + keyTtlMs);
 
     const { jobId, isNew } = await claimKey(cfg.key, initialKeyTtlMs);
@@ -484,8 +533,15 @@ export const job = <Input = void, Result = unknown>(
         meta: cfg.meta,
       });
     } catch (error) {
-      // Enqueue failed after claiming key — release the key so resubmit works.
-      await releaseKey(cfg.key, jobId);
+      if (isRetryableTransportError(error)) {
+        // Redis may have committed the idempotent queue write and lost only the
+        // response. Keep the pending claim and start a worker for that message.
+        startWorker();
+      } else {
+        // Serialization, validation and deterministic Redis errors did not
+        // ambiguously accept work, so a corrected submit may claim the key.
+        await releaseKey(cfg.key, jobId);
+      }
       throw error;
     }
 

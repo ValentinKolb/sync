@@ -405,29 +405,197 @@ test("delayMs delays first execution", async () => {
   worker.stop();
 });
 
+test("job timings reject non-finite and unsupported delays before allocating an id", async () => {
+  expect(() =>
+    job({
+      id: uid("invalid-default"),
+      defaults: { leaseMs: Number.NaN },
+      process: async () => {},
+    }),
+  ).toThrow("defaults.leaseMs must be a safe integer");
+
+  const worker = job({ id: uid("invalid-submit"), process: async () => {} });
+  await expect(worker.submit({ key: "nan", delayMs: Number.NaN })).rejects.toThrow(
+    "submit.delayMs must be a safe integer",
+  );
+  await expect(worker.submit({ key: "infinite", at: Number.POSITIVE_INFINITY })).rejects.toThrow(
+    "submit.at must be a safe integer",
+  );
+  await expect(worker.submit({ key: "too-far", delayMs: 30 * 24 * 60 * 60 * 1_000 })).rejects.toThrow(
+    "submit.delayMs must be a safe integer",
+  );
+
+  expect(await worker.submit({ key: "valid" })).toBe("1");
+  worker.stop();
+
+  const callbackErrors: string[] = [];
+  const callbackWorker = job({
+    id: uid("invalid-callback-timings"),
+    process: async ({ ctx }) => {
+      try {
+        await ctx.heartbeat({ leaseMs: Number.NaN });
+      } catch (error) {
+        callbackErrors.push((error as Error).message);
+      }
+    },
+    after: ({ ctx }) => {
+      try {
+        ctx.reschedule({ delayMs: Number.POSITIVE_INFINITY });
+      } catch (error) {
+        callbackErrors.push((error as Error).message);
+      }
+    },
+  });
+  await callbackWorker.submit({ key: "callback" });
+  await waitFor(() => callbackWorker.metric().dispatches === 1);
+  expect(callbackErrors).toEqual([
+    expect.stringContaining("heartbeat.leaseMs must be a safe integer"),
+    expect.stringContaining("reschedule.delayMs must be a safe integer"),
+  ]);
+  callbackWorker.stop();
+});
+
+test("job reschedule supports delays beyond the queue's old seven-day default", async () => {
+  const delayMs = 8 * 24 * 60 * 60 * 1_000;
+  const worker = job({
+    id: uid("long-reschedule"),
+    process: async () => {},
+    after: ({ ctx }) => {
+      if (ctx.failureCount === 0) ctx.reschedule({ delayMs });
+    },
+  });
+
+  await worker.submit({ key: "long" });
+  await waitFor(() => worker.metric().reschedules === 1);
+  worker.stop();
+});
+
 // ==========================
 // heartbeat
 // ==========================
 
-test("ctx.heartbeat extends lease for long runs", async () => {
-  let done = false;
+const raceHeartbeat = async (
+  id: string,
+  body: (ctx: { heartbeat: () => Promise<void> }) => Promise<void>,
+): Promise<{ stolen: boolean }> => {
+  let running = false;
+  let finished = false;
 
   const worker = job({
-    id: uid("heartbeat"),
+    id,
     defaults: { leaseMs: 300 },
     process: async ({ ctx }) => {
-      for (let i = 0; i < 5; i++) {
-        await Bun.sleep(100);
-        await ctx.heartbeat();
-      }
-      done = true;
+      running = true;
+      await body(ctx);
+      finished = true;
     },
   });
 
   await worker.submit({ key: "x" });
-  await waitFor(() => done, 5_000);
-  expect(done).toBe(true);
+  await waitFor(() => running);
 
+  const competitor = queue({ id: `${id}:work`, prefix: "sync:job:queue" }).reader();
+  let stolen = false;
+  while (!finished && !stolen) {
+    const message = await competitor.recv({ wait: false });
+    if (message) {
+      stolen = true;
+      await message.ack();
+    } else {
+      await Bun.sleep(50);
+    }
+  }
+  worker.stop();
+  return { stolen };
+};
+
+test("ctx.heartbeat extends lease for long runs", async () => {
+  const { stolen } = await raceHeartbeat(uid("heartbeat"), async (ctx) => {
+    for (let i = 0; i < 8; i++) {
+      await Bun.sleep(100);
+      await ctx.heartbeat();
+    }
+  });
+
+  expect(stolen).toBe(false);
+});
+
+test("without a heartbeat a long browser run loses its lease", async () => {
+  const { stolen } = await raceHeartbeat(uid("no-heartbeat"), async () => {
+    await Bun.sleep(1_500);
+  });
+
+  expect(stolen).toBe(true);
+});
+
+test("a per-submit lease overrides a longer handle default on first delivery", async () => {
+  const id = uid("submit-lease");
+  let running = false;
+  const worker = job({
+    id,
+    defaults: { leaseMs: 5_000 },
+    process: async () => {
+      running = true;
+      await Bun.sleep(800);
+    },
+  });
+
+  await worker.submit({ key: "short", leaseMs: 100 });
+  await waitFor(() => running);
+
+  const competitor = queue({ id: `${id}:work`, prefix: "sync:job:queue" }).reader();
+  let stolen = false;
+  const deadline = Date.now() + 3_000;
+  while (!stolen && Date.now() < deadline) {
+    const message = await competitor.recv({ wait: false });
+    if (message) {
+      stolen = true;
+      await message.ack();
+      break;
+    }
+    await Bun.sleep(25);
+  }
+
+  expect(stolen).toBe(true);
+  worker.stop();
+});
+
+test("a slow started trace cannot hand expired browser work to process", async () => {
+  const id = uid("slow-start-trace");
+  let traceStarted = false;
+  let processRan = false;
+  const worker = job({
+    id,
+    defaults: { leaseMs: 100 },
+    trace: async (event) => {
+      if (event.type !== "started") return;
+      traceStarted = true;
+      await Bun.sleep(400);
+    },
+    process: async () => {
+      processRan = true;
+    },
+  });
+
+  await worker.submit({ key: "trace" });
+  await waitFor(() => traceStarted);
+
+  const competitor = queue({ id: `${id}:work`, prefix: "sync:job:queue" }).reader();
+  let stolen = false;
+  const deadline = Date.now() + 3_000;
+  while (!stolen && Date.now() < deadline) {
+    const message = await competitor.recv({ wait: false });
+    if (message) {
+      stolen = true;
+      await message.ack();
+      break;
+    }
+    await Bun.sleep(25);
+  }
+
+  await Bun.sleep(350);
+  expect(stolen).toBe(true);
+  expect(processRan).toBe(false);
   worker.stop();
 });
 

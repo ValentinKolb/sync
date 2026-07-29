@@ -17,6 +17,15 @@ const DEFAULT_PAYLOAD_BYTES = 128 * 1024;
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 1_000;
 
 const textEncoder = new TextEncoder();
+const requireSafeInteger = (name: string, value: number, min: number, max = Number.MAX_SAFE_INTEGER): number => {
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new RangeError(`${name} must be a safe integer between ${min} and ${max}`);
+  }
+  return value;
+};
+
+const requireFutureDuration = (name: string, value: number, min: number): number =>
+  requireSafeInteger(name, value, min, Number.MAX_SAFE_INTEGER - Date.now());
 
 const parseJson = <T>(value: string | undefined): T | undefined => {
   if (value === undefined) return undefined;
@@ -166,12 +175,36 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
 
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
-  const defaultLeaseMs = config.delivery?.defaultLeaseMs ?? DEFAULT_LEASE_MS;
-  const maxDeliveries = config.delivery?.maxDeliveries ?? DEFAULT_MAX_DELIVERIES;
-  const maxPayloadBytes = config.limits?.payloadBytes ?? DEFAULT_PAYLOAD_BYTES;
-  const maxNackDelayMs = config.limits?.maxNackDelayMs ?? DEFAULT_MAX_NACK_DELAY_MS;
-  const maxMessageAgeMs = config.limits?.maxMessageAgeMs ?? DEFAULT_MAX_MESSAGE_AGE_MS;
-  const dlqRetentionMs = config.limits?.dlqRetentionMs ?? DEFAULT_DLQ_RETENTION_MS;
+  const defaultLeaseMs = requireFutureDuration(
+    "delivery.defaultLeaseMs",
+    config.delivery?.defaultLeaseMs ?? DEFAULT_LEASE_MS,
+    1,
+  );
+  const maxDeliveries = requireSafeInteger(
+    "delivery.maxDeliveries",
+    config.delivery?.maxDeliveries ?? DEFAULT_MAX_DELIVERIES,
+    1,
+  );
+  const maxPayloadBytes = requireSafeInteger(
+    "limits.payloadBytes",
+    config.limits?.payloadBytes ?? DEFAULT_PAYLOAD_BYTES,
+    1,
+  );
+  const maxNackDelayMs = requireSafeInteger(
+    "limits.maxNackDelayMs",
+    config.limits?.maxNackDelayMs ?? DEFAULT_MAX_NACK_DELAY_MS,
+    0,
+  );
+  const maxMessageAgeMs = requireSafeInteger(
+    "limits.maxMessageAgeMs",
+    config.limits?.maxMessageAgeMs ?? DEFAULT_MAX_MESSAGE_AGE_MS,
+    1,
+  );
+  const dlqRetentionMs = requireSafeInteger(
+    "limits.dlqRetentionMs",
+    config.limits?.dlqRetentionMs ?? DEFAULT_DLQ_RETENTION_MS,
+    1,
+  );
   const resolveTenant = (tenantId?: string): string => tenantId ?? defaultTenant;
 
   // Per-tenant state, shared by every handle with this id: on the server two
@@ -289,7 +322,12 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
 
   const send = async (sendCfg: QueueSendConfig<TData>): Promise<{ messageId: string }> => {
     const tenantId = resolveTenant(sendCfg.tenantId);
-    const state = getState(tenantId);
+    const delayMs = requireFutureDuration("send.delayMs", sendCfg.delayMs ?? 0, 0);
+    const idempotencyTtlMs = requireFutureDuration(
+      "send.idempotencyTtlMs",
+      sendCfg.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS,
+      1,
+    );
 
     // Measure the whole envelope, not just `data`: the server rejects on the
     // envelope, so measuring less here let a message through that the server
@@ -308,6 +346,8 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     if (payloadBytes > maxPayloadBytes) {
       throw new Error(`payload exceeds limit (${maxPayloadBytes} bytes)`);
     }
+
+    const state = getState(tenantId);
 
     // Idempotency check
     if (sendCfg.idempotencyKey) {
@@ -331,11 +371,10 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     if (sendCfg.idempotencyKey) {
       state.idempotency.set(sendCfg.idempotencyKey, {
         messageId,
-        expiresAt: Date.now() + (sendCfg.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS),
+        expiresAt: Date.now() + idempotencyTtlMs,
       });
     }
 
-    const delayMs = sendCfg.delayMs ?? 0;
     if (delayMs > 0) {
       state.delayed.set(messageId, Date.now() + delayMs);
     } else {
@@ -353,10 +392,14 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   const createReader = (): QueueReader<TData> => {
     const recv = async (recvCfg: QueueRecvConfig = {}): Promise<QueueReceived<TData> | null> => {
       const tenantId = resolveTenant(recvCfg.tenantId);
-      const state = getState(tenantId);
       const wait = recvCfg.wait ?? true;
-      const timeoutMs = recvCfg.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
-      const leaseMs = recvCfg.leaseMs ?? defaultLeaseMs;
+      const timeoutMs = requireFutureDuration(
+        "recv.timeoutMs",
+        recvCfg.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+        0,
+      );
+      const leaseMs = requireFutureDuration("recv.leaseMs", recvCfg.leaseMs ?? defaultLeaseMs, 1);
+      const state = getState(tenantId);
 
       runMaintenance(state, !wait);
 
@@ -444,7 +487,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
         if (!state.deliveries.has(deliveryId)) return false;
 
         // Validate BEFORE settling to avoid orphaning the message
-        const delayMs = cfg?.delayMs ?? 0;
+        const delayMs = requireFutureDuration("nack.delayMs", cfg?.delayMs ?? 0, 0);
         if (delayMs > maxNackDelayMs) {
           throw new Error(`delayMs exceeds maxNackDelayMs (${maxNackDelayMs})`);
         }
@@ -469,9 +512,10 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
       };
 
       const touch = async (cfg?: { leaseMs?: number }): Promise<boolean> => {
+        const newLeaseMs = requireFutureDuration("touch.leaseMs", cfg?.leaseMs ?? deliveryLeaseMs, 1);
         if (settled) return false;
         if (!state.deliveries.has(deliveryId)) return false;
-        const newLeaseMs = cfg?.leaseMs ?? deliveryLeaseMs;
+        if (delivery.leaseUntil <= Date.now()) return false;
         const newLeaseUntil = Date.now() + newLeaseMs;
         delivery.leaseUntil = newLeaseUntil;
         state.leases.set(deliveryId, newLeaseUntil);
@@ -509,9 +553,9 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   };
 
   const dlq = async (cfg: { tenantId?: string; limit?: number } = {}): Promise<Array<QueueDeadLetter<TData>>> => {
+    const limit = requireSafeInteger("dlq.limit", cfg.limit ?? 100, 1);
     const state = getState(resolveTenant(cfg.tenantId));
-    runMaintenance(state);
-    const limit = Math.max(1, cfg.limit ?? 100);
+    runMaintenance(state, true);
     return [...state.dlq.values()]
       .sort((a, b) => a.movedAt - b.movedAt)
       .slice(0, limit)

@@ -529,6 +529,38 @@ test("nack with delayMs exceeding maxNackDelayMs throws", async () => {
   await expect(msg!.nack({ delayMs: 200 })).rejects.toThrow("exceeds maxNackDelayMs");
 });
 
+test("queue timings reject unsafe values before mutating browser state", async () => {
+  expect(() =>
+    queue({
+      id: `invalid-defaults-${Date.now()}`,
+      delivery: { defaultLeaseMs: Number.NaN },
+    }),
+  ).toThrow("delivery.defaultLeaseMs must be a safe integer");
+
+  const q = queue<{ v: number }>({ id: `invalid-timings-${Date.now()}` });
+  await expect(q.send({ data: { v: 1 }, delayMs: Number.NaN })).rejects.toThrow(
+    "send.delayMs must be a safe integer",
+  );
+  await expect(q.send({ data: { v: 1 }, idempotencyTtlMs: 0 })).rejects.toThrow(
+    "send.idempotencyTtlMs must be a safe integer",
+  );
+
+  expect((await q.send({ data: { v: 1 } })).messageId).toBe("1");
+  await expect(q.recv({ wait: false, timeoutMs: Number.NaN })).rejects.toThrow(
+    "recv.timeoutMs must be a safe integer",
+  );
+  await expect(q.recv({ wait: false, leaseMs: Number.POSITIVE_INFINITY })).rejects.toThrow(
+    "recv.leaseMs must be a safe integer",
+  );
+  const message = await q.recv({ wait: false });
+  await expect(message?.nack({ delayMs: Number.NaN })).rejects.toThrow(
+    "nack.delayMs must be a safe integer",
+  );
+  await expect(message?.touch({ leaseMs: 0 })).rejects.toThrow("touch.leaseMs must be a safe integer");
+  expect(await message?.ack()).toBe(true);
+  await expect(q.dlq({ limit: Number.NaN })).rejects.toThrow("dlq.limit must be a safe integer");
+});
+
 test("touch after ack returns false", async () => {
   const q = queue({
     id: `touch-after-ack-${Date.now()}`,
@@ -538,6 +570,18 @@ test("touch after ack returns false", async () => {
   expect(msg).not.toBeNull();
   await msg!.ack();
   expect(await msg!.touch()).toBe(false);
+});
+
+test("touch cannot revive a browser lease after its deadline", async () => {
+  const q = queue({ id: `touch-expired-${Date.now()}` });
+  await q.send({ data: { v: 1 } });
+  const message = await q.recv({ wait: false, leaseMs: 30 });
+  await Bun.sleep(50);
+
+  expect(await message?.touch({ leaseMs: 1_000 })).toBe(false);
+  const redelivered = await q.recv({ wait: false });
+  expect(redelivered?.messageId).toBe(message?.messageId);
+  expect(await redelivered?.ack()).toBe(true);
 });
 
 // ==========================
@@ -556,6 +600,7 @@ test("message age expiry in claimNext moves to DLQ", async () => {
   // recv should return null because the message aged out during claimNext
   const msg = await q.recv({ wait: false });
   expect(msg).toBeNull();
+  expect((await q.dlq()).map((entry) => entry.reason)).toEqual(["expired"]);
 });
 
 test("nack after ack returns false", async () => {
@@ -639,6 +684,21 @@ test("dlq entries are readable and drainable", async () => {
 
   expect(await q.dlqRemove({ messageId: entries[0]!.messageId })).toBe(true);
   expect((await q.dlq()).length).toBe(0);
+});
+
+test("dlq reads purge entries after the retention window", async () => {
+  const q = queue<{ v: number }>({
+    id: `dlq-retention-${Date.now()}`,
+    delivery: { maxDeliveries: 1 },
+    limits: { dlqRetentionMs: 80 },
+  });
+
+  await q.send({ data: { v: 1 } });
+  await (await q.recv({ wait: false }))?.nack();
+  expect((await q.dlq()).length).toBe(1);
+
+  await Bun.sleep(120);
+  expect(await q.dlq()).toEqual([]);
 });
 
 test("touch defaults to this delivery's lease, not the queue default", async () => {

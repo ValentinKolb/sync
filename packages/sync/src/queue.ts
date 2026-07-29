@@ -310,6 +310,9 @@ const CLAIM_SCRIPT = `
   local leaseUntil = tonumber(ARGV[2])
   local maxSkips = tonumber(ARGV[3])
   local consumerId = ARGV[4]
+  local now = tonumber(ARGV[5])
+  local maxMessageAgeMs = tonumber(ARGV[6])
+  local dlqTtlMs = tonumber(ARGV[7])
 
   local messageId = nil
   local message = nil
@@ -322,17 +325,30 @@ const CLAIM_SCRIPT = `
     if messageRaw then
       local parsed = readMessage(messageRaw)
       if parsed then
-        messageId = candidate
-        message = parsed
-        break
+        local enqueuedAt = tonumber(parsed.enqueuedAt) or now
+        if (now - enqueuedAt) > maxMessageAgeMs then
+          writeDeadLetter(KEYS[8], KEYS[9], candidate, parsed, now, "expired", nil, dlqTtlMs)
+          redis.call("HDEL", KEYS[1], candidate)
+          redis.call("LREM", KEYS[4], 1, candidate)
+          redis.call("HDEL", KEYS[6], candidate)
+          redis.call("HDEL", KEYS[7], candidate)
+        else
+          messageId = candidate
+          message = parsed
+          break
+        end
+      else
+        redis.call("HDEL", KEYS[1], candidate)
       end
-      redis.call("HDEL", KEYS[1], candidate)
     end
     -- Dead id: drop it from active and keep draining.
     redis.call("LREM", KEYS[4], 1, candidate)
   end
 
-  if not messageId then return nil end
+  if not messageId then
+    if redis.call("LLEN", KEYS[5]) > 0 then return "retry" end
+    return nil
+  end
 
   message.attempt = (tonumber(message.attempt) or 0) + 1
   redis.call("HSET", KEYS[1], messageId, cjson.encode(message))
@@ -460,7 +476,8 @@ const NACK_SCRIPT = `
 
 const TOUCH_SCRIPT = `
   local deliveryId = ARGV[1]
-  local leaseUntil = tonumber(ARGV[2])
+  local now = tonumber(ARGV[2])
+  local leaseUntil = tonumber(ARGV[3])
 
   local deliveryRaw = redis.call("HGET", KEYS[1], deliveryId)
   if not deliveryRaw then
@@ -474,6 +491,10 @@ const TOUCH_SCRIPT = `
     return 0
   end
 
+  if (tonumber(delivery.leaseUntil) or 0) <= now then
+    return 0
+  end
+
   delivery.leaseUntil = leaseUntil
   redis.call("HSET", KEYS[1], deliveryId, cjson.encode(delivery))
   redis.call("ZADD", KEYS[2], tostring(leaseUntil), deliveryId)
@@ -481,9 +502,74 @@ const TOUCH_SCRIPT = `
   return 1
 `;
 
+const DLQ_READ_SCRIPT = `
+  local cutoff = tonumber(ARGV[1])
+  local limit = tonumber(ARGV[2])
+
+  local function purgeExpired()
+    local staleIds = redis.call("ZRANGEBYSCORE", KEYS[2], "-inf", tostring(cutoff))
+    for _, messageId in ipairs(staleIds) do
+      redis.call("HDEL", KEYS[1], messageId)
+      redis.call("ZREM", KEYS[2], messageId)
+    end
+  end
+  purgeExpired()
+
+  -- Entries written by <= 5.8.0 have no index member. Check every hash entry:
+  -- count equality cannot prove membership equality after an interrupted legacy
+  -- remove left a stale index id in place of a valid unindexed hash entry.
+  local entries = redis.call("HGETALL", KEYS[1])
+  for i = 1, #entries, 2 do
+    local messageId = entries[i]
+    if not redis.call("ZSCORE", KEYS[2], messageId) then
+      local movedAt = 0
+      local ok, record = pcall(cjson.decode, entries[i + 1])
+      if ok and type(record) == "table" then
+        movedAt = tonumber(record.movedAt) or 0
+      end
+      redis.call("ZADD", KEYS[2], tostring(movedAt), messageId)
+    end
+  end
+  purgeExpired()
+
+  local ids = redis.call("ZRANGE", KEYS[2], "0", "-1")
+  local result = {}
+  for _, messageId in ipairs(ids) do
+    local raw = redis.call("HGET", KEYS[1], messageId)
+    if raw then
+      local ok, record = pcall(cjson.decode, raw)
+      if ok and type(record) == "table" and record.messageId then
+        table.insert(result, raw)
+        if #result >= limit then break end
+      else
+        redis.call("HDEL", KEYS[1], messageId)
+        redis.call("ZREM", KEYS[2], messageId)
+      end
+    else
+      redis.call("ZREM", KEYS[2], messageId)
+    end
+  end
+  return result
+`;
+
+const DLQ_REMOVE_SCRIPT = `
+  local removed = redis.call("HDEL", KEYS[1], ARGV[1])
+  redis.call("ZREM", KEYS[2], ARGV[1])
+  return removed
+`;
+
 const textEncoder = new TextEncoder();
 
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
+const requireSafeInteger = (name: string, value: number, min: number, max = Number.MAX_SAFE_INTEGER): number => {
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new RangeError(`${name} must be a safe integer between ${min} and ${max}`);
+  }
+  return value;
+};
+
+const requireFutureDuration = (name: string, value: number, min: number): number =>
+  requireSafeInteger(name, value, min, Number.MAX_SAFE_INTEGER - Date.now());
 
 const safeClose = (client: RedisClient): void => {
   if (!client.connected) return;
@@ -642,12 +728,36 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
 
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
-  const maxPayloadBytes = config.limits?.payloadBytes ?? DEFAULT_PAYLOAD_BYTES;
-  const maxMessageAgeMs = config.limits?.maxMessageAgeMs ?? DEFAULT_MAX_MESSAGE_AGE_MS;
-  const maxNackDelayMs = config.limits?.maxNackDelayMs ?? DEFAULT_MAX_NACK_DELAY_MS;
-  const dlqRetentionMs = config.limits?.dlqRetentionMs ?? DEFAULT_DLQ_RETENTION_MS;
-  const defaultLeaseMs = config.delivery?.defaultLeaseMs ?? DEFAULT_LEASE_MS;
-  const maxDeliveries = config.delivery?.maxDeliveries ?? DEFAULT_MAX_DELIVERIES;
+  const maxPayloadBytes = requireSafeInteger(
+    "limits.payloadBytes",
+    config.limits?.payloadBytes ?? DEFAULT_PAYLOAD_BYTES,
+    1,
+  );
+  const maxMessageAgeMs = requireSafeInteger(
+    "limits.maxMessageAgeMs",
+    config.limits?.maxMessageAgeMs ?? DEFAULT_MAX_MESSAGE_AGE_MS,
+    1,
+  );
+  const maxNackDelayMs = requireSafeInteger(
+    "limits.maxNackDelayMs",
+    config.limits?.maxNackDelayMs ?? DEFAULT_MAX_NACK_DELAY_MS,
+    0,
+  );
+  const dlqRetentionMs = requireSafeInteger(
+    "limits.dlqRetentionMs",
+    config.limits?.dlqRetentionMs ?? DEFAULT_DLQ_RETENTION_MS,
+    1,
+  );
+  const defaultLeaseMs = requireFutureDuration(
+    "delivery.defaultLeaseMs",
+    config.delivery?.defaultLeaseMs ?? DEFAULT_LEASE_MS,
+    1,
+  );
+  const maxDeliveries = requireSafeInteger(
+    "delivery.maxDeliveries",
+    config.delivery?.maxDeliveries ?? DEFAULT_MAX_DELIVERIES,
+    1,
+  );
 
   const resolveTenant = (tenantId?: string): string => tenantId ?? defaultTenant;
 
@@ -749,8 +859,12 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
       const tenantId = resolveTenant(recvCfg.tenantId);
       const keys = keysForTenant(tenantId);
       const wait = recvCfg.wait ?? true;
-      const timeoutMs = recvCfg.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
-      const leaseMs = recvCfg.leaseMs ?? defaultLeaseMs;
+      const timeoutMs = requireFutureDuration(
+        "recv.timeoutMs",
+        recvCfg.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
+        0,
+      );
+      const leaseMs = requireFutureDuration("recv.leaseMs", recvCfg.leaseMs ?? defaultLeaseMs, 1);
       const deadline = Date.now() + timeoutMs;
 
       const onAbort = (): void => {
@@ -775,9 +889,21 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
               keys.ready,
               keys.deliveryOwners,
               keys.orphanCandidates,
+              keys.dlq,
+              keys.dlqIndex,
             ],
-            [deliveryId, Date.now() + leaseMs, CLAIM_MAX_SKIPS, recvCfg.consumerId ?? ""],
+            [
+              deliveryId,
+              Date.now() + leaseMs,
+              CLAIM_MAX_SKIPS,
+              recvCfg.consumerId ?? "",
+              Date.now(),
+              maxMessageAgeMs,
+              dlqRetentionMs,
+            ],
           );
+
+          if (claimRaw === "retry") continue;
 
           let claimed: ClaimResult | null = null;
           if (typeof claimRaw === "string") {
@@ -796,76 +922,82 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
             continue;
           }
 
-        const ack = async (): Promise<boolean> => {
-          const result = await evalScript(
-            ACK_SCRIPT,
-            [
-              keys.deliveries,
-              keys.leases,
-              keys.messages,
-              keys.active,
-              keys.deliveryOwners,
-              keys.orphanCandidates,
-            ],
-            [claimed.deliveryId],
-          );
-          return Number(result) > 0;
-        };
+          const ack = async (): Promise<boolean> => {
+            const result = await evalScript(
+              ACK_SCRIPT,
+              [
+                keys.deliveries,
+                keys.leases,
+                keys.messages,
+                keys.active,
+                keys.deliveryOwners,
+                keys.orphanCandidates,
+              ],
+              [claimed.deliveryId],
+            );
+            return Number(result) > 0;
+          };
 
-        const nack = async (nackCfg: { delayMs?: number; reason?: string; error?: string } = {}): Promise<boolean> => {
-          const delayMs = Math.max(0, nackCfg.delayMs ?? 0);
-          if (delayMs > maxNackDelayMs) {
-            throw new Error(`delayMs exceeds maxNackDelayMs (${maxNackDelayMs})`);
-          }
+          const nack = async (
+            nackCfg: { delayMs?: number; reason?: string; error?: string } = {},
+          ): Promise<boolean> => {
+            const delayMs = requireFutureDuration("nack.delayMs", nackCfg.delayMs ?? 0, 0);
+            if (delayMs > maxNackDelayMs) {
+              throw new Error(`delayMs exceeds maxNackDelayMs (${maxNackDelayMs})`);
+            }
 
-          const result = await evalScript(
-            NACK_SCRIPT,
-            [
-              keys.deliveries,
-              keys.leases,
-              keys.messages,
-              keys.active,
-              keys.ready,
-              keys.delayed,
-              keys.dlq,
-              keys.notify,
-              keys.dlqIndex,
-              keys.deliveryOwners,
-              keys.orphanCandidates,
-            ],
-            [
-              claimed.deliveryId,
-              Date.now(),
-              delayMs,
-            maxDeliveries,
-            nackCfg.reason ?? "",
-            nackCfg.error ?? "",
-            dlqRetentionMs,
-          ],
-        );
+            const result = await evalScript(
+              NACK_SCRIPT,
+              [
+                keys.deliveries,
+                keys.leases,
+                keys.messages,
+                keys.active,
+                keys.ready,
+                keys.delayed,
+                keys.dlq,
+                keys.notify,
+                keys.dlqIndex,
+                keys.deliveryOwners,
+                keys.orphanCandidates,
+              ],
+              [
+                claimed.deliveryId,
+                Date.now(),
+                delayMs,
+                maxDeliveries,
+                nackCfg.reason ?? "",
+                nackCfg.error ?? "",
+                dlqRetentionMs,
+              ],
+            );
 
-          return Number(result) > 0;
-        };
+            return Number(result) > 0;
+          };
 
-        const touch = async (touchCfg: { leaseMs?: number } = {}): Promise<boolean> => {
-          const nextLeaseMs = touchCfg.leaseMs ?? leaseMs;
-          const nextLeaseUntil = Date.now() + nextLeaseMs;
-          const result = await evalScript(TOUCH_SCRIPT, [keys.deliveries, keys.leases], [claimed.deliveryId, nextLeaseUntil]);
-          return Number(result) > 0;
-        };
+          const touch = async (touchCfg: { leaseMs?: number } = {}): Promise<boolean> => {
+            const nextLeaseMs = requireFutureDuration("touch.leaseMs", touchCfg.leaseMs ?? leaseMs, 1);
+            const nextLeaseUntil = Date.now() + nextLeaseMs;
+            const result = await evalScript(
+              TOUCH_SCRIPT,
+              [keys.deliveries, keys.leases],
+              [claimed.deliveryId, Date.now(), nextLeaseUntil],
+            );
+            return Number(result) > 0;
+          };
 
-        return {
-          data: parseOpaque<TData>(claimed.dataJson) as TData,
-          messageId: claimed.messageId,
-          deliveryId: claimed.deliveryId,
-          attempt: claimed.attempt,
-          leaseUntil: claimed.leaseUntil,
-          orderingKey: claimed.orderingKey,
-          meta: asObject<Record<string, unknown>>(parseOpaque(claimed.metaJson)) ?? undefined,
-          ack,
-          nack,
-          touch,
-        };
+          return {
+            data: parseOpaque<TData>(claimed.dataJson) as TData,
+            messageId: claimed.messageId,
+            deliveryId: claimed.deliveryId,
+            attempt: claimed.attempt,
+            leaseUntil: claimed.leaseUntil,
+            orderingKey: claimed.orderingKey,
+            meta: asObject<Record<string, unknown>>(parseOpaque(claimed.metaJson)) ?? undefined,
+            ack,
+            nack,
+            touch,
+          };
         }
       } finally {
         recvCfg.signal?.removeEventListener("abort", onAbort);
@@ -906,8 +1038,12 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     const keys = keysForTenant(tenantId);
 
     const now = Date.now();
-    const delayMs = Math.max(0, sendCfg.delayMs ?? 0);
-    const idempotencyTtlMs = sendCfg.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS;
+    const delayMs = requireFutureDuration("send.delayMs", sendCfg.delayMs ?? 0, 0);
+    const idempotencyTtlMs = requireFutureDuration(
+      "send.idempotencyTtlMs",
+      sendCfg.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS,
+      1,
+    );
 
     const dataJson = sendCfg.data === undefined ? undefined : JSON.stringify(sendCfg.data);
     const metaJson = sendCfg.meta === undefined ? undefined : JSON.stringify(sendCfg.meta);
@@ -988,27 +1124,14 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
 
   const dlq = async (cfg: { tenantId?: string; limit?: number } = {}): Promise<Array<QueueDeadLetter<TData>>> => {
     const keys = keysForTenant(resolveTenant(cfg.tenantId));
-    const limit = Math.max(1, cfg.limit ?? 100);
+    const limit = requireSafeInteger("dlq.limit", cfg.limit ?? 100, 1);
+    const raws = (await evalScript(
+      DLQ_READ_SCRIPT,
+      [keys.dlq, keys.dlqIndex],
+      [Date.now() - dlqRetentionMs, limit],
+    )) as unknown[];
+    if (!Array.isArray(raws) || raws.length === 0) return [];
 
-    // Entries written by <= 5.8.0 have no index member. Backfill once so the
-    // index stays the single ordering source afterwards.
-    const [indexed, stored] = await Promise.all([
-      redis.send("ZCARD", [keys.dlqIndex]),
-      redis.send("HLEN", [keys.dlq]),
-    ]);
-    if (Number(stored) > Number(indexed)) {
-      const all = (await redis.send("HGETALL", [keys.dlq])) as Record<string, string>;
-      const members: string[] = [];
-      for (const [messageId, raw] of Object.entries(all ?? {})) {
-        members.push(String(parseDeadLetter(raw)?.movedAt ?? 0), messageId);
-      }
-      if (members.length > 0) await redis.send("ZADD", [keys.dlqIndex, ...members]);
-    }
-
-    const ids = (await redis.send("ZRANGE", [keys.dlqIndex, "0", String(limit - 1)])) as string[];
-    if (!Array.isArray(ids) || ids.length === 0) return [];
-
-    const raws = (await redis.send("HMGET", [keys.dlq, ...ids])) as unknown[];
     const entries: Array<QueueDeadLetter<TData>> = [];
     for (const raw of raws) {
       const entry = parseDeadLetter(raw);
@@ -1019,8 +1142,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
 
   const dlqRemove = async (cfg: { messageId: string; tenantId?: string }): Promise<boolean> => {
     const keys = keysForTenant(resolveTenant(cfg.tenantId));
-    const removed = await redis.send("HDEL", [keys.dlq, cfg.messageId]);
-    await redis.send("ZREM", [keys.dlqIndex, cfg.messageId]);
+    const removed = await evalScript(DLQ_REMOVE_SCRIPT, [keys.dlq, keys.dlqIndex], [cfg.messageId]);
     return Number(removed) > 0;
   };
 

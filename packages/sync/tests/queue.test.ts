@@ -81,6 +81,19 @@ test("touch extends lease", async () => {
   expect(await message?.ack()).toBe(true);
 });
 
+test("touch cannot revive a lease after its deadline", async () => {
+  const q = queue({ id: "touch-expired", prefix: "test:q" });
+
+  await q.send({ data: { v: 1 } });
+  const message = await q.recv({ wait: false, leaseMs: 30 });
+  await Bun.sleep(50);
+
+  expect(await message?.touch({ leaseMs: 1_000 })).toBe(false);
+  const redelivered = await q.recv({ wait: false });
+  expect(redelivered?.messageId).toBe(message?.messageId);
+  expect(await redelivered?.ack()).toBe(true);
+});
+
 test("expired lease requeues message", async () => {
   const q = queue({
     id: "expire",
@@ -158,6 +171,40 @@ test("nack delay validation rejects values above maxNackDelayMs", async () => {
 
   expect(thrown).not.toBeNull();
   expect(await message?.ack()).toBe(true);
+});
+
+test("queue timings reject unsafe values before mutating Redis", async () => {
+  expect(() =>
+    queue({
+      id: "invalid-defaults",
+      prefix: "test:q",
+      delivery: { defaultLeaseMs: Number.NaN },
+    }),
+  ).toThrow("delivery.defaultLeaseMs must be a safe integer");
+
+  const q = queue({ id: "invalid-timings", prefix: "test:q" });
+  await expect(q.send({ data: { v: 1 }, delayMs: Number.NaN })).rejects.toThrow(
+    "send.delayMs must be a safe integer",
+  );
+  await expect(q.send({ data: { v: 1 }, idempotencyTtlMs: 0 })).rejects.toThrow(
+    "send.idempotencyTtlMs must be a safe integer",
+  );
+  expect(await redis.send("GET", ["test:q:default:invalid-timings:seq"])).toBeNull();
+
+  await q.send({ data: { v: 1 } });
+  await expect(q.recv({ wait: false, timeoutMs: Number.NaN })).rejects.toThrow(
+    "recv.timeoutMs must be a safe integer",
+  );
+  await expect(q.recv({ wait: false, leaseMs: Number.POSITIVE_INFINITY })).rejects.toThrow(
+    "recv.leaseMs must be a safe integer",
+  );
+  const message = await q.recv({ wait: false });
+  await expect(message?.nack({ delayMs: Number.NaN })).rejects.toThrow(
+    "nack.delayMs must be a safe integer",
+  );
+  await expect(message?.touch({ leaseMs: 0 })).rejects.toThrow("touch.leaseMs must be a safe integer");
+  expect(await message?.ack()).toBe(true);
+  await expect(q.dlq({ limit: Number.NaN })).rejects.toThrow("dlq.limit must be a safe integer");
 });
 
 test("tenant isolation keeps queues separated", async () => {
@@ -469,6 +516,42 @@ test("nack delay exceeding maxMessageAgeMs sends message to DLQ", async () => {
   expect(dlqEntry.reason).toBe("expired");
 });
 
+test("an expired ready message moves to the DLQ instead of being claimed", async () => {
+  const q = queue<{ v: number }>({
+    id: "ready-age-dlq",
+    prefix: "test:q",
+    limits: { maxMessageAgeMs: 50 },
+  });
+
+  await q.send({ data: { v: 1 } });
+  await Bun.sleep(80);
+
+  expect(await q.recv({ wait: false })).toBeNull();
+  const entries = await q.dlq();
+  expect(entries.map((entry) => entry.reason)).toEqual(["expired"]);
+  expect(await redis.send("LLEN", ["test:q:default:ready-age-dlq:active"])).toBe(0);
+  expect(await redis.send("HLEN", ["test:q:default:ready-age-dlq:messages"])).toBe(0);
+});
+
+test("recv drains more than one expired claim batch before returning a valid message", async () => {
+  const q = queue<{ v: number }>({
+    id: "ready-age-batch",
+    prefix: "test:q",
+    limits: { maxMessageAgeMs: 50 },
+  });
+
+  for (let i = 0; i < 33; i++) {
+    await q.send({ data: { v: i } });
+  }
+  await Bun.sleep(80);
+  await q.send({ data: { v: 99 } });
+
+  const valid = await q.recv({ wait: false });
+  expect(valid?.data).toEqual({ v: 99 });
+  expect((await q.dlq()).length).toBe(33);
+  expect(await valid?.ack()).toBe(true);
+});
+
 test("blocking recv unblocks when message is sent", async () => {
   const q = queue({
     id: "blocking-recv",
@@ -656,8 +739,28 @@ test("dlq entries are readable, drainable and bounded per entry", async () => {
   expect(entries[0]?.attempts).toBe(1);
 
   expect(await q.dlqRemove({ messageId: entries[0]!.messageId })).toBe(true);
+  expect(await redis.send("ZSCORE", ["test:q:default:dlq-api:dlq:index", entries[0]!.messageId])).toBeNull();
   expect(await q.dlqRemove({ messageId: entries[0]!.messageId })).toBe(false);
   expect((await q.dlq()).length).toBe(1);
+});
+
+test("dlq reads purge expired hash and index entries without a later failure", async () => {
+  const q = queue<{ v: number }>({
+    id: "dlq-read-retention",
+    prefix: "test:q",
+    delivery: { maxDeliveries: 1 },
+    limits: { dlqRetentionMs: 80 },
+  });
+
+  await q.send({ data: { v: 1 } });
+  await (await q.recv({ wait: false }))?.nack();
+  expect((await q.dlq()).length).toBe(1);
+
+  await Bun.sleep(120);
+
+  expect(await q.dlq()).toEqual([]);
+  expect(await redis.send("HLEN", ["test:q:default:dlq-read-retention:dlq"])).toBe(0);
+  expect(await redis.send("ZCARD", ["test:q:default:dlq-read-retention:dlq:index"])).toBe(0);
 });
 
 test("dlq retention drops entries older than the window without dropping fresh ones", async () => {
@@ -704,4 +807,28 @@ test("dead letters written in the 5.8.0 format are still listed", async () => {
   expect(entries[0]?.data).toEqual({ tag: "old" });
   expect(entries[0]?.meta).toEqual({ source: "legacy" });
   expect(entries[0]?.reason).toBe("expired");
+});
+
+test("dlq reads reconcile a stale index without hiding an unindexed legacy entry", async () => {
+  const q = queue<{ tag: string }>({ id: "dlq-stale-index", prefix: "test:q" });
+  const dlqKey = "test:q:default:dlq-stale-index:dlq";
+  const indexKey = `${dlqKey}:index`;
+
+  await redis.send("HSET", [
+    dlqKey,
+    "valid",
+    JSON.stringify({
+      messageId: "valid",
+      data: { tag: "kept" },
+      attempts: 1,
+      movedAt: Date.now(),
+      reason: "failed",
+    }),
+  ]);
+  await redis.send("ZADD", [indexKey, String(Date.now() - 1), "missing"]);
+
+  const entries = await q.dlq({ limit: 1 });
+  expect(entries.map((entry) => entry.messageId)).toEqual(["valid"]);
+  expect(await redis.send("ZSCORE", [indexKey, "missing"])).toBeNull();
+  expect(await redis.send("ZSCORE", [indexKey, "valid"])).not.toBeNull();
 });
