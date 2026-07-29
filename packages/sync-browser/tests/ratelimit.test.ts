@@ -381,3 +381,13 @@ test("uses internal memory store when no store is provided", async () => {
   const r3 = await limiter.check("u");
   expect(r3.limited).toBe(true);
 });
+
+test("long identifiers do not collide at a practical scale", async () => {
+  const { simpleHash } = await import("../src/internal/id");
+  const seen = new Set<string>();
+  for (let i = 0; i < 100_000; i++) {
+    seen.add(simpleHash(`user:${i}:${"x".repeat(200)}`));
+  }
+  // A 32-bit hash makes a birthday collision near-certain well before this.
+  expect(seen.size).toBe(100_000);
+});

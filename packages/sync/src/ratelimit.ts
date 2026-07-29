@@ -74,6 +74,20 @@ export class RateLimitError extends Error {
 // ==========================
 
 export const ratelimit = (config: RateLimitConfig): RateLimiter => {
+  // The browser threw on these at construction and the server did not, so the
+  // same config failed loudly there and silently here. windowSecs: 0 — e.g.
+  // Number(process.env.RL_WINDOW) on an unset var — made both window keys
+  // Infinity and collapse to one, elapsedRatio NaN, and `EXPIRE key 0` delete
+  // the counter on every first increment, so the weighted count never exceeded
+  // the limit and the limiter allowed everything. A fractional windowSecs made
+  // EXPIRE reject exactly the first request of each window.
+  if (!Number.isFinite(config.limit) || config.limit <= 0) {
+    throw new Error("limit must be > 0");
+  }
+  if (config.windowSecs !== undefined && (!Number.isInteger(config.windowSecs) || config.windowSecs <= 0)) {
+    throw new Error("windowSecs must be a positive integer number of seconds");
+  }
+
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const windowSecs = config.windowSecs ?? DEFAULT_WINDOW_SECS;
   const { limit } = config;
@@ -102,7 +116,9 @@ export const ratelimit = (config: RateLimitConfig): RateLimiter => {
 
     const [, , weightedCount] = result;
 
-    const limited = weightedCount > limit;
+    // Fail closed on a non-comparable count: an abuse-control primitive must
+    // never allow everything because arithmetic went sideways.
+    const limited = !Number.isFinite(weightedCount) || weightedCount > limit;
     const remaining = Math.max(0, Math.floor(limit - weightedCount));
     const resetIn = windowMs - elapsedInWindow;
 

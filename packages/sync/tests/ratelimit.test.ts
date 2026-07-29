@@ -193,3 +193,14 @@ test("different limiter ids are isolated", async () => {
   const webhookOk = await webhookLimiter.check("user:1");
   expect(webhookOk.limited).toBe(false);
 });
+
+test("invalid limiter configuration is rejected instead of failing open", () => {
+  // windowSecs: 0 collapsed both window keys, made elapsedRatio NaN, and
+  // `EXPIRE key 0` deleted the counter on every first increment — so the
+  // limiter silently allowed everything, the worst failure available to an
+  // abuse-control primitive. The browser already threw on the same config.
+  expect(() => ratelimit({ id: "bad-window", limit: 5, windowSecs: 0 })).toThrow(/windowSecs/);
+  expect(() => ratelimit({ id: "frac-window", limit: 5, windowSecs: 0.1 })).toThrow(/windowSecs/);
+  expect(() => ratelimit({ id: "bad-limit", limit: 0, windowSecs: 60 })).toThrow(/limit/);
+  expect(() => ratelimit({ id: "ok", limit: 5, windowSecs: 60 })).not.toThrow();
+});
