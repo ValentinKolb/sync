@@ -86,6 +86,64 @@ test("start is idempotent for a persisted key", async () => {
   expect(pulls).toBe(1);
 });
 
+test("default same-id handles share persisted runs", async () => {
+  const id = uid("shared-default");
+  let releasePull!: () => void;
+  const pull = async (): Promise<{ items: Item[]; nextCursor: null }> => {
+    await new Promise<void>((resolve) => {
+      releasePull = resolve;
+    });
+    return { items: [], nextCursor: null };
+  };
+
+  const first = track(pump<Input, Cursor, Item>({
+    id,
+    pull,
+    dispatch: () => {},
+  }));
+  const second = track(pump<Input, Cursor, Item>({
+    id,
+    pull,
+    dispatch: () => {},
+  }));
+
+  await first.start({ key: "shared", input: { source: "first" } });
+  await waitFor(() => releasePull !== undefined);
+
+  expect(await second.get({ key: "shared" })).toMatchObject({
+    key: "shared",
+    input: { source: "first" },
+    state: "running",
+  });
+
+  releasePull();
+  await waitFor(async () => (await second.get({ key: "shared" }))?.state === "completed");
+});
+
+test("empty pages without cursor progress fail after maxAttempts", async () => {
+  let pulls = 0;
+  const worker = track(pump<Input, Cursor, Item>({
+    id: uid("stalled"),
+    retry: { maxAttempts: 2, baseMs: 5, maxMs: 5, jitter: 0 },
+    pull: ({ cursor }) => {
+      pulls += 1;
+      return { items: [], nextCursor: cursor ?? 1 };
+    },
+    dispatch: () => {},
+  }));
+
+  await worker.start({ key: "stalled", input: { source: "messages" } });
+  await waitFor(async () => (await worker.get({ key: "stalled" }))?.state === "failed");
+
+  expect(pulls).toBe(3);
+  expect(await worker.get({ key: "stalled" })).toMatchObject({
+    state: "failed",
+    cursor: 1,
+    failureCount: 2,
+    lastError: "pull returned an empty page without advancing the cursor",
+  });
+});
+
 test("retry resumes the active page from its item checkpoint", async () => {
   let pulls = 0;
   let failedOnce = false;

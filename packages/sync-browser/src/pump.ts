@@ -1,7 +1,8 @@
 import { randomId } from "./internal/id";
+import { resolveStore } from "./internal/shared-state";
 import { sleep } from "./internal/sleep";
 import { expBackoff, type BackoffOptions } from "./retry";
-import { type Store, createMemoryStore } from "./store";
+import { type Store } from "./store";
 import { emitTrace, type TraceHandler } from "./trace";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -17,6 +18,7 @@ const DEFAULT_RETRY_MAX_MS = 60_000;
 const DEFAULT_RETRY_JITTER = 0.2;
 const WORKER_POLL_MS = 250;
 const MAX_KEY_BYTES = 512;
+const STALLED_PAGE_ERROR = "pull returned an empty page without advancing the cursor";
 
 const textEncoder = new TextEncoder();
 
@@ -95,8 +97,8 @@ export type PumpConfig<Input, Cursor, Item extends PumpItem> = {
   pull: (ctx: PumpPullContext<Input, Cursor>) => Promise<PumpPullResult<Cursor, Item>> | PumpPullResult<Cursor, Item>;
   dispatch: (ctx: PumpDispatchContext<Input, Item>) => Promise<void> | void;
   /**
-   * Persistence backend. Defaults to MemoryStore; use LocalStorageStore to
-   * resume executions after a page reload.
+   * Persistence backend. Defaults to the process-wide MemoryStore; use
+   * LocalStorageStore to resume executions after a page reload.
    */
   store?: Store;
 };
@@ -138,12 +140,8 @@ type ActiveWorker = {
   current?: ActiveAttempt;
 };
 
-// Deliberately not a module-level registry. Keying workers by Store meant that
-// with default per-instance stores every handle ran its own 250ms poll loop and
-// stop() affected only its own — a permanent wakeup source in a tab — while
-// keying them by `${prefix}:${id}` would make a second same-id handle a silent
-// no-op. The worker belongs to the handle that started it; concurrent workers
-// on one run are already resolved by the leaseToken fence.
+// Workers belong to handles rather than the shared store. This keeps stop()
+// local while the lease token fences concurrent workers claiming the same run.
 
 class LeaseLostError extends Error {
   constructor() {
@@ -226,7 +224,7 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const baseKey = `${prefix}:${config.id}`;
   const runPrefix = `${baseKey}:run:`;
-  const store = config.store ?? createMemoryStore();
+  const store = resolveStore(config.store);
   const batchSize = Math.max(1, Math.floor(config.batchSize ?? DEFAULT_BATCH_SIZE));
   const delayMs = Math.max(0, config.delayMs ?? DEFAULT_DELAY_MS);
   const leaseMs = Math.max(50, config.defaults?.leaseMs ?? DEFAULT_LEASE_MS);
@@ -361,8 +359,6 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
           throw new LeaseLostError();
         }
         currentState.activePage = activePage;
-        currentState.failureCount = 0;
-        delete currentState.lastError;
         currentState.updatedAt = Date.now();
         state = writeState(stateKey, currentState);
 
@@ -427,15 +423,19 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
       }
 
       const nextCursor = currentState.activePage.nextCursor;
+      const stalled =
+        nextCursor !== null &&
+        currentState.activePage.items.length === 0 &&
+        JSON.stringify(nextCursor) === JSON.stringify(currentState.cursor);
       currentState.cursor = nextCursor;
       delete currentState.activePage;
       delete currentState.leaseToken;
       delete currentState.leaseUntil;
-      delete currentState.lastError;
-      currentState.failureCount = 0;
       currentState.updatedAt = Date.now();
 
       if (nextCursor === null) {
+        delete currentState.lastError;
+        currentState.failureCount = 0;
         currentState.state = "completed";
         delete currentState.nextRunAt;
         state = writeState(stateKey, currentState, terminalRetentionMs);
@@ -446,7 +446,41 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
           dispatched: state.dispatched,
           durationMs: Date.now() - state.createdAt,
         });
+      } else if (stalled) {
+        currentState.failureCount += 1;
+        currentState.lastError = STALLED_PAGE_ERROR;
+
+        if (currentState.failureCount >= maxAttempts) {
+          currentState.state = "failed";
+          delete currentState.nextRunAt;
+          state = writeState(stateKey, currentState, terminalRetentionMs);
+          await emitTrace(config.trace, {
+            type: "finished",
+            key: state.key,
+            status: "failed",
+            dispatched: state.dispatched,
+            durationMs: Date.now() - state.createdAt,
+            error: new Error(STALLED_PAGE_ERROR),
+          });
+        } else {
+          const retryDelayMs = Math.max(
+            delayMs,
+            expBackoff(currentState.failureCount, retryBackoff),
+          );
+          currentState.state = "waiting";
+          currentState.nextRunAt = Date.now() + retryDelayMs;
+          state = writeState(stateKey, currentState);
+          await emitTrace(config.trace, {
+            type: "rescheduled",
+            key: state.key,
+            failureCount: state.failureCount,
+            delayMs: retryDelayMs,
+            error: new Error(STALLED_PAGE_ERROR),
+          });
+        }
       } else {
+        delete currentState.lastError;
+        currentState.failureCount = 0;
         currentState.state = "waiting";
         currentState.nextRunAt = Date.now() + delayMs;
         writeState(stateKey, currentState);

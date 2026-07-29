@@ -195,8 +195,14 @@ const externalImport = pump<
 `delayMs` paces successful pages. Provider request budgets still belong in the
 API client or a shared rate limiter; pump pacing is not a rate limiter.
 
+An empty page that returns the current non-terminal cursor has made no progress.
+Pump retries it with the configured retry backoff and marks the run failed after
+`maxAttempts`. Return `nextCursor: null` when the source is exhausted.
+
 ## Browser
 
-Import from `@k2b/sync/browser`. State is in memory by default. Pass
-`store: createLocalStorageStore()` to resume after reloads. Multi-tab ownership
-is best-effort because browser storage has no Redis-style atomic fencing.
+Import from `@k2b/sync/browser`. State is in a process-wide memory store by
+default, so handles with the same `id` share runs. Pass the same explicit store
+to coordinate a separate scope, or `store: createLocalStorageStore()` to resume
+after reloads. Multi-tab ownership is best-effort because browser storage has
+no Redis-style atomic fencing.

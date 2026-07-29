@@ -103,6 +103,31 @@ test("start is idempotent for the same key", async () => {
   expect(pulls).toBe(1);
 });
 
+test("empty pages without cursor progress fail after maxAttempts", async () => {
+  let pulls = 0;
+  const worker = track(pump<Input, Cursor, Item>({
+    id: uid("stalled"),
+    prefix: "test:pump",
+    retry: { maxAttempts: 2, baseMs: 10, maxMs: 10, jitter: 0 },
+    pull: ({ cursor }) => {
+      pulls += 1;
+      return { items: [], nextCursor: cursor ?? 1 };
+    },
+    dispatch: () => {},
+  }));
+
+  await worker.start({ key: "stalled", input: { source: "messages" } });
+  await waitFor(async () => (await worker.get({ key: "stalled" }))?.state === "failed");
+
+  expect(pulls).toBe(3);
+  expect(await worker.get({ key: "stalled" })).toMatchObject({
+    state: "failed",
+    cursor: 1,
+    failureCount: 2,
+    lastError: "pull returned an empty page without advancing the cursor",
+  });
+});
+
 test("failed dispatch retries the persisted page without pulling again", async () => {
   let pulls = 0;
   let failedOnce = false;

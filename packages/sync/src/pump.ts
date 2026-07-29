@@ -16,6 +16,7 @@ const DEFAULT_RETRY_MAX_MS = 60_000;
 const DEFAULT_RETRY_JITTER = 0.2;
 const WORKER_POLL_MS = 250;
 const MAX_KEY_BYTES = 512;
+const STALLED_PAGE_ERROR = "pull returned an empty page without advancing the cursor";
 
 const textEncoder = new TextEncoder();
 
@@ -100,8 +101,6 @@ const STORE_PAGE_SCRIPT = `
   state.pageNextCursorJson = ARGV[4]
   state.pageNextIndex = 0
   state.pageItemCount = tonumber(ARGV[5])
-  state.failureCount = 0
-  state.lastError = nil
   state.updatedAt = tonumber(ARGV[6])
   local encoded = cjson.encode(state)
   redis.call("SET", KEYS[1], encoded)
@@ -151,24 +150,21 @@ const COMMIT_PAGE_SCRIPT = `
   -- empty page with a nextPageToken hammer Redis and the upstream forever, with
   -- no terminal state and no trace signal. Such a round now counts as a failure
   -- so the configured backoff and maxAttempts apply.
-  local stalled = tonumber(state.pageItemCount) == 0 and nextCursorJson == state.cursorJson
+  local stalled = nextCursorJson ~= "null"
+    and tonumber(state.pageItemCount) == 0
+    and nextCursorJson == state.cursorJson
   state.cursorJson = nextCursorJson
   state.pageItemsJson = nil
   state.pageNextCursorJson = nil
   state.pageNextIndex = nil
   state.pageItemCount = nil
-  if stalled then
-    state.failureCount = (tonumber(state.failureCount) or 0) + 1
-    state.lastError = "pull returned an empty page without advancing the cursor"
-  else
-    state.failureCount = 0
-    state.lastError = nil
-  end
   state.leaseToken = nil
   state.leaseUntil = nil
   state.updatedAt = tonumber(ARGV[3])
 
   if nextCursorJson == "null" then
+    state.failureCount = 0
+    state.lastError = nil
     state.state = "completed"
     state.nextRunAt = nil
     local encoded = cjson.encode(state)
@@ -177,8 +173,23 @@ const COMMIT_PAGE_SCRIPT = `
     return encoded
   end
 
+  if stalled then
+    state.failureCount = (tonumber(state.failureCount) or 0) + 1
+    state.lastError = "${STALLED_PAGE_ERROR}"
+    if state.failureCount >= tonumber(ARGV[7]) then
+      state.state = "failed"
+      state.nextRunAt = nil
+      local encoded = cjson.encode(state)
+      redis.call("SET", KEYS[1], encoded, "PX", ARGV[5])
+      redis.call("ZREM", KEYS[2], ARGV[1])
+      return encoded
+    end
+  else
+    state.failureCount = 0
+    state.lastError = nil
+  end
+
   state.state = "waiting"
-  -- ARGV[6] carries the backoff deadline used when the round made no progress.
   state.nextRunAt = stalled and tonumber(ARGV[6]) or tonumber(ARGV[4])
   local encoded = cjson.encode(state)
   redis.call("SET", KEYS[1], encoded)
@@ -694,15 +705,13 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
       }
 
       const nextRunAt = Date.now() + delayMs;
-      // Deadline used when the round made no progress, so a non-advancing empty
-      // page backs off instead of spinning.
       const stalledRunAt =
-        Date.now() + Math.max(delayMs, expBackoff((state.failureCount ?? 0) + 1, { baseMs: 250, maxMs: 30_000 }));
+        Date.now() + Math.max(delayMs, expBackoff((state.failureCount ?? 0) + 1, retryBackoff));
       const committed = parseState<Input, Cursor, Item>(
         await evalScript(
           COMMIT_PAGE_SCRIPT,
           [stateKeyForMember(member), dueKey],
-          [member, token, Date.now(), nextRunAt, terminalRetentionMs, stalledRunAt],
+          [member, token, Date.now(), nextRunAt, terminalRetentionMs, stalledRunAt, maxAttempts],
         ),
       );
       if (!committed) throw new LeaseLostError();
@@ -715,6 +724,23 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
           status: "completed",
           dispatched: state.dispatched,
           durationMs: Date.now() - state.createdAt,
+        });
+      } else if (state.state === "failed") {
+        await emitTrace(config.trace, {
+          type: "finished",
+          key: state.key,
+          status: "failed",
+          dispatched: state.dispatched,
+          durationMs: Date.now() - state.createdAt,
+          error: new Error(STALLED_PAGE_ERROR),
+        });
+      } else if (state.lastError === STALLED_PAGE_ERROR && state.nextRunAt !== undefined) {
+        await emitTrace(config.trace, {
+          type: "rescheduled",
+          key: state.key,
+          failureCount: state.failureCount,
+          delayMs: Math.max(0, state.nextRunAt - Date.now()),
+          error: new Error(STALLED_PAGE_ERROR),
         });
       }
     } catch (caught) {
