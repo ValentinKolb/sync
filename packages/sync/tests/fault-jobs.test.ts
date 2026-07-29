@@ -189,11 +189,18 @@ test("two live workers with the same id process each key exactly once", async ()
 }, 30_000);
 
 test("stop cancels the in-flight callback via ctx.signal", async () => {
+  const id = uid("stop-signal");
   let abortedDuringRun = false;
   let observedAfterStop = false;
+  let afterCalled = false;
+  const events: string[] = [];
 
   const worker = job({
-    id: uid("stop-signal"),
+    id,
+    defaults: { leaseMs: 100 },
+    trace: (event) => {
+      events.push(event.type);
+    },
     process: async ({ ctx }) => {
       // `ctx.signal.aborted` used to be false for the entire life of process,
       // making the documented cancellation pattern inoperative.
@@ -206,6 +213,9 @@ test("stop cancels the in-flight callback via ctx.signal", async () => {
       }
       observedAfterStop = true;
     },
+    after: async () => {
+      afterCalled = true;
+    },
   });
 
   await worker.submit({ key: "cancel-me" });
@@ -215,16 +225,32 @@ test("stop cancels the in-flight callback via ctx.signal", async () => {
 
   expect(abortedDuringRun).toBe(true);
   expect(observedAfterStop).toBe(false);
+  expect(afterCalled).toBe(false);
+  expect(worker.metric()).toEqual({ dispatches: 0, failures: 0, reschedules: 0 });
+  expect(events).toEqual(["submitted", "started"]);
+
+  const competitor = queue({ id: `${id}:work`, prefix: "sync:job:queue" }).reader();
+  let redelivered = null;
+  while (!redelivered) {
+    redelivered = await competitor.recv({ wait: false });
+    if (!redelivered) await Bun.sleep(20);
+  }
+  expect(await redelivered.ack()).toBe(true);
 });
 
 test("losing the lease during a heartbeat aborts the running callback", async () => {
   const id = uid("lease-loss-signal");
   const observed: boolean[] = [];
   let running = false;
+  let afterCalled = false;
+  const events: string[] = [];
 
   const worker = job({
     id,
     defaults: { leaseMs: 100 },
+    trace: (event) => {
+      events.push(event.type);
+    },
     process: async ({ ctx }) => {
       running = true;
       // Outlive the lease while another consumer takes the delivery over, then
@@ -233,6 +259,9 @@ test("losing the lease during a heartbeat aborts the running callback", async ()
       await Bun.sleep(900);
       await ctx.heartbeat();
       observed.push(ctx.signal.aborted);
+    },
+    after: async () => {
+      afterCalled = true;
     },
   });
 
@@ -254,11 +283,50 @@ test("losing the lease during a heartbeat aborts the running callback", async ()
   await stolen?.ack();
 
   expect(observed[0]).toBe(true);
+  expect(afterCalled).toBe(false);
+  expect(worker.metric()).toEqual({ dispatches: 0, failures: 0, reschedules: 0 });
+  expect(events).toEqual(["submitted", "started"]);
 }, 30_000);
 
 // ==========================
 // stop mid-process
 // ==========================
+
+test("submit after stop waits for the aborted callback before restarting", async () => {
+  let active = 0;
+  let maxActive = 0;
+  let firstStarted = false;
+  const processed: string[] = [];
+
+  const worker = job({
+    id: uid("stop-restart"),
+    process: async ({ ctx }) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      try {
+        if (ctx.key === "first") {
+          firstStarted = true;
+          while (!ctx.signal.aborted) await Bun.sleep(10);
+          await Bun.sleep(50);
+          return;
+        }
+        processed.push(ctx.key);
+      } finally {
+        active -= 1;
+      }
+    },
+  });
+
+  await worker.submit({ key: "first" });
+  await waitFor(() => firstStarted);
+  worker.stop();
+  await worker.submit({ key: "second" });
+
+  await waitFor(() => processed.includes("second"));
+  expect(processed).toEqual(["second"]);
+  expect(maxActive).toBe(1);
+  worker.stop();
+});
 
 test("worker.stop while process is running does not prevent the in-flight process from completing", async () => {
   let completedNormally = false;

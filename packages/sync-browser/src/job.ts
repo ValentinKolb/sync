@@ -173,8 +173,15 @@ export const job = <Input = void, Result = unknown>(
     return { jobId, isNew: true };
   };
 
-  const releaseKey = (key: string): void => {
-    shared.idempotency.delete(key);
+  const refreshKey = (key: string, jobId: JobId, keyTtlMs: number): void => {
+    const entry = shared.idempotency.get(key);
+    if (entry?.jobId === jobId) entry.expiresAt = Date.now() + keyTtlMs;
+  };
+
+  const releaseKey = (key: string, jobId: JobId): void => {
+    if (shared.idempotency.get(key)?.jobId === jobId) {
+      shared.idempotency.delete(key);
+    }
   };
 
   const startWorker = (): void => {
@@ -207,7 +214,19 @@ export const job = <Input = void, Result = unknown>(
             let leaseLost = false;
             activeJobAc = jobAc;
 
-            const makeCtx = (): JobCtx<Input> => {
+            try {
+              const keepLease = async (leaseMs = payload.leaseMs): Promise<boolean> => {
+                const held = await message.touch({ leaseMs });
+                if (!held) {
+                  leaseLost = true;
+                  jobAc.abort();
+                  return false;
+                }
+                refreshKey(payload.key, payload.jobId, payload.keyTtlMs);
+                return true;
+              };
+              const canceled = (): boolean => workerAc.signal.aborted || leaseLost || jobAc.signal.aborted;
+
               const ctx = {
                 jobId: payload.jobId,
                 key: payload.key,
@@ -215,129 +234,123 @@ export const job = <Input = void, Result = unknown>(
                 failureCount,
                 signal: jobAc.signal,
                 heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
-                  const held = await message.touch({ leaseMs: cfg?.leaseMs ?? payload.leaseMs });
-                  if (!held) {
-                    leaseLost = true;
-                    jobAc.abort();
-                  }
+                  await keepLease(cfg?.leaseMs);
                 },
               } as JobCtx<Input>;
               Object.defineProperty(ctx, "duration", {
                 get: () => Date.now() - startedAt,
                 enumerable: true,
               });
-              return ctx;
-            };
 
-            const ctx = makeCtx();
-            const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
+              // A delayed message may arrive after the original claim TTL.
+              // Delivery makes the claim current again before user code runs.
+              refreshKey(payload.key, payload.jobId, payload.keyTtlMs);
+              const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
 
-            await emitTrace(config.trace, {
-              type: "started",
-              jobId: payload.jobId,
-              key: payload.key,
-              ...traceInput,
-              attempt,
-            });
-
-            if (workerAc.signal.aborted) {
-              jobAc.abort();
-              if (activeJobAc === jobAc) activeJobAc = null;
-              continue;
-            }
-
-            let result: Result | undefined;
-            let error: Error | undefined;
-            try {
-              result = await Promise.resolve(config.process({ ctx }));
-            } catch (err) {
-              error = asError(err);
-            } finally {
-              jobAc.abort();
-              if (activeJobAc === jobAc) activeJobAc = null;
-            }
-
-            // stop() and a failed heartbeat both leave the message unsettled so
-            // its lease can expire and another worker can safely retry it.
-            if (workerAc.signal.aborted || leaseLost) continue;
-
-            if (error) {
               await emitTrace(config.trace, {
-                type: "failed",
+                type: "started",
                 jobId: payload.jobId,
                 key: payload.key,
                 ...traceInput,
-                error,
-                durationMs: Date.now() - startedAt,
-              });
-            } else {
-              await emitTrace(config.trace, {
-                type: "succeeded",
-                jobId: payload.jobId,
-                key: payload.key,
-                ...traceInput,
-                data: result as Result,
-                durationMs: Date.now() - startedAt,
-              });
-            }
-            if (workerAc.signal.aborted || leaseLost) continue;
-
-            // Build after ctx
-            let rescheduleRequested: { delayMs?: number } | null = null;
-            const afterCtx: JobAfterCtx<Input, Result> = Object.create(ctx) as JobAfterCtx<Input, Result>;
-            if (error) afterCtx.error = error;
-            if (!error) afterCtx.data = result;
-            afterCtx.reschedule = (rcfg?: { delayMs?: number }): void => {
-              rescheduleRequested = { delayMs: rcfg?.delayMs };
-            };
-            afterCtx.expBackoff = (bcfg?: BackoffOptions): number => expBackoff(failureCount + 1, bcfg);
-            afterCtx.metric = metrics;
-
-            if (config.after) {
-              try {
-                await Promise.resolve(config.after({ ctx: afterCtx }));
-              } catch {
-                // after errors are swallowed
-              }
-            }
-            if (workerAc.signal.aborted || leaseLost) continue;
-
-            if (rescheduleRequested) {
-              const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
-              const nacked = await message.nack({
-                delayMs,
-                reason: "reschedule",
-                error: error?.message,
-              });
-              if (!nacked) continue;
-              metrics.reschedules += 1;
-              await emitTrace(config.trace, {
-                type: "rescheduled",
-                jobId: payload.jobId,
-                key: payload.key,
                 attempt,
-                delayMs,
               });
-              continue;
-            }
+              if (canceled()) continue;
 
-            // Terminal: ack + release key
-            const acked = await message.ack();
-            if (!acked) continue;
-            releaseKey(payload.key);
+              let result: Result | undefined;
+              let error: Error | undefined;
+              try {
+                result = await Promise.resolve(config.process({ ctx }));
+              } catch (err) {
+                error = asError(err);
+              }
+              if (canceled() || !(await keepLease())) continue;
 
-            if (error) {
-              metrics.failures += 1;
-            } else {
-              metrics.dispatches += 1;
+              if (error) {
+                await emitTrace(config.trace, {
+                  type: "failed",
+                  jobId: payload.jobId,
+                  key: payload.key,
+                  ...traceInput,
+                  error,
+                  durationMs: Date.now() - startedAt,
+                });
+              } else {
+                await emitTrace(config.trace, {
+                  type: "succeeded",
+                  jobId: payload.jobId,
+                  key: payload.key,
+                  ...traceInput,
+                  data: result as Result,
+                  durationMs: Date.now() - startedAt,
+                });
+              }
+              if (canceled()) continue;
+
+              let rescheduleRequested: { delayMs?: number } | null = null;
+              const afterCtx: JobAfterCtx<Input, Result> = Object.create(ctx) as JobAfterCtx<Input, Result>;
+              if (error) afterCtx.error = error;
+              if (!error) afterCtx.data = result;
+              afterCtx.reschedule = (rcfg?: { delayMs?: number }): void => {
+                rescheduleRequested = { delayMs: rcfg?.delayMs };
+              };
+              afterCtx.expBackoff = (bcfg?: BackoffOptions): number => expBackoff(failureCount + 1, bcfg);
+              afterCtx.metric = metrics;
+
+              if (config.after) {
+                try {
+                  await Promise.resolve(config.after({ ctx: afterCtx }));
+                } catch {
+                  // after errors are swallowed
+                }
+              }
+              if (canceled() || !(await keepLease())) continue;
+
+              if (rescheduleRequested) {
+                const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
+                const nacked = await message.nack({
+                  delayMs,
+                  reason: "reschedule",
+                  error: error?.message,
+                });
+                if (!nacked) continue;
+                metrics.reschedules += 1;
+                refreshKey(
+                  payload.key,
+                  payload.jobId,
+                  Math.min(MAX_KEY_TTL_MS, delayMs + payload.keyTtlMs),
+                );
+                await emitTrace(config.trace, {
+                  type: "rescheduled",
+                  jobId: payload.jobId,
+                  key: payload.key,
+                  attempt,
+                  delayMs,
+                });
+                continue;
+              }
+
+              // Terminal: ack + release key
+              const acked = await message.ack();
+              if (!acked) continue;
+              releaseKey(payload.key, payload.jobId);
+
+              if (error) {
+                metrics.failures += 1;
+              } else {
+                metrics.dispatches += 1;
+              }
+              await emitTrace(config.trace, {
+                type: "finished",
+                jobId: payload.jobId,
+                key: payload.key,
+                status: error ? "failed" : "succeeded",
+                durationMs: Date.now() - startedAt,
+              });
+            } finally {
+              // Ordinary completion keeps the signal live through after().
+              // Only clear the controller if this attempt still owns the slot.
+              if (activeJobAc === jobAc) activeJobAc = null;
             }
-            await emitTrace(config.trace, {
-              type: "finished",
-              jobId: payload.jobId,
-              key: payload.key,
-              status: error ? "failed" : "succeeded",
-              durationMs: Date.now() - startedAt,
-            });
           } catch {
             if (workerAc.signal.aborted) break;
             await sleep(25);
@@ -359,8 +372,9 @@ export const job = <Input = void, Result = unknown>(
     const leaseMs = Math.max(1, cfg.leaseMs ?? defaultLeaseMs);
     const keyTtlMs = Math.min(MAX_KEY_TTL_MS, Math.max(1_000, cfg.keyTtlMs ?? defaultKeyTtlMs));
     const delayMs = cfg.at !== undefined ? Math.max(0, cfg.at - Date.now()) : Math.max(0, cfg.delayMs ?? 0);
+    const initialKeyTtlMs = Math.min(MAX_KEY_TTL_MS, delayMs + keyTtlMs);
 
-    const { jobId, isNew } = claimKey(cfg.key, keyTtlMs);
+    const { jobId, isNew } = claimKey(cfg.key, initialKeyTtlMs);
     if (!isNew) {
       startWorker();
       return jobId;
@@ -382,7 +396,7 @@ export const job = <Input = void, Result = unknown>(
         meta: cfg.meta,
       });
     } catch (error) {
-      releaseKey(cfg.key);
+      releaseKey(cfg.key, jobId);
       throw error;
     }
 

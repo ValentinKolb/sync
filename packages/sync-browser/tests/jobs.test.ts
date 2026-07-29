@@ -23,6 +23,7 @@ beforeEach(() => {
 
 test("submit + process + after (success path)", async () => {
   let afterCalled = false;
+  let afterSignalAborted: boolean | undefined;
   let seenData: number | undefined;
 
   const worker = job<void, number>({
@@ -30,6 +31,7 @@ test("submit + process + after (success path)", async () => {
     process: async () => 42,
     after: async ({ ctx }) => {
       afterCalled = true;
+      afterSignalAborted = ctx.signal.aborted;
       seenData = ctx.data;
     },
   });
@@ -37,6 +39,7 @@ test("submit + process + after (success path)", async () => {
   await worker.submit({ key: "chat:1" });
   await waitFor(() => afterCalled);
   expect(seenData).toBe(42);
+  expect(afterSignalAborted).toBe(false);
 
   worker.stop();
 });
@@ -562,17 +565,21 @@ test("a failed heartbeat aborts the attempt without false completion", async () 
   expect(events).toEqual(["submitted", "started"]);
 });
 
-test("a rejected reschedule does not increment the reschedule metric", async () => {
+test("lease loss after process skips after and transport completion", async () => {
   const id = uid("lost-reschedule");
   let started = false;
+  let processFinished = false;
   let afterCalled = false;
+  let signal: AbortSignal | undefined;
 
   const worker = job({
     id,
     defaults: { leaseMs: 50 },
-    process: async () => {
+    process: async ({ ctx }) => {
       started = true;
+      signal = ctx.signal;
       await Bun.sleep(120);
+      processFinished = true;
     },
     after: async ({ ctx }) => {
       afterCalled = true;
@@ -588,12 +595,128 @@ test("a rejected reschedule does not increment the reschedule metric", async () 
   const stolen = await competitor.recv({ wait: false });
   expect(stolen).not.toBeNull();
 
-  await waitFor(() => afterCalled);
+  await waitFor(() => processFinished);
+  await waitFor(() => signal?.aborted === true);
   await Bun.sleep(20);
+  expect(afterCalled).toBe(false);
   expect(worker.metric().reschedules).toBe(0);
 
   worker.stop();
   expect(await stolen?.ack()).toBe(true);
+});
+
+test("initial delay keeps the idempotency claim beyond keyTtlMs", async () => {
+  let started = false;
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  const worker = job({
+    id: uid("delay-claim-refresh"),
+    process: async () => {
+      started = true;
+      await gate;
+    },
+  });
+
+  const first = await worker.submit({ key: "same", keyTtlMs: 1_000, delayMs: 1_500 });
+  await Bun.sleep(1_100);
+  expect(started).toBe(false);
+  expect(await worker.submit({ key: "same", keyTtlMs: 1_000 })).toBe(first);
+
+  await waitFor(() => started, 3_000);
+  release?.();
+  await waitFor(() => worker.metric().dispatches === 1);
+  worker.stop();
+});
+
+test("heartbeat renews the idempotency claim", async () => {
+  let heartbeatDone = false;
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  const worker = job({
+    id: uid("heartbeat-claim-refresh"),
+    process: async ({ ctx }) => {
+      await Bun.sleep(700);
+      await ctx.heartbeat();
+      heartbeatDone = true;
+      await gate;
+    },
+  });
+
+  const first = await worker.submit({ key: "same", keyTtlMs: 1_000 });
+  await waitFor(() => heartbeatDone);
+  await Bun.sleep(450);
+  expect(await worker.submit({ key: "same", keyTtlMs: 1_000 })).toBe(first);
+
+  release?.();
+  await waitFor(() => worker.metric().dispatches === 1);
+  worker.stop();
+});
+
+test("reschedule holds the idempotency claim across a delay longer than its TTL", async () => {
+  let firstAttemptFinished = false;
+
+  const worker = job({
+    id: uid("reschedule-claim-refresh"),
+    process: async ({ ctx }) => {
+      if (ctx.failureCount === 0) firstAttemptFinished = true;
+    },
+    after: async ({ ctx }) => {
+      if (ctx.failureCount === 0) ctx.reschedule({ delayMs: 1_600 });
+    },
+  });
+
+  const first = await worker.submit({ key: "same", keyTtlMs: 1_000 });
+  await waitFor(() => firstAttemptFinished && worker.metric().reschedules === 1);
+  await Bun.sleep(1_200);
+  expect(await worker.submit({ key: "same", keyTtlMs: 1_000 })).toBe(first);
+  worker.stop();
+});
+
+test("terminal release cannot delete a newer idempotency claim", async () => {
+  let run = 0;
+  let firstStarted = false;
+  let secondStarted = false;
+  let releaseFirst: (() => void) | undefined;
+  let releaseSecond: (() => void) | undefined;
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const secondGate = new Promise<void>((resolve) => {
+    releaseSecond = resolve;
+  });
+
+  const worker = job({
+    id: uid("fenced-claim-release"),
+    process: async () => {
+      run += 1;
+      if (run === 1) {
+        firstStarted = true;
+        await firstGate;
+        return;
+      }
+      secondStarted = true;
+      await secondGate;
+    },
+  });
+
+  await worker.submit({ key: "same", keyTtlMs: 1_000 });
+  await waitFor(() => firstStarted);
+  await Bun.sleep(1_050);
+  const second = await worker.submit({ key: "same", keyTtlMs: 1_000 });
+
+  releaseFirst?.();
+  await waitFor(() => secondStarted);
+  expect(await worker.submit({ key: "same", keyTtlMs: 1_000 })).toBe(second);
+
+  releaseSecond?.();
+  await waitFor(() => worker.metric().dispatches === 2);
+  worker.stop();
 });
 
 // ==========================

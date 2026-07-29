@@ -25,6 +25,7 @@ const waitFor = async (pred: () => boolean, timeoutMs = 5_000, pollMs = 20): Pro
 
 test("submit + process + after (success path)", async () => {
   let afterCalled = false;
+  let afterSignalAborted: boolean | undefined;
   let seenData: number | undefined;
   let seenError: Error | undefined;
 
@@ -33,6 +34,7 @@ test("submit + process + after (success path)", async () => {
     process: async () => 42,
     after: async ({ ctx }) => {
       afterCalled = true;
+      afterSignalAborted = ctx.signal.aborted;
       seenData = ctx.data;
       seenError = ctx.error;
     },
@@ -42,6 +44,7 @@ test("submit + process + after (success path)", async () => {
   await waitFor(() => afterCalled);
   expect(seenData).toBe(42);
   expect(seenError).toBeUndefined();
+  expect(afterSignalAborted).toBe(false);
 
   worker.stop();
 });
@@ -478,6 +481,25 @@ test("delayMs delays first execution", async () => {
   worker.stop();
 });
 
+test("initial delay keeps the idempotency key claimed beyond keyTtlMs", async () => {
+  let started = false;
+
+  const worker = job({
+    id: uid("delay-holds-key"),
+    process: async () => {
+      started = true;
+    },
+  });
+
+  const first = await worker.submit({ key: "same", keyTtlMs: 1_000, delayMs: 1_500 });
+  await Bun.sleep(1_100);
+  expect(started).toBe(false);
+  expect(await worker.submit({ key: "same", keyTtlMs: 1_000 })).toBe(first);
+
+  await waitFor(() => worker.metric().dispatches === 1);
+  worker.stop();
+});
+
 // ==========================
 // ctx.heartbeat / signal
 // ==========================
@@ -562,11 +584,9 @@ test("stop halts the receive loop until the next submit restarts it", async () =
   // submit() restart one, and asserted the job *ran*, under a name promising
   // the loop halts. Neither half of the documented behaviour was tested.
   await worker.submit({ key: "first" });
-  await waitFor(() => processed.length === 1, 10_000);
+  await waitFor(() => worker.metric().dispatches === 1, 10_000);
 
   worker.stop();
-  // Enqueue directly, bypassing submit(), so nothing restarts the loop.
-  await redis.send("LPUSH", [`sync:job:queue:default:${worker.id}:work:ready`, "999999"]);
   await Bun.sleep(400);
   expect(processed).toEqual(["first"]);
 

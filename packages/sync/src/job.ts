@@ -252,9 +252,14 @@ export const job = <Input = void, Result = unknown>(
   let workerAc: AbortController | null = null;
   // The controller of the callback currently running, so stop() can cancel it.
   let activeJobAc: AbortController | null = null;
+  let restartRequested = false;
 
   const startWorker = (): void => {
-    if (workerAc) return;
+    if (workerAc) {
+      if (workerAc.signal.aborted) restartRequested = true;
+      return;
+    }
+    restartRequested = false;
     const ac = new AbortController();
     workerAc = ac;
 
@@ -268,6 +273,7 @@ export const job = <Input = void, Result = unknown>(
                   wait: true,
                   timeoutMs: DEFAULT_WORKER_RECV_TIMEOUT_MS,
                   leaseMs: defaultLeaseMs,
+                  signal: ac.signal,
                 }),
               after: ({ ctx }) => {
                 if (ctx.error && isRetryableTransportError(ctx.error)) {
@@ -284,9 +290,23 @@ export const job = <Input = void, Result = unknown>(
             const failureCount = attempt - 1;
             const startedAt = Date.now();
             const jobAc = new AbortController();
+            let leaseLost = false;
             activeJobAc = jobAc;
 
-            const makeCtx = (): JobCtx<Input> => {
+            try {
+              const keepLease = async (leaseMs = payload.leaseMs): Promise<boolean> => {
+                const held = await message.touch({ leaseMs });
+                if (!held) {
+                  leaseLost = true;
+                  jobAc.abort();
+                  return false;
+                }
+                // A job that outlives keyTtlMs must not lose its dedup claim.
+                await refreshKey(payload.key, payload.jobId, payload.keyTtlMs);
+                return true;
+              };
+              const canceled = (): boolean => ac.signal.aborted || leaseLost || jobAc.signal.aborted;
+
               const ctx = {
                 jobId: payload.jobId,
                 key: payload.key,
@@ -294,135 +314,132 @@ export const job = <Input = void, Result = unknown>(
                 failureCount,
                 signal: jobAc.signal,
                 heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
-                  const held = await message.touch({ leaseMs: cfg?.leaseMs ?? payload.leaseMs });
-                  if (!held) {
-                    // The lease is gone: this message is already being
-                    // redelivered elsewhere, so this attempt should wind down.
-                    jobAc.abort();
-                    return;
-                  }
-                  // A job that outlives keyTtlMs must not lose its dedup claim.
-                  await refreshKey(payload.key, payload.jobId, payload.keyTtlMs);
+                  await keepLease(cfg?.leaseMs);
                 },
               } as JobCtx<Input>;
               Object.defineProperty(ctx, "duration", {
                 get: () => Date.now() - startedAt,
                 enumerable: true,
               });
-              return ctx;
-            };
 
-            const ctx = makeCtx();
-            // Every delivery renews the claim: while queued work exists for this
-            // key, the key that dedups it must exist too.
-            await refreshKey(payload.key, payload.jobId, payload.keyTtlMs);
+              // Every delivery renews the claim: while queued work exists for
+              // this key, the key that dedups it must exist too.
+              await refreshKey(payload.key, payload.jobId, payload.keyTtlMs);
 
-            const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
+              const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
 
-            await emitTrace(config.trace, {
-              type: "started",
-              jobId: payload.jobId,
-              key: payload.key,
-              ...traceInput,
-              attempt,
-            });
-
-            let result: Result | undefined;
-            let error: Error | undefined;
-            try {
-              result = await Promise.resolve(config.process({ ctx }));
-            } catch (err) {
-              error = asError(err);
-            } finally {
-              jobAc.abort();
-              activeJobAc = null;
-            }
-
-            if (error) {
               await emitTrace(config.trace, {
-                type: "failed",
+                type: "started",
                 jobId: payload.jobId,
                 key: payload.key,
                 ...traceInput,
-                error,
-                durationMs: Date.now() - startedAt,
+                attempt,
               });
-            } else {
-              await emitTrace(config.trace, {
-                type: "succeeded",
-                jobId: payload.jobId,
-                key: payload.key,
-                ...traceInput,
-                data: result as Result,
-                durationMs: Date.now() - startedAt,
-              });
-            }
+              if (canceled()) continue;
 
-            // Build after ctx
-            let rescheduleRequested: { delayMs?: number } | null = null;
-            const afterCtx: JobAfterCtx<Input, Result> = Object.create(ctx) as JobAfterCtx<Input, Result>;
-            if (error) afterCtx.error = error;
-            if (!error) afterCtx.data = result;
-            afterCtx.reschedule = (rcfg?: { delayMs?: number }): void => {
-              rescheduleRequested = { delayMs: rcfg?.delayMs };
-            };
-            afterCtx.expBackoff = (bcfg?: BackoffOptions): number => expBackoff(failureCount + 1, bcfg);
-            afterCtx.metric = metrics;
-
-            if (config.after) {
+              let result: Result | undefined;
+              let error: Error | undefined;
               try {
-                await Promise.resolve(config.after({ ctx: afterCtx }));
-              } catch {
-                // after errors are swallowed — transport decision is made by ctx.reschedule flag
+                result = await Promise.resolve(config.process({ ctx }));
+              } catch (err) {
+                error = asError(err);
               }
-            }
+              if (canceled() || !(await keepLease())) continue;
 
-            if (rescheduleRequested) {
-              const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
-              const nacked = await message.nack({
-                delayMs,
-                reason: "reschedule",
-                error: error?.message,
-              });
-              if (!nacked) {
+              if (error) {
+                await emitTrace(config.trace, {
+                  type: "failed",
+                  jobId: payload.jobId,
+                  key: payload.key,
+                  ...traceInput,
+                  error,
+                  durationMs: Date.now() - startedAt,
+                });
+              } else {
+                await emitTrace(config.trace, {
+                  type: "succeeded",
+                  jobId: payload.jobId,
+                  key: payload.key,
+                  ...traceInput,
+                  data: result as Result,
+                  durationMs: Date.now() - startedAt,
+                });
+              }
+              if (canceled()) continue;
+
+              let rescheduleRequested: { delayMs?: number } | null = null;
+              const afterCtx: JobAfterCtx<Input, Result> = Object.create(ctx) as JobAfterCtx<Input, Result>;
+              if (error) afterCtx.error = error;
+              if (!error) afterCtx.data = result;
+              afterCtx.reschedule = (rcfg?: { delayMs?: number }): void => {
+                rescheduleRequested = { delayMs: rcfg?.delayMs };
+              };
+              afterCtx.expBackoff = (bcfg?: BackoffOptions): number => expBackoff(failureCount + 1, bcfg);
+              afterCtx.metric = metrics;
+
+              if (config.after) {
+                try {
+                  await Promise.resolve(config.after({ ctx: afterCtx }));
+                } catch {
+                  // after errors are swallowed — transport decision is made by ctx.reschedule flag
+                }
+              }
+              if (canceled() || !(await keepLease())) continue;
+
+              if (rescheduleRequested) {
+                const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
+                const nacked = await message.nack({
+                  delayMs,
+                  reason: "reschedule",
+                  error: error?.message,
+                });
+                if (!nacked) {
+                  // Lease expired; message will be redelivered. Key stays claimed.
+                  continue;
+                }
+                metrics.reschedules += 1;
+                // Hold the claim across the scheduled delay as well as the TTL,
+                // so a long backoff cannot lose its dedup claim.
+                await refreshKey(
+                  payload.key,
+                  payload.jobId,
+                  Math.min(MAX_KEY_TTL_MS, delayMs + payload.keyTtlMs),
+                );
+                await emitTrace(config.trace, {
+                  type: "rescheduled",
+                  jobId: payload.jobId,
+                  key: payload.key,
+                  attempt,
+                  delayMs,
+                });
+                continue;
+              }
+
+              // Terminal: ack + release key
+              const acked = await message.ack();
+              if (!acked) {
                 // Lease expired; message will be redelivered. Key stays claimed.
                 continue;
               }
-              metrics.reschedules += 1;
-              // Hold the claim across the scheduled delay as well as the TTL, so
-              // a backoff chain longer than keyTtlMs cannot lose its dedup claim
-              // and let a fanout submit enqueue a second job for the same key.
-              await refreshKey(payload.key, payload.jobId, Math.min(MAX_KEY_TTL_MS, delayMs + payload.keyTtlMs));
+              await releaseKey(payload.key, payload.jobId);
+
+              if (error) {
+                metrics.failures += 1;
+              } else {
+                metrics.dispatches += 1;
+              }
               await emitTrace(config.trace, {
-                type: "rescheduled",
+                type: "finished",
                 jobId: payload.jobId,
                 key: payload.key,
-                attempt,
-                delayMs,
+                status: error ? "failed" : "succeeded",
+                durationMs: Date.now() - startedAt,
               });
-              continue;
+            } finally {
+              // Ordinary completion keeps the signal live through after().
+              // Only clear the controller if this attempt still owns the slot.
+              if (activeJobAc === jobAc) activeJobAc = null;
             }
-
-            // Terminal: ack + release key
-            const acked = await message.ack();
-            if (!acked) {
-              // Lease expired; message will be redelivered. Key stays claimed.
-              continue;
-            }
-            await releaseKey(payload.key, payload.jobId);
-
-            if (error) {
-              metrics.failures += 1;
-            } else {
-              metrics.dispatches += 1;
-            }
-            await emitTrace(config.trace, {
-              type: "finished",
-              jobId: payload.jobId,
-              key: payload.key,
-              status: error ? "failed" : "succeeded",
-              durationMs: Date.now() - startedAt,
-            });
           } catch {
             if (ac.signal.aborted) break;
             await sleep(25);
@@ -430,6 +447,7 @@ export const job = <Input = void, Result = unknown>(
         }
       } finally {
         if (workerAc === ac) workerAc = null;
+        if (restartRequested) startWorker();
       }
     })();
   };
@@ -440,8 +458,9 @@ export const job = <Input = void, Result = unknown>(
     const leaseMs = Math.max(1, cfg.leaseMs ?? defaultLeaseMs);
     const keyTtlMs = Math.min(MAX_KEY_TTL_MS, Math.max(1_000, cfg.keyTtlMs ?? defaultKeyTtlMs));
     const delayMs = cfg.at !== undefined ? Math.max(0, cfg.at - Date.now()) : Math.max(0, cfg.delayMs ?? 0);
+    const initialKeyTtlMs = Math.min(MAX_KEY_TTL_MS, delayMs + keyTtlMs);
 
-    const { jobId, isNew } = await claimKey(cfg.key, keyTtlMs);
+    const { jobId, isNew } = await claimKey(cfg.key, initialKeyTtlMs);
     if (!isNew) {
       startWorker();
       return jobId;
@@ -470,7 +489,7 @@ export const job = <Input = void, Result = unknown>(
 
     // Only now is the claim genuinely backed by queued work. A crash before
     // this point leaves the claim unenqueued, and a later submit re-enqueues it.
-    await markEnqueued(cfg.key, jobId, keyTtlMs);
+    await markEnqueued(cfg.key, jobId, initialKeyTtlMs);
 
     const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
     await emitTrace(config.trace, {
@@ -488,8 +507,8 @@ export const job = <Input = void, Result = unknown>(
   const metric = (): JobMetrics => ({ ...metrics });
 
   const stop = (): void => {
+    restartRequested = false;
     workerAc?.abort();
-    workerAc = null;
     // Cancel the in-flight callback too, so `ctx.signal.aborted` is a usable
     // cancellation signal rather than something that is always false.
     activeJobAc?.abort();
