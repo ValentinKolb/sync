@@ -658,6 +658,56 @@ test("stop fences a direct run even when the scheduler loop was never started", 
   expect(after?.nextRunAt).toBe(before?.nextRunAt);
 }, 20_000);
 
+test("stop fences a cron run suspended while acquiring leadership", async () => {
+  const schedId = uid("stop-leader-acquire");
+  const s = makeScheduler(schedId);
+  let runs = 0;
+  await s.create({
+    id: "due",
+    cron: "0 3 * * *",
+    process: async () => {
+      runs += 1;
+    },
+  });
+
+  const keyPrefix = `sync:scheduler:${schedId}`;
+  const schedule = JSON.parse((await redis.get(`${keyPrefix}:schedule:due`)) as string);
+  schedule.nextRunAt = Date.now() - 1_000;
+  await redis.set(`${keyPrefix}:schedule:due`, JSON.stringify(schedule));
+  await redis.send("ZADD", [`${keyPrefix}:due`, String(schedule.nextRunAt), "due"]);
+
+  const originalSend = redis.send.bind(redis);
+  let releaseAcquire = (): void => {};
+  const acquireGate = new Promise<void>((resolve) => {
+    releaseAcquire = resolve;
+  });
+  let acquireStarted = false;
+  redis.send = (async (command, args) => {
+    const result = await originalSend(command, args);
+    if (
+      command === "SET"
+      && String(args[0]).includes(`${schedId}:leader:active`)
+      && args.includes("NX")
+    ) {
+      acquireStarted = true;
+      await acquireGate;
+    }
+    return result;
+  }) as typeof redis.send;
+
+  try {
+    s.start();
+    await waitFor(() => acquireStarted);
+    const stopped = s.stop();
+    releaseAcquire();
+    await stopped;
+    expect(runs).toBe(0);
+  } finally {
+    releaseAcquire();
+    redis.send = originalSend as typeof redis.send;
+  }
+}, 20_000);
+
 test("non-finite batchSize falls back to a usable default", async () => {
   const schedId = uid("batch-size-nan");
   const s = makeScheduler(schedId, {

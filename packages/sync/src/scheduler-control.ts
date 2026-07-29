@@ -51,6 +51,20 @@ const WRITE_PENDING_RESPONSE_SCRIPT = `
 const WRITE_BOUND_RESPONSE_SCRIPT = `
   if redis.call("GET", KEYS[1]) ~= ARGV[1] then return 0 end
   redis.call("PEXPIRE", KEYS[1], ARGV[2])
+  local incoming = cjson.decode(ARGV[3])
+  local raw = redis.call("GET", KEYS[2])
+  if raw then
+    local ok, existing = pcall(cjson.decode, raw)
+    if ok and (
+      existing.status == "accepted"
+      or existing.status == "not_found"
+      or existing.status == "unavailable"
+    ) then
+      redis.call("PEXPIRE", KEYS[2], ARGV[4])
+      if existing.status == incoming.status then return 1 end
+      return 0
+    end
+  end
   redis.call("SET", KEYS[2], ARGV[3], "PX", ARGV[4])
   return 1
 `;
@@ -138,17 +152,20 @@ type SchedulerControlResponse =
 
 const schedulerIndexKey = (prefix: string): string => `${prefix}:index`;
 const scheduleIndexKey = (prefix: string, schedulerId: string): string => `${prefix}:${schedulerId}:index`;
-const scheduleKey = (prefix: string, schedulerId: string, scheduleId: string): string =>
+export const encodeSchedulerKeyPart = (value: string): string =>
+  value.replaceAll("%", "%25").replaceAll(":", "%3A");
+export const schedulerScheduleKey = (prefix: string, schedulerId: string, scheduleId: string): string =>
+  `${prefix}:${encodeSchedulerKeyPart(schedulerId)}:schedule:${scheduleId}`;
+const legacySchedulerScheduleKey = (prefix: string, schedulerId: string, scheduleId: string): string =>
   `${prefix}:${schedulerId}:schedule:${scheduleId}`;
 const handlerIndexKey = (prefix: string, schedulerId: string, scheduleId: string): string =>
-  `${prefix}:${schedulerId}:control:${scheduleId}:handlers`;
+  `${prefix}:${encodeSchedulerKeyPart(schedulerId)}:control:${encodeSchedulerKeyPart(scheduleId)}:handlers`;
 const handlerInstanceKey = (prefix: string, schedulerId: string, scheduleId: string, instanceId: string): string =>
-  `${prefix}:${schedulerId}:control:${scheduleId}:handler:${instanceId}`;
-const encodedIdentity = (value: string): string => value.replaceAll("%", "%25").replaceAll(":", "%3A");
+  `${prefix}:${encodeSchedulerKeyPart(schedulerId)}:control:${encodeSchedulerKeyPart(scheduleId)}:handler:${instanceId}`;
 const responseKey = (prefix: string, requestId: string): string =>
-  `${prefix}:control:response:${encodedIdentity(requestId)}`;
+  `${prefix}:control:response:${encodeSchedulerKeyPart(requestId)}`;
 const requestKey = (prefix: string, requestId: string): string =>
-  `${prefix}:control:request:${encodedIdentity(requestId)}`;
+  `${prefix}:control:request:${encodeSchedulerKeyPart(requestId)}`;
 
 const assertId = (name: string, value: string): void => {
   if (!value) throw new Error(`${name} is required`);
@@ -198,6 +215,36 @@ const parseMeta = (metaJson: string): Record<string, unknown> | undefined => {
   } catch {
     return undefined;
   }
+};
+
+export const readSchedulerScheduleRaw = async (
+  prefix: string,
+  schedulerId: string,
+  scheduleId: string,
+): Promise<string | null> => {
+  const key = schedulerScheduleKey(prefix, schedulerId, scheduleId);
+  const current = await redis.get(key);
+  if (current) {
+    try {
+      const parsed = JSON.parse(current) as { id?: unknown };
+      return parsed.id === scheduleId ? current : null;
+    } catch {
+      return current;
+    }
+  }
+  if (key === legacySchedulerScheduleKey(prefix, schedulerId, scheduleId)) return null;
+
+  const legacy = await redis.get(legacySchedulerScheduleKey(prefix, schedulerId, scheduleId));
+  if (!legacy) return null;
+  try {
+    const parsed = JSON.parse(legacy) as { id?: unknown };
+    if (parsed.id !== scheduleId) return null;
+  } catch {
+    return null;
+  }
+
+  await redis.send("SET", [key, legacy, "NX"]);
+  return await redis.get(key);
 };
 
 const toInfo = (
@@ -341,7 +388,7 @@ export const schedulerControlQueue = (
   scheduleId: string,
 ): Queue<SchedulerControlRequest> =>
   queue<SchedulerControlRequest>({
-    id: `${encodedIdentity(schedulerId)}:${encodedIdentity(scheduleId)}:manual`,
+    id: `${encodeSchedulerKeyPart(schedulerId)}:${encodeSchedulerKeyPart(scheduleId)}:manual`,
     prefix: `${prefix}:control`,
     delivery: { defaultLeaseMs: 30_000, maxDeliveries: Number.MAX_SAFE_INTEGER },
     limits: { maxMessageAgeMs: 5 * 60_000, dlqRetentionMs: 60_000 },
@@ -424,8 +471,9 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
       if (!Array.isArray(scheduleIdsRaw) || scheduleIdsRaw.length === 0) continue;
 
       const scheduleIds = scheduleIdsRaw.map((value) => String(value));
-      const values = await redis.send("MGET", scheduleIds.map((scheduleId) => scheduleKey(prefix, schedulerId, scheduleId)));
-      if (!Array.isArray(values)) continue;
+      const values = await Promise.all(
+        scheduleIds.map((scheduleId) => readSchedulerScheduleRaw(prefix, schedulerId, scheduleId)),
+      );
 
       for (let i = 0; i < scheduleIds.length; i += 1) {
         const scheduleId = scheduleIds[i];
@@ -462,7 +510,7 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
     if (existing?.status === "unavailable") throw new SchedulerControlUnavailableError(existing.error);
 
     if (existing?.status !== "pending") {
-      const schedule = parseSchedule(await redis.get(scheduleKey(prefix, cfg.schedulerId, cfg.scheduleId)));
+      const schedule = parseSchedule(await readSchedulerScheduleRaw(prefix, cfg.schedulerId, cfg.scheduleId));
       if (!schedule) {
         throw new SchedulerControlNotFoundError(
           `schedulerControl.runNow: schedule ${cfg.schedulerId}/${cfg.scheduleId} not found`,

@@ -1404,6 +1404,26 @@ test("stop during final dispatch preparation prevents the callback", async () =>
   expect(ran).toBe(false);
 });
 
+test("stop immediately after start fences a newly due cron callback", async () => {
+  const s = makeScheduler(uid("stop-leader-acquire"));
+  let cronRuns = 0;
+  await s.create({
+    id: "due",
+    cron: "0 3 * * *",
+    process: async ({ ctx }) => {
+      if (ctx.trigger === "cron") cronRuns += 1;
+    },
+    after: async ({ ctx }) => {
+      if (ctx.trigger === "manual") ctx.reschedule({ delayMs: 0 });
+    },
+  });
+  await s.runNow({ id: "due" });
+
+  s.start();
+  await s.stop();
+  expect(cronRuns).toBe(0);
+});
+
 test("losing the dispatch lease aborts the callback and rejects the run", async () => {
   const prefix = uid("dispatch-lease-prefix");
   const schedulerId = uid("dispatch-lease-loss");

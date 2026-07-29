@@ -8,10 +8,12 @@ import {
   markSchedulerControlNotFound,
   markSchedulerControlPending,
   markSchedulerControlUnavailable,
+  readSchedulerScheduleRaw,
   refreshSchedulerControlRequestBinding,
   refreshSchedulerControlHandler,
   registerSchedulerControlIndex,
   removeSchedulerControlHandler,
+  schedulerScheduleKey,
   schedulerControlQueue,
   type SchedulerControlRequest,
 } from "./scheduler-control";
@@ -58,7 +60,7 @@ const UPSERT_SCRIPT = `
   if raw then
     created = 0
     local ok, existing = pcall(cjson.decode, raw)
-    if ok then
+    if ok and tostring(existing.id or "") == scheduleId then
       incoming.createdAt = tonumber(existing.createdAt) or incoming.createdAt
       incoming.runNumber = tonumber(existing.runNumber) or 0
 
@@ -94,7 +96,20 @@ const UPSERT_SCRIPT = `
 `;
 
 const DELETE_SCRIPT = `
-  redis.call("DEL", KEYS[1])
+  local currentRaw = redis.call("GET", KEYS[1])
+  if currentRaw then
+    local ok, current = pcall(cjson.decode, currentRaw)
+    if not ok or type(current) ~= "table" or tostring(current.id or "") == ARGV[1] then
+      redis.call("DEL", KEYS[1])
+    end
+  end
+  local legacyRaw = redis.call("GET", KEYS[4])
+  if legacyRaw then
+    local ok, legacy = pcall(cjson.decode, legacyRaw)
+    if ok and type(legacy) == "table" and tostring(legacy.id or "") == ARGV[1] then
+      redis.call("DEL", KEYS[4])
+    end
+  end
   redis.call("ZREM", KEYS[2], ARGV[1])
   redis.call("SREM", KEYS[3], ARGV[1])
   return 1
@@ -343,7 +358,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const controlHandlerTtlMs = Math.max(5_000, tickMs * 4);
   const controlHeartbeatMs = Math.max(500, Math.floor(controlHandlerTtlMs / 3));
 
-  const scheduleKey = (id: string): string => `${prefix}:${config.id}:schedule:${id}`;
+  const scheduleKey = (id: string): string => schedulerScheduleKey(prefix, config.id, id);
+  const legacyScheduleKey = (id: string): string => `${prefix}:${config.id}:schedule:${id}`;
   const dueKey = `${prefix}:${config.id}:due`;
   const indexKey = `${prefix}:${config.id}:index`;
   const instanceId = crypto.randomUUID();
@@ -694,7 +710,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       }, Math.max(50, Math.floor(heartbeatMs / 2)));
 
       try {
-        const schedule = parseSchedule(await redis.get(scheduleKey(scheduleId)));
+        const schedule = parseSchedule(await readSchedulerScheduleRaw(prefix, config.id, scheduleId));
         if (!schedule) throw new Error(`runNow: schedule ${scheduleId} not found`);
         const handler = handlers.get(scheduleId);
         if (!handler) throw new Error(`runNow: no current handler registered for schedule ${scheduleId} on this pod`);
@@ -746,11 +762,19 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     for (const scheduleId of dueIds) {
       if (!currentLeaderLock) break;
 
-      const raw = await redis.get(scheduleKey(scheduleId));
+      const raw = await readSchedulerScheduleRaw(prefix, config.id, scheduleId);
       const schedule = parseSchedule(raw);
       if (!schedule) {
         // Broken record: clean up
-        await redis.send("EVAL", [DELETE_SCRIPT, "3", scheduleKey(scheduleId), dueKey, indexKey, scheduleId]);
+        await redis.send("EVAL", [
+          DELETE_SCRIPT,
+          "4",
+          scheduleKey(scheduleId),
+          dueKey,
+          indexKey,
+          legacyScheduleKey(scheduleId),
+          scheduleId,
+        ]);
         continue;
       }
 
@@ -844,7 +868,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         dispatched += 1;
         continue;
       }
-      const raw = await redis.get(scheduleKey(scheduleId));
+      const raw = await readSchedulerScheduleRaw(prefix, config.id, scheduleId);
       const schedule = parseSchedule(raw);
       if (!schedule) {
         await markSchedulerControlNotFound(
@@ -911,6 +935,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       try {
         await dispatchControlRequests();
         await tryAcquireLeadership();
+        if (!running) {
+          await relinquishLeadership();
+          break;
+        }
         if (currentLeaderLock) {
           await dispatchDue();
         }
@@ -976,6 +1004,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       ...(cfg.meta === undefined ? {} : { metaJson: JSON.stringify(cfg.meta) }),
     };
 
+    await readSchedulerScheduleRaw(prefix, config.id, cfg.id);
     const resultRaw = await redis.send("EVAL", [
       UPSERT_SCRIPT,
       "3",
@@ -1023,7 +1052,15 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   };
 
   const deleteSchedule = async (cfg: { id: string }): Promise<void> => {
-    await redis.send("EVAL", [DELETE_SCRIPT, "3", scheduleKey(cfg.id), dueKey, indexKey, cfg.id]);
+    await redis.send("EVAL", [
+      DELETE_SCRIPT,
+      "4",
+      scheduleKey(cfg.id),
+      dueKey,
+      indexKey,
+      legacyScheduleKey(cfg.id),
+      cfg.id,
+    ]);
     handlers.delete(cfg.id);
     // A refresh may have captured this handler immediately before deletion.
     // Wait it out, then make the removal the final Redis write.
@@ -1032,7 +1069,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   };
 
   const runNow = async (cfg: { id: string }): Promise<void> => {
-    const raw = await redis.get(scheduleKey(cfg.id));
+    const raw = await readSchedulerScheduleRaw(prefix, config.id, cfg.id);
     const schedule = parseSchedule(raw);
     if (!schedule) throw new Error(`runNow: schedule ${cfg.id} not found`);
     if (!handlers.has(cfg.id)) throw new Error(`runNow: no handler registered for schedule ${cfg.id} on this pod`);
@@ -1046,7 +1083,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   };
 
   const get = async (cfg: { id: string }): Promise<SchedulerInfo | null> => {
-    const raw = await redis.get(scheduleKey(cfg.id));
+    const raw = await readSchedulerScheduleRaw(prefix, config.id, cfg.id);
     const parsed = parseSchedule(raw);
     return parsed ? asInfo(parsed) : null;
   };
@@ -1055,8 +1092,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     const idsRaw = await redis.send("SMEMBERS", [indexKey]);
     if (!Array.isArray(idsRaw) || idsRaw.length === 0) return [];
     const ids = idsRaw.map((v) => String(v));
-    const values = await redis.send("MGET", ids.map((id) => scheduleKey(id)));
-    if (!Array.isArray(values)) return [];
+    const values = await Promise.all(ids.map((id) => readSchedulerScheduleRaw(prefix, config.id, id)));
 
     const out: SchedulerInfo[] = [];
     for (const raw of values) {

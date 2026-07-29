@@ -627,6 +627,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     while (running) {
       try {
         await tryAcquireLeadership();
+        if (!running) {
+          await relinquishLeadership();
+          break;
+        }
         if (currentLeaderLock) {
           await dispatchDue();
         }

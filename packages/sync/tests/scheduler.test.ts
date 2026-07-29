@@ -12,6 +12,7 @@ import {
 import {
   markSchedulerControlAccepted,
   markSchedulerControlPending,
+  markSchedulerControlUnavailable,
   refreshSchedulerControlRequestBinding,
   schedulerControlQueue,
   type SchedulerControlRequest,
@@ -969,6 +970,27 @@ test("scheduler control queues keep colon-rich target identities distinct", asyn
   await secondMessage?.ack();
 });
 
+test("colon-rich scheduler and schedule ids keep durable records distinct", async () => {
+  const prefix = `test:sched:${uid("record-identity")}`;
+  const first = makeScheduler("a:schedule:b", { prefix });
+  const second = makeScheduler("a", { prefix });
+
+  await first.create({ id: "c", cron: "0 1 * * *", meta: { owner: "first" }, process: async () => {} });
+  await second.create({
+    id: "b:schedule:c",
+    cron: "0 2 * * *",
+    meta: { owner: "second" },
+    process: async () => {},
+  });
+
+  expect((await first.get({ id: "c" }))?.meta).toEqual({ owner: "first" });
+  expect((await second.get({ id: "b:schedule:c" }))?.meta).toEqual({ owner: "second" });
+
+  const listed = await schedulerControl({ prefix }).list();
+  expect(listed.find((entry) => entry.schedulerId === "a:schedule:b")?.scheduleId).toBe("c");
+  expect(listed.find((entry) => entry.schedulerId === "a")?.scheduleId).toBe("b:schedule:c");
+});
+
 test("scheduler control request identities include the full prefix", async () => {
   const root = `test:sched:${uid("request-prefix")}`;
   const first = makeScheduler("first", { prefix: `${root}:control:request:child`, dispatch: { tickMs: 20 } });
@@ -1150,6 +1172,52 @@ test("schedules written in the 5.8.0 record format keep their meta", async () =>
   const info = await sched.get({ id: "legacy" });
   expect(info?.meta).toEqual({ source: "5.8.0" });
   expect(info?.runNumber).toBe(4);
+});
+
+test("a legacy record for a colon-rich scheduler id migrates without losing state", async () => {
+  const id = `legacy:${uid("scheduler")}`;
+  const sched = scheduler({ id, prefix: "test:sched" });
+  const legacyKey = `test:sched:${id}:schedule:legacy`;
+  await redis.set(
+    legacyKey,
+    JSON.stringify({
+      id: "legacy",
+      cron: "0 3 * * *",
+      tz: "UTC",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      nextRunAt: Date.now() + 60_000,
+      runNumber: 7,
+      failureCount: 2,
+    }),
+  );
+  await redis.send("SADD", [`test:sched:${id}:index`, "legacy"]);
+
+  expect((await sched.get({ id: "legacy" }))?.runNumber).toBe(7);
+  await sched.create({ id: "legacy", cron: "0 3 * * *", process: async () => {} });
+  expect((await sched.get({ id: "legacy" }))?.failureCount).toBe(2);
+
+  await sched.delete({ id: "legacy" });
+  expect(await redis.get(legacyKey)).toBeNull();
+  expect(await sched.get({ id: "legacy" })).toBeNull();
+});
+
+test("an accepted control response cannot be downgraded to unavailable", async () => {
+  const prefix = `test:sched:${uid("accepted-terminal")}`;
+  const schedulerId = uid("accepted-terminal");
+  const sched = makeScheduler(schedulerId, { prefix, dispatch: { tickMs: 20 } });
+  await sched.create({ id: "run", cron: "0 3 * * *", process: async () => {} });
+  sched.start();
+
+  const requestId = uid("accepted-request");
+  const request = { requestId, schedulerId, scheduleId: "run", requestedAt: Date.now() };
+  const control = schedulerControl({ prefix });
+  await control.runNow({ schedulerId, scheduleId: "run", requestId, timeoutMs: 2_000 });
+
+  expect(await markSchedulerControlUnavailable(prefix, request, "late failure")).toBe(false);
+  await expect(
+    control.runNow({ schedulerId, scheduleId: "run", requestId, timeoutMs: 2_000 }),
+  ).resolves.toBeUndefined();
 });
 
 test("a repeatedly failing control dispatch is reported, not replayed forever", async () => {
