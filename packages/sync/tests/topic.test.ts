@@ -742,17 +742,16 @@ test("reader.close releases the blocking connection", async () => {
 
   const clientsBefore = await connectedClients();
   const readers = Array.from({ length: 6 }, (_, i) => t.reader(`g${i}`));
-  for (const reader of readers) {
-    await reader.recv({ wait: true, timeoutMs: 50 });
-  }
+  const pending = readers.map((reader) => reader.recv({ wait: true, timeoutMs: 10_000 }));
+  await Bun.sleep(100);
   const clientsDuring = await connectedClients();
   expect(clientsDuring).toBeGreaterThan(clientsBefore);
 
   await Promise.all(readers.map((reader) => reader.close()));
+  expect(await Promise.all(pending)).toEqual(Array.from({ length: readers.length }, () => null));
   await Bun.sleep(200);
 
-  // Without close() there was no way to reach the socket at all, so a reader
-  // created per request leaked one connection per request.
+  // close() must interrupt every active socket owned by these readers.
   expect(await connectedClients()).toBeLessThan(clientsDuring);
 });
 
