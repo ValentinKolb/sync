@@ -22,7 +22,11 @@ const PUB_SCRIPT = `
   if idemKey ~= "" then
     local existing = redis.call("GET", idemKey)
     if existing then
-      return existing
+      local retained = redis.call("XRANGE", KEYS[1], existing, existing, "COUNT", 1)
+      if retained and #retained > 0 then
+        return existing
+      end
+      redis.call("DEL", idemKey)
     end
   end
 

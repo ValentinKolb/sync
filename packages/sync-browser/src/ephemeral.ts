@@ -490,8 +490,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       return cursor;
     };
 
-    const checkReplayGap = (): void => {
-      const after = replayChecked ? cursor : (readerCfg.after ?? cursor);
+    const checkReplayGap = (after = replayChecked ? cursor : (readerCfg.after ?? cursor)): void => {
       replayChecked = true;
 
       if (!after) return;
@@ -598,8 +597,17 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       // Loop to skip prefix-mismatched events. One pass if no prefix configured.
       while (true) {
         // Try buffered entries first
-        const entries = state.eventLog.range(anchor(), 1);
+        const previousCursor = anchor();
+        const entries = state.eventLog.range(previousCursor, 1);
         if (entries.length > 0) {
+          if (previousCursor !== "0" && previousCursor !== "0-0") {
+            checkReplayGap(previousCursor);
+            if (overflowPending) {
+              const event = overflowPending;
+              overflowPending = null;
+              return event;
+            }
+          }
           cursor = entries[0]!.id;
           const parsed = parseEvent(entries[0]!);
           if (parsed && matchesPrefix(parsed)) return parsed;
@@ -620,6 +628,15 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
         let got: EphemeralEvent<TData> | null = null;
         try {
           for await (const entry of state.eventLog.subscribe(anchor(), ac.signal)) {
+            const previousCursor = anchor();
+            if (previousCursor !== "0" && previousCursor !== "0-0") {
+              checkReplayGap(previousCursor);
+              if (overflowPending) {
+                got = overflowPending;
+                overflowPending = null;
+                break;
+              }
+            }
             cursor = entry.id;
             const parsed = parseEvent(entry);
             if (!parsed) continue;

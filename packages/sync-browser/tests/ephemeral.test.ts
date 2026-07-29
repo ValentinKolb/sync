@@ -827,3 +827,33 @@ test("a reader that falls behind after a healthy read gets overflow", async () =
   expect(event?.type).toBe("overflow");
   if (event?.type === "overflow") expect(event.after).toBe(consumed?.cursor);
 });
+
+test("a blocked reader detects a gap after the entire event history expired", async () => {
+  const id = `overflow-empty-history-${Date.now()}`;
+  const store = ephemeral<{ n: number }>({
+    id,
+    ttlMs: 60_000,
+    limits: { eventRetentionMs: 5 },
+  });
+  await store.upsert({ key: "seed", value: { n: 0 } });
+  const anchor = await store.snapshot();
+  const reader = store.reader({ after: anchor.cursor });
+
+  const states = sharedState(`ephemeral:${id}`, undefined, () => new Map()) as Map<
+    string,
+    { eventLog: { entries: Array<{ ts: number }> } }
+  >;
+  states.get("default")!.eventLog.entries[0]!.ts = 0;
+
+  const pending = reader.recv({ wait: true, timeoutMs: 500 });
+  await Bun.sleep(0);
+  await store.upsert({ key: "after-gap", value: { n: 1 } });
+
+  const event = await pending;
+  expect(event?.type).toBe("overflow");
+  if (event?.type === "overflow") {
+    expect(event.after).toBe(anchor.cursor);
+    expect(event.firstAvailable).not.toBe(anchor.cursor);
+  }
+  await reader.close();
+});

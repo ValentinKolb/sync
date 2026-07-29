@@ -10,6 +10,19 @@ import {
 const testId = (suffix: string): string => `test-eph-${suffix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const readers: EphemeralReader<unknown>[] = [];
 
+const connectedClients = async (): Promise<number> => {
+  const info = (await redis.send("INFO", ["clients"])) as string;
+  return Number(/connected_clients:(\d+)/.exec(info)?.[1] ?? 0);
+};
+
+const waitFor = async (predicate: () => boolean | Promise<boolean>, timeoutMs = 1_000): Promise<void> => {
+  const startedAt = Date.now();
+  while (!(await predicate())) {
+    if (Date.now() - startedAt >= timeoutMs) throw new Error(`waitFor timed out after ${timeoutMs}ms`);
+    await Bun.sleep(5);
+  }
+};
+
 const trackReader = <T>(reader: EphemeralReader<T>): EphemeralReader<T> => {
   readers.push(reader as EphemeralReader<unknown>);
   return reader;
@@ -377,6 +390,37 @@ test("reader close is terminal and aborts pending reads", async () => {
   expect(await pendingNext).toEqual({ value: undefined, done: true });
 });
 
+test("reader close can interrupt a read while its connection is starting", async () => {
+  const store = ephemeral<{ value: number }>({
+    id: testId("reader-close-connect"),
+    ttlMs: 2_000,
+  });
+  const reader = trackReader(store.reader());
+  const pending = reader.recv({ wait: true, timeoutMs: 10_000 });
+
+  await reader.close();
+  await expect(pending).resolves.toBeNull();
+});
+
+test("concurrent streams from one reader use independent connections", async () => {
+  const store = ephemeral<{ value: number }>({
+    id: testId("concurrent-streams"),
+    ttlMs: 2_000,
+  });
+  const reader = trackReader(store.reader());
+  const clientsBefore = await connectedClients();
+  const first = reader.stream({ wait: true, timeoutMs: 10_000 })[Symbol.asyncIterator]();
+  const second = reader.stream({ wait: true, timeoutMs: 10_000 })[Symbol.asyncIterator]();
+  const firstPending = first.next();
+  const secondPending = second.next();
+
+  await waitFor(async () => (await connectedClients()) >= clientsBefore + 2);
+
+  await reader.close();
+  expect(await firstPending).toEqual({ value: undefined, done: true });
+  expect(await secondPending).toEqual({ value: undefined, done: true });
+});
+
 test("reader close during signal registration aborts the pending read", async () => {
   const store = ephemeral<{ value: number }>({
     id: testId("reader-close-registration"),
@@ -699,6 +743,29 @@ test("a reader that falls behind after a healthy start gets an overflow", async 
   // consumer's materialised view stayed permanently wrong.
   const next = await reader.recv({ wait: false });
   expect(next?.type).toBe("overflow");
+});
+
+test("a blocked reader detects a gap after the entire event stream disappeared", async () => {
+  const id = testId("overflow-empty-history");
+  const store = ephemeral<{ n: number }>({ id, ttlMs: 60_000 });
+  const eventsKey = `sync:e:default:${id}:events`;
+
+  await store.upsert({ key: "seed", value: { n: 0 } });
+  const anchor = await store.snapshot();
+  const reader = trackReader(store.reader({ after: anchor.cursor }));
+  await redis.send("DEL", [eventsKey]);
+
+  const clientsBefore = await connectedClients();
+  const pending = reader.recv({ wait: true, timeoutMs: 1_000 });
+  await waitFor(async () => (await connectedClients()) > clientsBefore);
+  await store.upsert({ key: "after-gap", value: { n: 1 } });
+
+  const event = await pending;
+  expect(event?.type).toBe("overflow");
+  if (event?.type === "overflow") {
+    expect(event.after).toBe(anchor.cursor);
+    expect(event.firstAvailable).not.toBe(anchor.cursor);
+  }
 });
 
 test("a reader that keeps up never sees a spurious overflow", async () => {

@@ -128,6 +128,22 @@ test("pub idempotency key deduplicates events", async () => {
   expect(events.length).toBe(1);
 });
 
+test("pub replaces an idempotency key whose stream entry was retained away", async () => {
+  const id = `idempotency-retention-${Date.now()}`;
+  const streamKey = `test:t:default:${id}:stream`;
+  const t = topic<{ value: number }>({ id, prefix: "test:t" });
+
+  const first = await t.pub({ data: { value: 1 }, idempotencyKey: "same" });
+  expect(await redis.send("XDEL", [streamKey, first.eventId])).toBe(1);
+
+  const second = await t.pub({ data: { value: 2 }, idempotencyKey: "same" });
+  expect(second.eventId).not.toBe(first.eventId);
+  expect(await t.latestCursor()).toBe(second.cursor);
+
+  const message = await t.reader("retained").recv({ wait: false });
+  expect(message?.data).toEqual({ value: 2 });
+});
+
 test("commit can only acknowledge once", async () => {
   const t = topic({
     id: "commit-once",

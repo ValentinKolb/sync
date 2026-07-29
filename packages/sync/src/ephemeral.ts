@@ -292,28 +292,69 @@ const evalScript = async (script: string, keys: string[], args: Array<string | n
   return await redis.send("EVAL", [script, keys.length.toString(), ...keys, ...args.map((v) => String(v))]);
 };
 
-const blockingReadWithTemporaryClient = async (
+const raceWithAbort = async <T>(operation: Promise<T>, signal: AbortSignal): Promise<T | null> => {
+  if (signal.aborted) return null;
+
+  return await new Promise<T | null>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(null);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+};
+
+const blockingReadWithClient = async (
+  client: RedisClient,
   args: string[],
   signal?: AbortSignal,
 ): Promise<unknown> => {
   if (signal?.aborted) return null;
 
-  const client = new RedisClient();
   const onAbort = (): void => {
     safeClose(client);
   };
-
   if (signal) signal.addEventListener("abort", onAbort, { once: true });
 
   try {
-    if (!client.connected) await client.connect();
+    if (!client.connected) {
+      const connect = client.connect();
+      const connected = signal ? await raceWithAbort(connect, signal) : await connect;
+      if (connected === null) {
+        void connect.then(() => safeClose(client), () => {});
+        return null;
+      }
+    }
     if (signal?.aborted) return null;
-    return await client.send("XREAD", args);
+
+    const read = client.send("XREAD", args);
+    return signal ? await raceWithAbort(read, signal) : await read;
   } catch (error) {
     if (signal?.aborted) return null;
     throw asError(error);
   } finally {
     if (signal) signal.removeEventListener("abort", onAbort);
+  }
+};
+
+const blockingReadWithTemporaryClient = async (
+  args: string[],
+  signal?: AbortSignal,
+): Promise<unknown> => {
+  const client = new RedisClient();
+  try {
+    return await blockingReadWithClient(client, args, signal);
+  } finally {
     safeClose(client);
   }
 };
@@ -783,7 +824,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     let overflowPending: EphemeralEvent<TData> | null = null;
     let replayChecked = false;
     let anchored = false;
-    let blockingClient: RedisClient | null = null;
+    const blockingClients = new Set<RedisClient>();
     const closeController = new AbortController();
     let closed = false;
     let closePromise: Promise<void> | null = null;
@@ -814,49 +855,15 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       }
     };
 
-    const resetBlockingClient = (): void => {
-      if (!blockingClient) return;
-      safeClose(blockingClient);
-      blockingClient = null;
-    };
-
-    // Number of stream() loops currently using the blocking client. Without it,
-    // the first loop to exit closed the socket a concurrent loop was blocked on.
-    let blockingUsers = 0;
-
-    const releaseBlockingClient = (): void => {
-      blockingUsers = Math.max(0, blockingUsers - 1);
-      if (blockingUsers === 0) resetBlockingClient();
-    };
-
-    const ensureBlockingClient = async (): Promise<RedisClient> => {
-      assertOpen();
-      if (blockingClient?.connected) return blockingClient;
-      resetBlockingClient();
-      const client = new RedisClient();
-      blockingClient = client;
-      await client.connect();
-      if (closed || blockingClient !== client) {
-        safeClose(client);
-        throw new Error("ephemeral reader is closed");
-      }
-      // Return the local handle: a concurrent reset may already have cleared the
-      // slot while this connect was in flight.
-      return client;
-    };
-
     /**
-     * Release this reader's dedicated blocking connection. Without it, a reader
-     * created per request leaked one Redis connection per request until the
-     * process hit its fd or maxclients limit, and every other Redis user in the
-     * process started failing far from the code that caused it.
+     * Release this reader's blocking connections. Each stream owns one connection
+     * so concurrent streams cannot serialize or close each other's reads.
      */
     const close = (): Promise<void> => {
       if (closePromise) return closePromise;
       closed = true;
       closeController.abort();
-      blockingUsers = 0;
-      resetBlockingClient();
+      for (const client of blockingClients) safeClose(client);
       closePromise = operationsIdle;
       return closePromise;
     };
@@ -871,8 +878,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
      *
      * It now runs against the live cursor before every read.
      */
-    const checkReplayGap = async (): Promise<void> => {
-      const from = replayChecked ? cursor : (readerCfg.after ?? cursor);
+    const checkReplayGap = async (from = replayChecked ? cursor : (readerCfg.after ?? cursor)): Promise<void> => {
       replayChecked = true;
 
       if (!from || from === "$") return;
@@ -901,7 +907,10 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       cursor = await latestCursor(keys.events);
     };
 
-    const recvInternal = async (cfg: EphemeralRecvConfig = {}): Promise<EphemeralEvent<TData> | null> => {
+    const recvInternal = async (
+      cfg: EphemeralRecvConfig = {},
+      blockingRead = blockingReadWithTemporaryClient,
+    ): Promise<EphemeralEvent<TData> | null> => {
       await anchorLiveCursor();
       if (closed) return null;
       await maybeRunReconcile(tenantId, keys);
@@ -921,42 +930,42 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       // Loop internally to skip prefix-mismatched events without returning null
       // prematurely. Only meaningful when `prefix` is set; otherwise one pass.
       while (true) {
-        if (cfg.signal?.aborted) return null;
+        if (cfg.signal?.aborted || closeController.signal.aborted) return null;
 
         const args = wait
           ? ["COUNT", "1", "BLOCK", timeoutMs.toString(), "STREAMS", keys.events, cursor]
           : ["COUNT", "1", "STREAMS", keys.events, cursor];
 
-        const result = cfg.signal
-          ? await (async (): Promise<unknown> => {
-              const readController = new AbortController();
-              const abortRead = (): void => readController.abort();
-              cfg.signal!.addEventListener("abort", abortRead, { once: true });
-              closeController.signal.addEventListener("abort", abortRead, { once: true });
-              if (cfg.signal!.aborted || closeController.signal.aborted) readController.abort();
-              try {
-                return await blockingReadWithTemporaryClient(args, readController.signal);
-              } finally {
-                cfg.signal!.removeEventListener("abort", abortRead);
-                closeController.signal.removeEventListener("abort", abortRead);
-              }
-            })()
-          : wait
-            ? await (async (): Promise<unknown> => {
-                try {
-                  const client = await ensureBlockingClient();
-                  return await client.send("XREAD", args);
-                } catch (error) {
-                  resetBlockingClient();
-                  if (closed) return null;
-                  throw asError(error);
-                }
-              })()
-            : await redis.send("XREAD", args);
+        const previousCursor = cursor;
+        let result: unknown;
+        if (wait) {
+          const readController = new AbortController();
+          const abortRead = (): void => readController.abort();
+          cfg.signal?.addEventListener("abort", abortRead, { once: true });
+          closeController.signal.addEventListener("abort", abortRead, { once: true });
+          if (cfg.signal?.aborted || closeController.signal.aborted) readController.abort();
+          try {
+            result = await blockingRead(args, readController.signal);
+          } finally {
+            cfg.signal?.removeEventListener("abort", abortRead);
+            closeController.signal.removeEventListener("abort", abortRead);
+          }
+        } else {
+          result = await redis.send("XREAD", args);
+        }
 
         if (closed) return null;
         const entry = parseFirstStreamEntry(result);
         if (!entry) return null;
+
+        if (previousCursor !== "0-0" && previousCursor !== "$") {
+          await checkReplayGap(previousCursor);
+          if (overflowPending) {
+            const event = overflowPending;
+            overflowPending = null;
+            return event;
+          }
+        }
 
         cursor = entry.id;
         const parsed = parseEvent(entry);
@@ -971,14 +980,21 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
 
     const stream = async function* (cfg: EphemeralRecvConfig = {}): AsyncIterable<EphemeralEvent<TData>> {
       const wait = cfg.wait ?? true;
-      blockingUsers += 1;
+      const streamClient = new RedisClient();
+      blockingClients.add(streamClient);
       try {
         while (!closed && !cfg.signal?.aborted) {
           let event: EphemeralEvent<TData> | null;
           try {
             event = wait
               ? await retry({
-                  run: () => recv(cfg),
+                  run: () =>
+                    runOperation(() =>
+                      recvInternal(
+                        cfg,
+                        (args, signal) => blockingReadWithClient(streamClient, args, signal),
+                      ),
+                    ),
                   after: ({ ctx }) => {
                     if (ctx.error && isRetryableTransportError(ctx.error)) {
                       ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
@@ -998,7 +1014,8 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
           if (!wait) break;
         }
       } finally {
-        releaseBlockingClient();
+        safeClose(streamClient);
+        blockingClients.delete(streamClient);
       }
     };
 
