@@ -11,9 +11,12 @@ import {
 
 type TestValue = { status: string };
 
+// A distinct id per store, because same-id handles genuinely share state now,
+// exactly as two queue()/ephemeral() calls with one id do on the server.
+let storeCounter = 0;
 const makeStore = (overrides?: Parameters<typeof ephemeral<TestValue>>[0]) =>
   ephemeral<TestValue>({
-    id: "test",
+    id: `test-${++storeCounter}-${Date.now()}`,
     ttlMs: 2000,
     ...overrides,
   });

@@ -1,4 +1,5 @@
 import { EventLog, type EventLogEntry } from "./internal/event-log";
+import { sharedState } from "./internal/shared-state";
 
 const DEFAULT_MAX_ENTRIES = 10_000;
 const DEFAULT_MAX_PAYLOAD_BYTES = 4 * 1024;
@@ -165,8 +166,12 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     return resolved;
   };
 
-  // Per-tenant state
-  const tenantStates = new Map<string, TenantState<TData>>();
+  // Per-tenant state, shared by every handle with this id.
+  const tenantStates = sharedState(
+    `ephemeral:${config.id}`,
+    undefined,
+    () => new Map<string, TenantState<TData>>(),
+  );
   const getTenantState = (tenantId: string): TenantState<TData> => {
     let state = tenantStates.get(tenantId);
     if (!state) {

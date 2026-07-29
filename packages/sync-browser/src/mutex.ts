@@ -1,4 +1,5 @@
-import { type Store, createMemoryStore } from "./store";
+import { type Store } from "./store";
+import { resolveStore } from "./internal/shared-state";
 import { sleep } from "./internal/sleep";
 import { randomHex, simpleHash } from "./internal/id";
 
@@ -65,7 +66,7 @@ export const mutex = (config: MutexConfig): Mutex => {
   const retryCount = config.retryCount ?? DEFAULT_RETRY_COUNT;
   const retryDelay = config.retryDelay ?? DEFAULT_RETRY_DELAY;
   const defaultTtl = config.defaultTtl ?? DEFAULT_TTL;
-  const store = config.store ?? createMemoryStore();
+  const store = resolveStore(config.store);
 
   const acquire = async (resource: string, ttl: number = defaultTtl): Promise<Lock | null> => {
     if (!Number.isFinite(ttl) || ttl <= 0) return null;

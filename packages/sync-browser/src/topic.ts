@@ -1,4 +1,5 @@
-import { type Store, createMemoryStore } from "./store";
+import { type Store } from "./store";
+import { resolveStore, sharedState } from "./internal/shared-state";
 import { EventLog, type EventLogEntry } from "./internal/event-log";
 import { randomId } from "./internal/id";
 
@@ -164,12 +165,12 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
   const retentionMs = config.retentionMs ?? DEFAULT_RETENTION_MS;
   const maxPayloadBytes = config.limits?.payloadBytes ?? DEFAULT_PAYLOAD_BYTES;
-  const store = config.store ?? createMemoryStore();
+  const store = resolveStore(config.store);
 
   const resolveTenant = (tenantId?: string): string => tenantId ?? defaultTenant;
 
-  // One EventLog per tenant
-  const eventLogs = new Map<string, EventLog>();
+  // One EventLog per tenant, shared by every handle in this scope.
+  const eventLogs = sharedState(`topic:logs:${prefix}:${config.id}`, config.store, () => new Map<string, EventLog>());
   const getEventLog = (tenantId: string): EventLog => {
     const key = `${prefix}:${tenantId}:${config.id}`;
     let log = eventLogs.get(key);

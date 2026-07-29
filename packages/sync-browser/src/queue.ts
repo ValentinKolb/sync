@@ -1,6 +1,7 @@
 import { Emitter } from "./internal/emitter";
 import { randomId } from "./internal/id";
 import { sleep } from "./internal/sleep";
+import { sharedState } from "./internal/shared-state";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_PREFIX = "sync:queue";
@@ -163,8 +164,9 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   const dlqRetentionMs = config.limits?.dlqRetentionMs ?? DEFAULT_DLQ_RETENTION_MS;
   const resolveTenant = (tenantId?: string): string => tenantId ?? defaultTenant;
 
-  // Per-tenant state
-  const states = new Map<string, QueueState>();
+  // Per-tenant state, shared by every handle with this id: on the server two
+  // queue() calls with one id always meet through Redis.
+  const states = sharedState(`queue:${prefix}:${config.id}`, undefined, () => new Map<string, QueueState>());
   const getState = (tenantId: string): QueueState => {
     const key = `${prefix}:${tenantId}:${config.id}`;
     let state = states.get(key);

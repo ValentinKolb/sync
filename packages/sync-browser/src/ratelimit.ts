@@ -1,4 +1,5 @@
-import { type Store, createMemoryStore } from "./store";
+import { type Store } from "./store";
+import { resolveStore } from "./internal/shared-state";
 import { simpleHash } from "./internal/id";
 
 const DEFAULT_PREFIX = "sync:ratelimit";
@@ -58,7 +59,7 @@ export const ratelimit = (config: RateLimitConfig): RateLimiter => {
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const windowSecs = config.windowSecs ?? DEFAULT_WINDOW_SECS;
   const { limit } = config;
-  const store = config.store ?? createMemoryStore();
+  const store = resolveStore(config.store);
 
   if (!Number.isFinite(windowSecs) || windowSecs <= 0) {
     throw new Error("windowSecs must be > 0");
