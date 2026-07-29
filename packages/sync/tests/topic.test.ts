@@ -846,31 +846,33 @@ test("close is terminal for a reader", async () => {
   expect(seen).toEqual([]);
 });
 
-test("two concurrent streams from one reader do not close each other's connection", async () => {
+test("two concurrent streams from one reader use independent connections", async () => {
   const id = `shared-stream-${Date.now()}`;
   const t = topic<{ v: number }>({ id, prefix: "test:t" });
   const reader = t.reader("shared");
+  const clientsBefore = await connectedClients();
 
   const firstAc = new AbortController();
   const collected: number[] = [];
 
-  const consume = async (signal?: AbortSignal): Promise<void> => {
-    for await (const message of reader.stream({ wait: true, timeoutMs: 200, signal })) {
+  const consume = async (tenantId: string, signal?: AbortSignal): Promise<void> => {
+    for await (const message of reader.stream({ tenantId, wait: true, timeoutMs: 200, signal })) {
       collected.push(message.data.v);
       await message.commit();
     }
   };
 
-  const first = consume(firstAc.signal);
+  const first = consume("first", firstAc.signal);
   const secondAc = new AbortController();
-  const second = consume(secondAc.signal);
+  const second = consume("second", secondAc.signal);
 
   await Bun.sleep(100);
+  expect(await connectedClients()).toBeGreaterThanOrEqual(clientsBefore + 2);
   firstAc.abort();
   await first;
 
-  // The surviving loop must keep working on a socket the other one closed.
-  await t.pub({ data: { v: 42 } });
+  // The surviving loop must keep working after the other closes its socket.
+  await t.pub({ tenantId: "second", data: { v: 42 } });
   await Bun.sleep(400);
   secondAc.abort();
   await second;

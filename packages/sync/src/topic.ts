@@ -105,14 +105,14 @@ const evalScript = async (script: string, keys: string[], args: Array<string | n
   return await redis.send("EVAL", [script, keys.length.toString(), ...keys, ...args.map((v) => String(v))]);
 };
 
-const blockingReadWithTemporaryClient = async (
+const blockingReadWithClient = async (
+  client: RedisClient,
   command: string,
   args: string[],
   signal?: AbortSignal,
 ): Promise<unknown> => {
   if (signal?.aborted) return null;
 
-  const client = new RedisClient();
   const onAbort = (): void => {
     safeClose(client);
   };
@@ -140,6 +140,18 @@ const blockingReadWithTemporaryClient = async (
     throw asError(error);
   } finally {
     if (signal) signal.removeEventListener("abort", onAbort);
+  }
+};
+
+const blockingReadWithTemporaryClient = async (
+  command: string,
+  args: string[],
+  signal?: AbortSignal,
+): Promise<unknown> => {
+  const client = new RedisClient();
+  try {
+    return await blockingReadWithClient(client, command, args, signal);
+  } finally {
     safeClose(client);
   }
 };
@@ -415,11 +427,8 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     // group registry forever, because nothing ever issues XGROUP DELCONSUMER.
     // Callers with a stable identity can supply one; close() cleans up the rest.
     const consumer = readerCfg.consumerId ?? `consumer:${process.pid}:${randomUUID()}`;
-    let blockingClient: RedisClient | null = null;
+    const blockingClients = new Set<RedisClient>();
     const usedKeys = new Set<string>();
-    // Number of stream() loops currently using the blocking client. Without it,
-    // the first loop to exit closed the socket a concurrent loop was blocked on.
-    let blockingUsers = 0;
     const closeController = new AbortController();
     let closed = false;
     let closePromise: Promise<void> | null = null;
@@ -450,43 +459,6 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       }
     };
 
-    const resetBlockingClient = (): void => {
-      if (!blockingClient) return;
-      safeClose(blockingClient);
-      blockingClient = null;
-    };
-
-    const releaseBlockingClient = (): void => {
-      blockingUsers = Math.max(0, blockingUsers - 1);
-      if (blockingUsers === 0) resetBlockingClient();
-    };
-
-    const ensureBlockingClient = async (): Promise<RedisClient> => {
-      assertOpen();
-      if (blockingClient?.connected) return blockingClient;
-      resetBlockingClient();
-      const client = new RedisClient();
-      blockingClient = client;
-      const connect = client.connect();
-      const connected = await raceWithAbort(connect, closeController.signal);
-      if (connected === null) {
-        void connect.then(() => safeClose(client), () => {});
-        throw new Error("topic reader is closed");
-      }
-      if (closed) {
-        safeClose(client);
-        throw new Error("topic reader is closed");
-      }
-      if (blockingClient !== client) {
-        safeClose(client);
-        throw new Error("connection closed");
-      }
-      // Return the local handle: a concurrent reset may already have cleared the
-      // slot while this connect was in flight, which made callers see null and
-      // throw an opaque TypeError no transport-error check could match.
-      return client;
-    };
-
     /**
      * Release this reader's dedicated blocking connection, and drop its consumer
      * record when it holds nothing. Without it, `const m = await topic
@@ -501,8 +473,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       if (closePromise) return closePromise;
       closed = true;
       closeController.abort();
-      blockingUsers = 0;
-      resetBlockingClient();
+      for (const client of blockingClients) safeClose(client);
       closePromise = (async () => {
         await operationsIdle;
         for (const key of usedKeys) {
@@ -517,23 +488,10 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     };
 
     const blockingReadGroup = async (args: string[], signal?: AbortSignal): Promise<unknown> => {
-      if (signal?.aborted) return null;
-
-      const onAbort = (): void => {
-        resetBlockingClient();
-      };
-      if (signal) signal.addEventListener("abort", onAbort, { once: true });
-
-      try {
-        const client = await ensureBlockingClient();
-        return await client.send("XREADGROUP", args);
-      } catch (error) {
-        if (signal?.aborted || closed) return null;
-        resetBlockingClient();
-        throw asError(error);
-      } finally {
-        if (signal) signal.removeEventListener("abort", onAbort);
-      }
+      const combinedSignal = signal
+        ? AbortSignal.any([signal, closeController.signal])
+        : closeController.signal;
+      return await blockingReadWithTemporaryClient("XREADGROUP", args, combinedSignal);
     };
 
     // A bare XACK let a stalled consumer acknowledge an entry another consumer
@@ -567,6 +525,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     const recvInternal = async (
       recvCfg: TopicRecvConfig,
       retriedAfterNoGroup = false,
+      readGroup = blockingReadGroup,
     ): Promise<TopicDelivery<TData> | null> => {
       if (closed) return null;
       const tenantId = resolveTenant(recvCfg.tenantId);
@@ -581,7 +540,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       let result: unknown;
       try {
         result = wait
-          ? await blockingReadGroup(
+          ? await readGroup(
               [
                 "GROUP",
                 group,
@@ -600,7 +559,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       } catch (error) {
         if (retriedAfterNoGroup || !isNoGroupError(error)) throw error;
         forgetGroup(key, group);
-        return await recvInternal(recvCfg, true);
+        return await recvInternal(recvCfg, true, readGroup);
       }
 
       const entry = parseFirstStreamEntry(result);
@@ -614,7 +573,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
         // one bad envelope as end-of-drain and yielded nothing at all — making
         // exactly one message of progress per run on a 500-message backlog.
         await createCommit(key, entry.id, consumer)();
-        return await recvInternal(recvCfg, retriedAfterNoGroup);
+        return await recvInternal(recvCfg, retriedAfterNoGroup, readGroup);
       }
       return createDelivery(entry, stored.value, key);
     };
@@ -683,14 +642,29 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
 
     const stream = async function* (streamCfg: TopicRecvConfig = {}): AsyncIterable<TopicDelivery<TData>> {
       const wait = streamCfg.wait ?? true;
-      blockingUsers += 1;
+      let streamClient = new RedisClient();
+      blockingClients.add(streamClient);
+      const readGroup = async (args: string[], signal?: AbortSignal): Promise<unknown> => {
+        const combinedSignal = signal
+          ? AbortSignal.any([signal, closeController.signal])
+          : closeController.signal;
+        try {
+          return await blockingReadWithClient(streamClient, "XREADGROUP", args, combinedSignal);
+        } catch (error) {
+          safeClose(streamClient);
+          blockingClients.delete(streamClient);
+          streamClient = new RedisClient();
+          blockingClients.add(streamClient);
+          throw error;
+        }
+      };
       try {
         while (!closed && !streamCfg.signal?.aborted) {
           let message: TopicDelivery<TData> | null;
           try {
             message = wait
               ? await retry({
-                  run: () => recv(streamCfg),
+                  run: () => runOperation(() => recvInternal(streamCfg, false, readGroup)),
                   after: ({ ctx }) => {
                     if (ctx.error && isRetryableTransportError(ctx.error)) {
                       ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
@@ -710,7 +684,8 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
           if (!wait) break;
         }
       } finally {
-        releaseBlockingClient();
+        safeClose(streamClient);
+        blockingClients.delete(streamClient);
       }
     };
 
