@@ -15,6 +15,9 @@ const DEFAULT_IDEMPOTENCY_TTL_MS = 7 * DAY_MS;
 const DEFAULT_PAYLOAD_BYTES = 128 * 1024;
 const MAINTENANCE_BATCH_SIZE = 200;
 const DEFAULT_MAINTENANCE_INTERVAL_MS = 1_000;
+// Old workers moved ready -> active before writing the delivery record. Give
+// that non-atomic claim window one default lease to finish before recovery.
+const LEGACY_ORPHAN_GRACE_MS = DEFAULT_LEASE_MS;
 // Longest single block on the notify list. Bounding it keeps a parked consumer
 // running maintenance and re-checking the ready list roughly once a second, so
 // delayed sends and expired leases can no longer wait out a long recv timeout.
@@ -130,6 +133,7 @@ const MAINTENANCE_SCRIPT = `
   local maxMessageAgeMs = tonumber(ARGV[3])
   local batch = tonumber(ARGV[4])
   local dlqTtlMs = tonumber(ARGV[5])
+  local orphanGraceMs = tonumber(ARGV[6])
 
   local function toDlq(messageId, message, reason)
     writeDeadLetter(KEYS[7], KEYS[9], messageId, message, now, reason, nil, dlqTtlMs)
@@ -199,8 +203,9 @@ const MAINTENANCE_SCRIPT = `
 
   -- New claims maintain message -> delivery directly. During rolling upgrades,
   -- old workers do not, so incrementally backfill their live deliveries first.
-  -- A candidate is only reaped after a complete delivery scan since it was
-  -- observed, which prevents a genuine legacy delivery from being requeued.
+  -- A candidate is only reaped after two complete delivery scans started after
+  -- observation and a time grace, which gives a genuine legacy claim time to
+  -- materialize and be backfilled before recovery.
   local deliveryCursor = redis.call("HGET", KEYS[12], "deliveryCursor") or "0"
   local generation = tonumber(redis.call("HGET", KEYS[12], "deliveryGeneration")) or 0
   local deliveryScan = redis.call("HSCAN", KEYS[4], deliveryCursor, "COUNT", tostring(batch))
@@ -244,22 +249,27 @@ const MAINTENANCE_SCRIPT = `
       redis.call("HDEL", KEYS[10], messageId)
       local candidate = redis.call("HGET", KEYS[11], messageId)
       local observedGeneration = candidate and tonumber(string.match(candidate, "^([^:]+)"))
-      local observedAttempt = candidate and tonumber(string.match(candidate, ":(.+)$"))
+      local observedAttempt = candidate and tonumber(string.match(candidate, "^[^:]+:([^:]+)"))
+      local observedAt = candidate and tonumber(string.match(candidate, "^[^:]+:[^:]+:(.+)$"))
       local messageRaw = redis.call("HGET", KEYS[5], messageId)
       local message = messageRaw and readMessage(messageRaw)
       if not message then
         redis.call("LPOP", KEYS[6])
         redis.call("HDEL", KEYS[11], messageId)
-      elseif not observedGeneration or observedAttempt ~= (tonumber(message.attempt) or 0) then
+      elseif not observedGeneration
+        or not observedAt
+        or observedAttempt ~= (tonumber(message.attempt) or 0)
+      then
         -- A legacy nack + claim increments the attempt without touching this
-        -- hash. Treat that as a new active incarnation and observe it afresh.
+        -- hash. Two-field candidates came from an older release and have no
+        -- trustworthy observation time. Observe either case afresh.
         redis.call(
           "HSET",
           KEYS[11],
           messageId,
-          tostring(generation) .. ":" .. tostring(tonumber(message.attempt) or 0)
+          tostring(generation) .. ":" .. tostring(tonumber(message.attempt) or 0) .. ":" .. tostring(now)
         )
-      elseif observedGeneration + 2 <= generation then
+      elseif observedGeneration + 2 <= generation and now - observedAt >= orphanGraceMs then
         -- RPOPLPUSH put this entry at the head, so removal is O(1).
         redis.call("LPOP", KEYS[6])
         redis.call("HDEL", KEYS[11], messageId)
@@ -680,7 +690,14 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
         keys.orphanCandidates,
         keys.maintenance,
       ],
-      [now, maxDeliveries, maxMessageAgeMs, MAINTENANCE_BATCH_SIZE, dlqRetentionMs],
+      [
+        now,
+        maxDeliveries,
+        maxMessageAgeMs,
+        MAINTENANCE_BATCH_SIZE,
+        dlqRetentionMs,
+        LEGACY_ORPHAN_GRACE_MS,
+      ],
     );
   };
 

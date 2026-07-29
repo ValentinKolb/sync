@@ -14,4 +14,7 @@ test("recurring queue maintenance incrementally scans deliveries instead of usin
   expect(maintenance).toContain('redis.call("RPOPLPUSH", KEYS[6], KEYS[6])');
   expect(maintenance).toContain("observedAttempt ~= (tonumber(message.attempt) or 0)");
   expect(maintenance).toContain("observedGeneration + 2 <= generation");
+  expect(maintenance).toContain("local orphanGraceMs = tonumber(ARGV[6])");
+  expect(maintenance).toContain('string.match(candidate, "^[^:]+:[^:]+:(.+)$")');
+  expect(maintenance).toContain("now - observedAt >= orphanGraceMs");
 });

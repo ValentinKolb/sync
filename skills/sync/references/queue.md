@@ -94,6 +94,7 @@ const msg2 = await reader.recv({ signal });
 - **Payloads are JSON snapshots**: `data` and `meta` are serialized at `send()` and parsed for each delivery. Mutating the caller's object or a received object cannot change a later redelivery. JSON restrictions therefore match the Redis-backed server.
 - **Ordering**: only `best_effort` exists. `orderingKey` is stored and delivered back with the message, but nothing partitions or serialises by it, so concurrent consumers can reorder same-key messages. Constructing a queue with `ordering: { mode: "ordering_key_partitioned" }` throws rather than silently ignoring the guarantee.
 - **`tenantId`**: isolates queue state (separate namespace). Presence in config sets the default; can be overridden per-call.
+- **Rolling upgrades from <= 5.8.0**: maintenance gives a legacy non-atomic claim 30 seconds plus two complete delivery-index scans before recovering it as orphaned. This bounds the practical race, but an old worker paused arbitrarily long between its list move and delivery write cannot be strictly fenced without changing that old protocol.
 
 ## Redis keys (server)
 

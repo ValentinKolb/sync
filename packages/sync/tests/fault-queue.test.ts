@@ -3,6 +3,7 @@ import { redis } from "bun";
 import { queue } from "../index";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+const EXPIRED_ORPHAN_OBSERVED_AT = (): number => Date.now() - 31_000;
 
 beforeEach(async () => {
   const keys = await redis.send("KEYS", ["test:fq:*"]);
@@ -426,9 +427,30 @@ test("a message orphaned between dequeue and claim is recovered, not lost", asyn
   expect(await redis.send("HLEN", [`${base}:deliveries`])).toBe(0);
   expect(await redis.send("LLEN", [`${base}:ready`])).toBe(0);
 
-  // The first pass only records the suspicion. Requeueing immediately
-  // would race an older worker between its LMOVE and delivery write.
+  // The first pass only records the suspicion. Requeueing immediately would
+  // race an older worker between its LMOVE and delivery write.
   expect(await q.recv({ wait: false })).toBeNull();
+  const candidateKey = `${base}:orphan-candidates`;
+  const initialCandidate = String(await redis.send("HGET", [candidateKey, messageId]));
+  const [initialGeneration, initialAttempt] = initialCandidate.split(":");
+
+  // A candidate written by the previous release has no observedAt. The next
+  // pass accepts it but starts both its generation and time fences afresh.
+  await redis.send("HSET", [candidateKey, messageId, `${initialGeneration}:${initialAttempt}`]);
+  expect(await q.recv({ wait: false })).toBeNull();
+  const migratedCandidate = String(await redis.send("HGET", [candidateKey, messageId]));
+  const [migratedGeneration, migratedAttempt, migratedObservedAt] = migratedCandidate.split(":");
+  expect(Number(migratedGeneration)).toBeGreaterThan(Number(initialGeneration));
+  expect(Number(migratedObservedAt)).toBeGreaterThan(0);
+
+  // Age the observation directly instead of waiting through the internal
+  // 30-second rolling-upgrade grace. Two scans started after migration are
+  // still required before the true orphan can be recovered.
+  await redis.send("HSET", [
+    candidateKey,
+    messageId,
+    `${migratedGeneration}:${migratedAttempt}:${EXPIRED_ORPHAN_OBSERVED_AT()}`,
+  ]);
   expect(await q.recv({ wait: false })).toBeNull();
   const recovered = await q.recv({ wait: false });
   expect(recovered).not.toBeNull();
@@ -437,6 +459,42 @@ test("a message orphaned between dequeue and claim is recovered, not lost", asyn
   expect(await recovered?.ack()).toBe(true);
 
   expect(await redis.send("LLEN", [`${base}:active`])).toBe(0);
+});
+
+test("a legacy claim that materializes within the orphan grace is not requeued", async () => {
+  const id = uid("orphan-legacy-grace");
+  const q = queue<{ v: number }>({ id, prefix: "test:fq" });
+  const base = `test:fq:default:${id}`;
+
+  const { messageId } = await q.send({ data: { v: 1 } });
+  expect(await redis.send("LMOVE", [`${base}:ready`, `${base}:active`, "RIGHT", "LEFT"])).toBe(messageId);
+
+  // Complete enough scans for the generation fence while keeping the real
+  // observation time. The grace alone must prevent premature recovery.
+  expect(await q.recv({ wait: false })).toBeNull();
+  expect(await q.recv({ wait: false })).toBeNull();
+  expect(await q.recv({ wait: false })).toBeNull();
+  expect(await redis.send("LLEN", [`${base}:ready`])).toBe(0);
+
+  // The old worker now finishes its non-atomic claim. It cannot write the new
+  // reverse owner index, so maintenance must discover and backfill it.
+  const deliveryId = `legacy-${messageId}`;
+  const leaseUntil = Date.now() + 60_000;
+  const messageRaw = String(await redis.send("HGET", [`${base}:messages`, messageId]));
+  const message = JSON.parse(messageRaw) as { attempt?: number };
+  message.attempt = (message.attempt ?? 0) + 1;
+  await redis.send("HSET", [`${base}:messages`, messageId, JSON.stringify(message)]);
+  await redis.send("HSET", [
+    `${base}:deliveries`,
+    deliveryId,
+    JSON.stringify({ messageId, leaseUntil, attempt: message.attempt }),
+  ]);
+  await redis.send("ZADD", [`${base}:leases`, String(leaseUntil), deliveryId]);
+
+  expect(await q.recv({ wait: false })).toBeNull();
+  expect(await redis.send("HGET", [`${base}:delivery-owners`, messageId])).toBe(deliveryId);
+  expect(await redis.send("LLEN", [`${base}:ready`])).toBe(0);
+  expect(await redis.send("LLEN", [`${base}:active`])).toBe(1);
 });
 
 test("the reaper leaves genuinely in-flight deliveries alone", async () => {
@@ -566,6 +624,13 @@ test("an orphan is recovered without requeueing an unrelated live delivery", asy
 
   // The candidate waits until a scan started after observation has completed.
   expect(await q.reader().recv({ wait: false })).toBeNull();
+  const candidate = String(await redis.send("HGET", [`${base}:orphan-candidates`, orphan.messageId]));
+  const [generation, attempt] = candidate.split(":");
+  await redis.send("HSET", [
+    `${base}:orphan-candidates`,
+    orphan.messageId,
+    `${generation}:${attempt}:${EXPIRED_ORPHAN_OBSERVED_AT()}`,
+  ]);
   expect(await q.reader().recv({ wait: false })).toBeNull();
   const recovered = await q.reader().recv({ wait: false });
 
