@@ -584,20 +584,22 @@ test("concurrent first-recv on new group does not throw", async () => {
   const r1 = t.reader("fresh-group");
   const r2 = t.reader("fresh-group");
 
-  const [m1, m2] = await Promise.all([
-    r1.recv({ wait: false }),
-    r2.recv({ wait: false }),
-  ]);
+  try {
+    const [m1, m2] = await Promise.all([
+      r1.recv({ wait: false }),
+      r2.recv({ wait: false }),
+    ]);
 
-  // At least one should succeed, and they should not get the same message
-  const received = [m1, m2].filter((m) => m !== null);
-  expect(received.length).toBeGreaterThanOrEqual(1);
+    const received = [m1, m2].filter((m) => m !== null);
+    expect(received).toHaveLength(2);
+    expect(received.map((m) => m!.data.v).sort()).toEqual([1, 2]);
+    expect(new Set(received.map((m) => m!.eventId)).size).toBe(2);
 
-  const ids = received.map((m) => m!.eventId);
-  expect(new Set(ids).size).toBe(ids.length); // no duplicates
-
-  for (const m of received) {
-    await m!.commit();
+    for (const message of received) {
+      expect(await message!.commit()).toBe(true);
+    }
+  } finally {
+    await Promise.all([r1.close(), r2.close()]);
   }
 });
 

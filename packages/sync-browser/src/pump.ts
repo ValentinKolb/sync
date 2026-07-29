@@ -18,7 +18,7 @@ const DEFAULT_RETRY_MAX_MS = 60_000;
 const DEFAULT_RETRY_JITTER = 0.2;
 const WORKER_POLL_MS = 250;
 const MAX_KEY_BYTES = 512;
-const STALLED_PAGE_ERROR = "pull returned an empty page without advancing the cursor";
+const STALLED_PAGE_ERROR = "pull returned a page without advancing the cursor";
 
 const textEncoder = new TextEncoder();
 
@@ -359,6 +359,13 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
           throw new LeaseLostError();
         }
         currentState.activePage = activePage;
+        const stalled =
+          activePage.nextCursor !== null &&
+          JSON.stringify(activePage.nextCursor) === JSON.stringify(currentState.cursor);
+        if (!stalled) {
+          currentState.failureCount = 0;
+          delete currentState.lastError;
+        }
         currentState.updatedAt = Date.now();
         state = writeState(stateKey, currentState);
 
@@ -397,8 +404,13 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
         }
         currentState.activePage.nextIndex = index + 1;
         currentState.dispatched += 1;
-        currentState.failureCount = 0;
-        delete currentState.lastError;
+        const stalled =
+          currentState.activePage.nextCursor !== null &&
+          JSON.stringify(currentState.activePage.nextCursor) === JSON.stringify(currentState.cursor);
+        if (!stalled) {
+          currentState.failureCount = 0;
+          delete currentState.lastError;
+        }
         currentState.updatedAt = Date.now();
         state = writeState(stateKey, currentState);
 
@@ -425,7 +437,6 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
       const nextCursor = currentState.activePage.nextCursor;
       const stalled =
         nextCursor !== null &&
-        currentState.activePage.items.length === 0 &&
         JSON.stringify(nextCursor) === JSON.stringify(currentState.cursor);
       currentState.cursor = nextCursor;
       delete currentState.activePage;

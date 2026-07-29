@@ -96,24 +96,30 @@ test("resetIn returns time until window reset", async () => {
   expect(result.resetIn).toBeLessThanOrEqual(60000);
 });
 
-test("sliding window counts previous window", async () => {
+test("sliding window applies the weighted previous-window count", async () => {
+  const id = "sliding";
+  const identifier = "user:5";
+  const windowSecs = 10;
+  const windowMs = windowSecs * 1_000;
   const limiter = ratelimit({
-    id: "sliding",
+    id,
     limit: 10,
-    windowSecs: 1,
+    windowSecs,
     prefix: "test:rl",
   });
 
-  for (let i = 0; i < 8; i++) {
-    await limiter.check("user:5");
+  let now = Date.now();
+  const remainingInWindow = windowMs - (now % windowMs);
+  if (remainingInWindow < 1_000) {
+    await Bun.sleep(remainingInWindow + 20);
+    now = Date.now();
   }
 
-  await Bun.sleep(500);
+  const previousWindow = Math.floor(now / windowMs) - 1;
+  await redis.set(`test:rl:${id}:${identifier}:${previousWindow}`, "100");
 
-  const result = await limiter.check("user:5");
-  expect(result.limited).toBe(false);
-  expect(result.remaining).toBeLessThan(10);
-  expect(result.remaining).toBeGreaterThan(0);
+  const result = await limiter.check(identifier);
+  expect(result).toMatchObject({ limited: true, remaining: 0 });
 });
 
 test("long identifiers are hashed", async () => {

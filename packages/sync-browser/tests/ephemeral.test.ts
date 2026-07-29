@@ -354,6 +354,50 @@ test("reader recv with wait false returns null when no events pending", async ()
   expect(event).toBeNull();
 });
 
+test("stream yields events in order", async () => {
+  const store = makeStore();
+  await store.upsert({ key: "seed", value: { status: "seed" } });
+  const anchor = await store.snapshot();
+  const reader = store.reader({ after: anchor.cursor });
+  const iterator = reader.stream({ wait: true, timeoutMs: 500 })[Symbol.asyncIterator]();
+
+  try {
+    const first = iterator.next();
+    await store.upsert({ key: "a", value: { status: "online" } });
+    const result = await first;
+
+    expect(result.done).toBe(false);
+    expect(result.value).toMatchObject({
+      type: "upsert",
+      entry: { key: "a", value: { status: "online" } },
+    });
+  } finally {
+    await iterator.return?.();
+    await reader.close();
+  }
+});
+
+test("stream stops promptly when aborted", async () => {
+  const store = makeStore();
+  const reader = store.reader();
+  const abort = new AbortController();
+  const iterator = reader.stream({
+    wait: true,
+    timeoutMs: 5_000,
+    signal: abort.signal,
+  })[Symbol.asyncIterator]();
+
+  try {
+    const pending = iterator.next();
+    await Bun.sleep(10);
+    abort.abort();
+    expect(await pending).toEqual({ value: undefined, done: true });
+  } finally {
+    await iterator.return?.();
+    await reader.close();
+  }
+});
+
 // ==========================
 // Overflow and validation
 // ==========================

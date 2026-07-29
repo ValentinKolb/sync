@@ -16,7 +16,7 @@ const DEFAULT_RETRY_MAX_MS = 60_000;
 const DEFAULT_RETRY_JITTER = 0.2;
 const WORKER_POLL_MS = 250;
 const MAX_KEY_BYTES = 512;
-const STALLED_PAGE_ERROR = "pull returned an empty page without advancing the cursor";
+const STALLED_PAGE_ERROR = "pull returned a page without advancing the cursor";
 
 const textEncoder = new TextEncoder();
 
@@ -101,6 +101,11 @@ const STORE_PAGE_SCRIPT = `
   state.pageNextCursorJson = ARGV[4]
   state.pageNextIndex = 0
   state.pageItemCount = tonumber(ARGV[5])
+  local stalled = ARGV[4] ~= "null" and ARGV[4] == state.cursorJson
+  if not stalled then
+    state.failureCount = 0
+    state.lastError = nil
+  end
   state.updatedAt = tonumber(ARGV[6])
   local encoded = cjson.encode(state)
   redis.call("SET", KEYS[1], encoded)
@@ -122,8 +127,12 @@ const CHECKPOINT_SCRIPT = `
 
   state.pageNextIndex = tonumber(ARGV[2]) + 1
   state.dispatched = (tonumber(state.dispatched) or 0) + 1
-  state.failureCount = 0
-  state.lastError = nil
+  local stalled = state.pageNextCursorJson ~= "null"
+    and state.pageNextCursorJson == state.cursorJson
+  if not stalled then
+    state.failureCount = 0
+    state.lastError = nil
+  end
   state.updatedAt = tonumber(ARGV[3])
   local encoded = cjson.encode(state)
   redis.call("SET", KEYS[1], encoded)
@@ -144,14 +153,14 @@ const COMMIT_PAGE_SCRIPT = `
   end
 
   local nextCursorJson = state.pageNextCursorJson
-  -- A page that yielded nothing and did not move the cursor made no progress.
+  -- A page that did not move the cursor made no durable progress, even when
+  -- dispatch accepted items from it.
   -- Resetting failureCount on it, and scheduling the next run immediately when
   -- delayMs is 0, let a fully-filtered source or an external API returning an
   -- empty page with a nextPageToken hammer Redis and the upstream forever, with
   -- no terminal state and no trace signal. Such a round now counts as a failure
   -- so the configured backoff and maxAttempts apply.
   local stalled = nextCursorJson ~= "null"
-    and tonumber(state.pageItemCount) == 0
     and nextCursorJson == state.cursorJson
   state.cursorJson = nextCursorJson
   state.pageItemsJson = nil

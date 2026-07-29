@@ -160,29 +160,31 @@ test("different identifiers have separate limits", async () => {
 // Sliding window: old window count decreases over time
 // ==========================
 
-test("sliding window: old window count decreases over time", async () => {
+test("sliding window applies the weighted previous-window count", async () => {
   const store = createMemoryStore();
+  const id = "sliding";
+  const identifier = "user:5";
+  const windowSecs = 10;
+  const windowMs = windowSecs * 1_000;
   const limiter = ratelimit({
-    id: "sliding",
+    id,
     limit: 10,
-    windowSecs: 1,
+    windowSecs,
     store,
   });
 
-  // Use up 8 of 10 slots
-  for (let i = 0; i < 8; i++) {
-    await limiter.check("user:5");
+  let now = Date.now();
+  const remainingInWindow = windowMs - (now % windowMs);
+  if (remainingInWindow < 1_000) {
+    await Bun.sleep(remainingInWindow + 20);
+    now = Date.now();
   }
 
-  // Wait half a window so we cross into the next window.
-  // The previous window's 8 requests are weighted by (1 - elapsedRatio).
-  // At ~0.5 elapsed that weight is ~0.5, so weighted ≈ 4 + 1 = 5 → not limited.
-  await Bun.sleep(600);
+  const previousWindow = Math.floor(now / windowMs) - 1;
+  store.set(`sync:ratelimit:${id}:${identifier}:${previousWindow}`, 100);
 
-  const result = await limiter.check("user:5");
-  expect(result.limited).toBe(false);
-  expect(result.remaining).toBeLessThan(10);
-  expect(result.remaining).toBeGreaterThan(0);
+  const result = await limiter.check(identifier);
+  expect(result).toMatchObject({ limited: true, remaining: 0 });
 });
 
 // ==========================

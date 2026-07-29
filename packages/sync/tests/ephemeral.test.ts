@@ -1,18 +1,32 @@
-import { beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
 import {
   ephemeral,
   EphemeralCapacityError,
   EphemeralPayloadTooLargeError,
+  type EphemeralReader,
 } from "../index";
 
 const testId = (suffix: string): string => `test-eph-${suffix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+const readers: EphemeralReader<unknown>[] = [];
 
-beforeEach(async () => {
-  const keys = await redis.send("KEYS", ["sync:e:*:test-eph-*:*"]);
+const trackReader = <T>(reader: EphemeralReader<T>): EphemeralReader<T> => {
+  readers.push(reader as EphemeralReader<unknown>);
+  return reader;
+};
+
+const cleanup = async (): Promise<void> => {
+  const keys = await redis.send("KEYS", ["sync:e:*:*test-eph-*:*"]);
   if (Array.isArray(keys) && keys.length > 0) {
     await redis.send("DEL", keys as string[]);
   }
+};
+
+beforeEach(cleanup);
+
+afterEach(async () => {
+  await Promise.all(readers.splice(0).map((reader) => reader.close()));
+  await cleanup();
 });
 
 test("upsert + snapshot returns current state", async () => {
@@ -75,7 +89,7 @@ test("reader receives upsert/touch/delete events", async () => {
     ttlMs: 1_000,
   });
 
-  const reader = store.reader();
+  const reader = trackReader(store.reader());
 
   const p1 = reader.recv({ wait: true, timeoutMs: 500 });
   await store.upsert({ key: "user:u1", value: { status: "online" } });
@@ -105,7 +119,7 @@ test("ttl expiry produces expire event and removes key from snapshot", async () 
   await store.upsert({ key: "user:u1", value: { status: "online" } });
 
   const snapBefore = await store.snapshot();
-  const reader = store.reader({ after: snapBefore.cursor });
+  const reader = trackReader(store.reader({ after: snapBefore.cursor }));
   const readPromise = reader.recv({ wait: true, timeoutMs: 500 });
 
   await Bun.sleep(80);
@@ -127,7 +141,7 @@ test("reader({ after }) replays deltas since cursor", async () => {
     ttlMs: 2_000,
   });
 
-  const live = store.reader();
+  const live = trackReader(store.reader());
 
   const firstPromise = live.recv({ wait: true, timeoutMs: 500 });
   await store.upsert({ key: "user:u1", value: { status: "online" } });
@@ -137,7 +151,7 @@ test("reader({ after }) replays deltas since cursor", async () => {
 
   await store.upsert({ key: "user:u2", value: { status: "away" } });
 
-  const replay = store.reader({ after: first?.cursor });
+  const replay = trackReader(store.reader({ after: first?.cursor }));
   const next = await replay.recv({ wait: false });
 
   expect(next?.type).toBe("upsert");
@@ -159,7 +173,7 @@ test("overflow event when replay cursor is older than retention", async () => {
   await Bun.sleep(60);
   await store.upsert({ key: "user:u2", value: { status: "away" } });
 
-  const replay = store.reader({ after: "0-0" });
+  const replay = trackReader(store.reader({ after: "0-0" }));
   const first = await replay.recv({ wait: false });
 
   expect(first?.type).toBe("overflow");
@@ -226,13 +240,14 @@ test("tenant isolation separates state and events", async () => {
 });
 
 test("tenant and id delimiter combinations do not collide", async () => {
+  const suffix = testId("delimiter");
   const storeA = ephemeral({
-    id: "room:x",
+    id: `room:${suffix}:x`,
     tenantId: "t:a",
     ttlMs: 2_000,
   });
   const storeB = ephemeral({
-    id: "x",
+    id: `${suffix}:x`,
     tenantId: "t:a:room",
     ttlMs: 2_000,
   });
@@ -280,8 +295,58 @@ test("recv respects abort signal", async () => {
 
   const ac = new AbortController();
   ac.abort();
-  const ev = await store.reader().recv({ wait: true, timeoutMs: 5_000, signal: ac.signal });
+  const ev = await trackReader(store.reader()).recv({ wait: true, timeoutMs: 5_000, signal: ac.signal });
   expect(ev).toBeNull();
+});
+
+test("stream yields events in order and releases its blocking reader", async () => {
+  const store = ephemeral<{ value: number }>({
+    id: testId("stream"),
+    ttlMs: 2_000,
+  });
+  await store.upsert({ key: "seed", value: { value: 0 } });
+  const anchor = await store.snapshot();
+  const reader = trackReader(store.reader({ after: anchor.cursor }));
+  const iterator = reader.stream({ wait: true, timeoutMs: 500 })[Symbol.asyncIterator]();
+
+  try {
+    const first = iterator.next();
+    await store.upsert({ key: "a", value: { value: 1 } });
+    const result = await first;
+
+    expect(result.done).toBe(false);
+    expect(result.value).toMatchObject({
+      type: "upsert",
+      entry: { key: "a", value: { value: 1 } },
+    });
+  } finally {
+    await iterator.return?.();
+    await reader.close();
+  }
+});
+
+test("stream stops promptly when aborted", async () => {
+  const store = ephemeral<{ value: number }>({
+    id: testId("stream-abort"),
+    ttlMs: 2_000,
+  });
+  const reader = trackReader(store.reader());
+  const abort = new AbortController();
+  const iterator = reader.stream({
+    wait: true,
+    timeoutMs: 5_000,
+    signal: abort.signal,
+  })[Symbol.asyncIterator]();
+
+  try {
+    const pending = iterator.next();
+    await Bun.sleep(20);
+    abort.abort();
+    expect(await pending).toEqual({ value: undefined, done: true });
+  } finally {
+    await iterator.return?.();
+    await reader.close();
+  }
 });
 
 // ==========================
@@ -340,7 +405,7 @@ test("reader with prefix only yields events for matching keys", async () => {
     ttlMs: 5_000,
   });
 
-  const r = store.reader({ prefix: "apps/" });
+  const r = trackReader(store.reader({ prefix: "apps/" }));
 
   // First matching event
   const p1 = r.recv({ wait: true, timeoutMs: 500 });
@@ -364,7 +429,7 @@ test("reader without prefix yields all events (baseline)", async () => {
     ttlMs: 5_000,
   });
 
-  const r = store.reader();
+  const r = trackReader(store.reader());
 
   const p1 = r.recv({ wait: true, timeoutMs: 500 });
   await store.upsert({ key: "apps/a", value: { v: 1 } });
@@ -436,7 +501,7 @@ test("createdAt flows through snapshot", async () => {
 
 test("createdAt flows through reader upsert event", async () => {
   const store = ephemeral<{ v: number }>({ id: testId("createdAt-reader"), ttlMs: 5_000 });
-  const r = store.reader();
+  const r = trackReader(store.reader());
 
   const p = r.recv({ wait: true, timeoutMs: 500 });
   const entry = await store.upsert({ key: "k", value: { v: 1 } });
@@ -479,7 +544,7 @@ test("the snapshot and the change stream agree on the same value", async () => {
   // Seed first so the snapshot cursor is a real stream id, not "0-0".
   await store.upsert({ key: "svc/seed", value: { tags: [], n: 1 } });
   const anchor = await store.snapshot({});
-  const reader = store.reader({ after: anchor.cursor });
+  const reader = trackReader(store.reader({ after: anchor.cursor }));
   await store.upsert({ key: "svc/a", value });
 
   const event = await reader.recv({ timeoutMs: 2_000 });
@@ -544,7 +609,7 @@ test("a reader that falls behind after a healthy start gets an overflow", async 
   // Start healthy: anchor on a real cursor and consume one event without gaps.
   await store.upsert({ key: "seed", value: { n: 0 } });
   const anchor = await store.snapshot({});
-  const reader = store.reader({ after: anchor.cursor });
+  const reader = trackReader(store.reader({ after: anchor.cursor }));
 
   await store.upsert({ key: "a", value: { n: 1 } });
   expect((await reader.recv({ wait: false }))?.type).toBe("upsert");
@@ -573,7 +638,7 @@ test("a reader that keeps up never sees a spurious overflow", async () => {
 
   await store.upsert({ key: "seed", value: { n: 0 } });
   const anchor = await store.snapshot({});
-  const reader = store.reader({ after: anchor.cursor });
+  const reader = trackReader(store.reader({ after: anchor.cursor }));
 
   const types: string[] = [];
   for (let i = 0; i < 5; i++) {
