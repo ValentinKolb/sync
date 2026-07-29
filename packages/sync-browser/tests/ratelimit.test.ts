@@ -388,6 +388,9 @@ test("windowSecs must be a positive integer", () => {
     /positive integer/,
   );
   expect(() => ratelimit({ id: "safe-window", limit: 1, windowSecs: 1 })).not.toThrow();
+  expect(() =>
+    ratelimit({ id: "large-integer-window", limit: 1, windowSecs: Number.MAX_SAFE_INTEGER + 1 }),
+  ).not.toThrow();
 });
 
 test("long identifiers do not collide at a practical scale", async () => {

@@ -421,6 +421,12 @@ test("fractional ttlMs is rejected at the factory and call sites", async () => {
     /positive integer/,
   );
   await expect(store.touch({ key: "k", ttlMs: 100.5 })).rejects.toThrow(/positive integer/);
+  expect(() =>
+    ephemeral({
+      id: `unsafe-ttl-${Date.now()}`,
+      ttlMs: Number.MAX_SAFE_INTEGER + 1,
+    }),
+  ).toThrow(/positive integer/);
 });
 
 test("stored and returned values are isolated JSON snapshots", async () => {
@@ -428,15 +434,23 @@ test("stored and returned values are isolated JSON snapshots", async () => {
     id: `json-snapshot-${Date.now()}`,
     ttlMs: 5_000,
   });
+  const reader = store.reader({ after: "0" });
   const input = { nested: { value: 1 } };
   const returned = await store.upsert({ key: "k", value: input });
 
   input.nested.value = 2;
   returned.value.nested.value = 3;
 
+  const event = await reader.recv({ wait: false });
+  expect(event?.type).toBe("upsert");
+  if (event?.type === "upsert") {
+    expect(event.entry.value.nested.value).toBe(1);
+    event.entry.value.nested.value = 4;
+  }
+
   const first = await store.snapshot();
   expect(first.entries[0]?.value.nested.value).toBe(1);
-  first.entries[0]!.value.nested.value = 4;
+  first.entries[0]!.value.nested.value = 5;
   expect((await store.snapshot()).entries[0]?.value.nested.value).toBe(1);
 });
 
