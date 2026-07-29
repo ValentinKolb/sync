@@ -1100,6 +1100,87 @@ test("losing the dispatch lease aborts the callback and rejects the run", async 
   expect((await s.get({ id: "report" }))?.runNumber).toBe(0);
 });
 
+test("an in-flight run cannot overwrite a recreated schedule with the same id", async () => {
+  const s = makeScheduler(uid("schedule-revision"));
+  let started = false;
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await s.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async () => {
+      started = true;
+      await gate;
+    },
+  });
+  const staleRun = s.runNow({ id: "report" });
+  await waitFor(() => started);
+
+  await s.delete({ id: "report" });
+  await s.create({ id: "report", cron: "0 4 * * *", process: async () => {} });
+  const recreated = await s.get({ id: "report" });
+
+  release();
+  await expect(staleRun).rejects.toThrow("scheduler dispatch state changed");
+
+  const after = await s.get({ id: "report" });
+  expect(after?.cron).toBe("0 4 * * *");
+  expect(after?.runNumber).toBe(0);
+  expect(after?.nextRunAt).toBe(recreated?.nextRunAt);
+});
+
+test("stop fences a direct run even when the scheduler loop was never started", async () => {
+  const s = makeScheduler(uid("stop-direct"));
+  let started = false;
+
+  await s.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async ({ ctx }) => {
+      started = true;
+      while (!ctx.signal.aborted) await Bun.sleep(10);
+    },
+  });
+  const before = await s.get({ id: "report" });
+  let runError: Error | undefined;
+  const run = s.runNow({ id: "report" }).catch((error: Error) => {
+    runError = error;
+  });
+  await waitFor(() => started);
+
+  await s.stop();
+  await run;
+  expect(runError?.message).toContain("scheduler dispatch stopped");
+
+  const after = await s.get({ id: "report" });
+  expect(after?.runNumber).toBe(0);
+  expect(after?.nextRunAt).toBe(before?.nextRunAt);
+});
+
+test("non-finite batchSize falls back to a usable default", async () => {
+  const s = makeScheduler(uid("batch-size-nan"), {
+    dispatch: { tickMs: 20, batchSize: Number.NaN },
+  });
+  let runs = 0;
+
+  await s.create({
+    id: "due",
+    cron: "0 3 * * *",
+    process: async () => {
+      runs += 1;
+    },
+    after: async ({ ctx }) => {
+      if (ctx.trigger === "manual") ctx.reschedule({ delayMs: 0 });
+    },
+  });
+  await s.runNow({ id: "due" });
+  s.start();
+  await waitFor(() => runs === 2);
+});
+
 // ==========================
 // Tick loop (not runNow)
 // ==========================

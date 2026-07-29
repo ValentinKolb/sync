@@ -71,6 +71,7 @@ type BrowserScheduleRegistration = {
 
 const registrations = new Map<string, Map<string, BrowserScheduleRegistration>>();
 const requests = new Map<string, { target: string; accepted: Promise<void>; expiresAt: number }>();
+let requestPruneTimer: ReturnType<typeof setTimeout> | undefined;
 
 const groupKey = (prefix: string, schedulerId: string, scheduleId: string): string =>
   `${prefix}:${schedulerId}:${scheduleId}`;
@@ -85,6 +86,23 @@ const pruneRequests = (now: number): void => {
   for (const [key, request] of requests) {
     if (request.expiresAt <= now) requests.delete(key);
   }
+};
+
+const scheduleRequestPrune = (): void => {
+  clearTimeout(requestPruneTimer);
+  requestPruneTimer = undefined;
+  if (requests.size === 0) return;
+
+  let nextExpiry = Number.POSITIVE_INFINITY;
+  for (const request of requests.values()) {
+    nextExpiry = Math.min(nextExpiry, request.expiresAt);
+  }
+  requestPruneTimer = setTimeout(() => {
+    requestPruneTimer = undefined;
+    pruneRequests(Date.now());
+    scheduleRequestPrune();
+  }, Math.max(1, nextExpiry - Date.now()));
+  (requestPruneTimer as unknown as { unref?: () => void }).unref?.();
 };
 
 const waitForAcceptance = async (
@@ -210,6 +228,7 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
     }
     if (request) {
       request.expiresAt = now + Math.max(REQUEST_TTL_MS, timeoutMs * 2);
+      scheduleRequestPrune();
       await waitForAcceptance(request.accepted, timeoutMs, cfg.schedulerId, cfg.scheduleId);
       return;
     }
@@ -244,6 +263,7 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
       expiresAt: now + Math.max(REQUEST_TTL_MS, timeoutMs * 2),
     };
     requests.set(idempotencyKey, request);
+    scheduleRequestPrune();
 
     try {
       const run = registration.runNow(settleAccepted);

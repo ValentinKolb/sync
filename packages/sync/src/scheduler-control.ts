@@ -20,6 +20,19 @@ const BIND_REQUEST_SCRIPT = `
   return 0
 `;
 
+const REFRESH_REQUEST_SCRIPT = `
+  if redis.call("GET", KEYS[1]) ~= ARGV[1] then return 0 end
+  redis.call("PEXPIRE", KEYS[1], ARGV[2])
+  return 1
+`;
+
+const WRITE_BOUND_RESPONSE_SCRIPT = `
+  if redis.call("GET", KEYS[1]) ~= ARGV[1] then return 0 end
+  redis.call("PEXPIRE", KEYS[1], ARGV[2])
+  redis.call("SET", KEYS[2], ARGV[3], "PX", ARGV[4])
+  return 1
+`;
+
 type StoredSchedule = {
   id: string;
   cron: string;
@@ -188,14 +201,27 @@ const readResponse = async (prefix: string, requestId: string): Promise<Schedule
   return null;
 };
 
-const writeResponse = async (
+const requestTarget = (request: Pick<SchedulerControlRequest, "schedulerId" | "scheduleId">): string =>
+  JSON.stringify([request.schedulerId, request.scheduleId]);
+
+const writeBoundResponse = async (
   prefix: string,
-  requestId: string,
+  request: SchedulerControlRequest,
   response: SchedulerControlResponse,
   ttlMs = DEFAULT_RESPONSE_TTL_MS,
-): Promise<void> => {
-  await redis.send("SET", [responseKey(prefix, requestId), JSON.stringify(response), "PX", String(ttlMs)]);
-};
+): Promise<boolean> =>
+  Number(
+    await redis.send("EVAL", [
+      WRITE_BOUND_RESPONSE_SCRIPT,
+      "2",
+      requestKey(prefix, request.requestId),
+      responseKey(prefix, request.requestId),
+      requestTarget(request),
+      String(ttlMs),
+      JSON.stringify(response),
+      String(ttlMs),
+    ]),
+  ) > 0;
 
 const bindRequest = async (
   prefix: string,
@@ -204,7 +230,7 @@ const bindRequest = async (
   scheduleId: string,
   ttlMs: number,
 ): Promise<void> => {
-  const target = JSON.stringify([schedulerId, scheduleId]);
+  const target = requestTarget({ schedulerId, scheduleId });
   const bound = Number(
     await redis.send("EVAL", [
       BIND_REQUEST_SCRIPT,
@@ -285,26 +311,38 @@ export const schedulerControlQueue = (
 
 export const markSchedulerControlAccepted = async (
   prefix: string,
-  requestId: string,
-): Promise<void> => {
-  await writeResponse(prefix, requestId, { status: "accepted", acceptedAt: Date.now() });
-};
+  request: SchedulerControlRequest,
+): Promise<boolean> =>
+  await writeBoundResponse(prefix, request, { status: "accepted", acceptedAt: Date.now() });
 
 export const markSchedulerControlNotFound = async (
   prefix: string,
-  requestId: string,
+  request: SchedulerControlRequest,
   error: string,
-): Promise<void> => {
-  await writeResponse(prefix, requestId, { status: "not_found", error });
-};
+): Promise<boolean> =>
+  await writeBoundResponse(prefix, request, { status: "not_found", error });
 
 export const markSchedulerControlUnavailable = async (
   prefix: string,
-  requestId: string,
+  request: SchedulerControlRequest,
   error: string,
-): Promise<void> => {
-  await writeResponse(prefix, requestId, { status: "unavailable", error });
-};
+): Promise<boolean> =>
+  await writeBoundResponse(prefix, request, { status: "unavailable", error });
+
+export const refreshSchedulerControlRequestBinding = async (
+  prefix: string,
+  request: SchedulerControlRequest,
+  ttlMs = DEFAULT_RESPONSE_TTL_MS,
+): Promise<boolean> =>
+  Number(
+    await redis.send("EVAL", [
+      REFRESH_REQUEST_SCRIPT,
+      "1",
+      requestKey(prefix, request.requestId),
+      requestTarget(request),
+      String(ttlMs),
+    ]),
+  ) > 0;
 
 export const schedulerControl = (config: SchedulerControlConfig = {}): SchedulerControl => {
   const prefix = config.prefix ?? DEFAULT_PREFIX;

@@ -7,6 +7,7 @@ import {
   markSchedulerControlAccepted,
   markSchedulerControlNotFound,
   markSchedulerControlUnavailable,
+  refreshSchedulerControlRequestBinding,
   refreshSchedulerControlHandler,
   registerSchedulerControlIndex,
   removeSchedulerControlHandler,
@@ -113,6 +114,7 @@ const PERSIST_SCRIPT = `
   local ok, existing = pcall(cjson.decode, raw)
   if not ok or type(existing) ~= "table" then return 0 end
   if tostring(tonumber(existing.runNumber) or 0) ~= ARGV[2] then return 0 end
+  if tostring(existing.revision or "") ~= ARGV[6] then return 0 end
 
   local patch = cjson.decode(ARGV[4])
   existing.runNumber = patch.runNumber
@@ -136,6 +138,7 @@ const PERSIST_SCRIPT = `
 
 type StoredSchedule = {
   id: string;
+  revision: string;
   cron: string;
   tz: string;
   createdAt: number;
@@ -263,6 +266,7 @@ const parseSchedule = (raw: string | null): StoredSchedule | null => {
     if (typeof value.nextRunAt !== "number" || !Number.isFinite(value.nextRunAt)) return null;
     return {
       id: value.id,
+      revision: typeof value.revision === "string" ? value.revision : "",
       cron: value.cron,
       tz: value.tz,
       createdAt: Number(value.createdAt) || Date.now(),
@@ -316,7 +320,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     Math.floor(leaseMs / 3),
   );
   const tickMs = normalizeMs(config.dispatch?.tickMs, DEFAULT_TICK_MS, 50);
-  const batchSize = Math.max(1, config.dispatch?.batchSize ?? DEFAULT_BATCH_SIZE);
+  const batchSize = Math.max(
+    1,
+    Math.floor(Number.isFinite(config.dispatch?.batchSize) ? config.dispatch!.batchSize! : DEFAULT_BATCH_SIZE),
+  );
   const controlHandlerTtlMs = Math.max(5_000, tickMs * 4);
   const controlHeartbeatMs = Math.max(500, Math.floor(controlHandlerTtlMs / 3));
 
@@ -357,6 +364,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   let heartbeatPromise: Promise<void> | null = null;
   let controlHeartbeatPromise: Promise<void> | null = null;
   let controlRefreshPromise: Promise<void> | null = null;
+  let dispatchGeneration = 0;
   // Controllers of the callbacks currently running, so stop() can cancel them.
   const activeRuns = new Set<AbortController>();
   let currentLeaderLock: Lock | null = null;
@@ -442,6 +450,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         lastError: schedule.lastError ?? null,
       }),
       dispatchLock.value,
+      schedule.revision,
     ]);
     const persisted = Number(result) > 0;
     if (!persisted) metrics.staleWrites += 1;
@@ -539,6 +548,9 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       if (dispatchLeaseLost) {
         throw new Error(`scheduler dispatch lease lost for ${schedule.id}`);
       }
+      if (jobAc.signal.aborted) {
+        throw new Error(`scheduler dispatch stopped for ${schedule.id}`);
+      }
 
       if (error) {
         await emitTrace(handler.trace, {
@@ -578,6 +590,9 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
       if (dispatchLeaseLost) {
         throw new Error(`scheduler dispatch lease lost for ${schedule.id}`);
+      }
+      if (jobAc.signal.aborted) {
+        throw new Error(`scheduler dispatch stopped for ${schedule.id}`);
       }
 
       if (error) {
@@ -634,24 +649,55 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       shouldContinue?: () => boolean;
     },
   ): Promise<void> => {
+    const generation = dispatchGeneration;
     await serializeDispatch(scheduleId, async () => {
       let dispatchLock = await dispatchMutex.acquire(scheduleId, leaseMs);
       if (trigger === "cron" && !dispatchLock) return;
       while (!dispatchLock) {
-        if (options?.shouldContinue && !options.shouldContinue()) {
+        if (generation !== dispatchGeneration || (options?.shouldContinue && !options.shouldContinue())) {
           throw new Error(`scheduler dispatch stopped for ${scheduleId}`);
         }
         await sleep(Math.max(25, Math.min(100, Math.floor(heartbeatMs / 2))));
         dispatchLock = await dispatchMutex.acquire(scheduleId, leaseMs);
       }
 
+      let preparationLeaseLost = false;
+      let preparationHeartbeatTail = Promise.resolve();
+      const preparationHeartbeat = setInterval(() => {
+        preparationHeartbeatTail = preparationHeartbeatTail.then(async () => {
+          if (preparationLeaseLost) return;
+          try {
+            if (await dispatchMutex.extend(dispatchLock, leaseMs)) return;
+          } catch {
+            // Ownership is uncertain after a transport error.
+          }
+          preparationLeaseLost = true;
+        });
+      }, Math.max(50, Math.floor(heartbeatMs / 2)));
+
       try {
         const schedule = parseSchedule(await redis.get(scheduleKey(scheduleId)));
         if (!schedule) throw new Error(`runNow: schedule ${scheduleId} not found`);
         if (trigger === "cron" && (!currentLeaderLock || schedule.nextRunAt > Date.now())) return;
+        if (
+          generation !== dispatchGeneration
+          || (options?.shouldContinue && !options.shouldContinue())
+        ) {
+          throw new Error(`scheduler dispatch stopped for ${scheduleId}`);
+        }
+        if (preparationLeaseLost || !(await dispatchMutex.extend(dispatchLock, leaseMs))) {
+          throw new Error(`scheduler dispatch lease lost for ${scheduleId}`);
+        }
         await options?.onAcquired?.();
+        clearInterval(preparationHeartbeat);
+        await preparationHeartbeatTail;
+        if (preparationLeaseLost || !(await dispatchMutex.extend(dispatchLock, leaseMs))) {
+          throw new Error(`scheduler dispatch lease lost for ${scheduleId}`);
+        }
         await dispatchOne(schedule, handler, trigger, dispatchLock);
       } finally {
+        clearInterval(preparationHeartbeat);
+        await preparationHeartbeatTail;
         await dispatchMutex.release(dispatchLock);
       }
     });
@@ -740,12 +786,17 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       if (!message) continue;
 
       const request: SchedulerControlRequest = message.data;
+      if (!(await refreshSchedulerControlRequestBinding(prefix, request))) {
+        await message.ack();
+        dispatched += 1;
+        continue;
+      }
       const raw = await redis.get(scheduleKey(scheduleId));
       const schedule = parseSchedule(raw);
       if (!schedule) {
         await markSchedulerControlNotFound(
           prefix,
-          request.requestId,
+          request,
           `schedulerControl.runNow: schedule ${request.schedulerId}/${request.scheduleId} not found`,
         );
         await message.ack();
@@ -756,7 +807,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       if (!handlers.has(scheduleId)) {
         await markSchedulerControlUnavailable(
           prefix,
-          request.requestId,
+          request,
           `schedulerControl.runNow: no live handler for schedule ${request.schedulerId}/${request.scheduleId}`,
         );
         await message.ack();
@@ -768,10 +819,15 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         // Without the catch a transient Redis error here becomes an unhandled
         // rejection, which terminates the process under Bun and Node defaults.
         void message.touch({ leaseMs: controlLeaseMs }).catch(() => {});
+        void refreshSchedulerControlRequestBinding(prefix, request).catch(() => {});
       }, Math.floor(controlLeaseMs / 3));
       try {
         await dispatchSchedule(scheduleId, handler, "manual", {
-          onAcquired: () => markSchedulerControlAccepted(prefix, request.requestId),
+          onAcquired: async () => {
+            if (!(await markSchedulerControlAccepted(prefix, request))) {
+              throw new Error(`schedulerControl.runNow: stale request ${request.requestId}`);
+            }
+          },
           shouldContinue: () => running,
         });
         await message.ack();
@@ -783,7 +839,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         if (message.attempt >= CONTROL_MAX_ATTEMPTS) {
           await markSchedulerControlUnavailable(
             prefix,
-            request.requestId,
+            request,
             `schedulerControl.runNow: dispatch failed after ${message.attempt} attempts: ${asError(error).message}`,
           );
           await message.ack();
@@ -856,6 +912,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
     const incoming: StoredSchedule = {
       id: cfg.id,
+      revision: crypto.randomUUID(),
       cron: cfg.cron,
       tz,
       createdAt: Date.now(),
@@ -969,12 +1026,17 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   };
 
   const stop = async (): Promise<void> => {
-    if (!running) return;
+    const wasRunning = running;
     running = false;
+    dispatchGeneration += 1;
+    const pendingDispatches = Array.from(dispatchChains.values());
     // Cancel in-flight callbacks so `ctx.signal.aborted` is a usable
     // cancellation signal instead of something that is always false.
     for (const ac of activeRuns) ac.abort();
-    await Promise.all([loopPromise, heartbeatPromise, controlHeartbeatPromise]);
+    if (wasRunning) {
+      await Promise.all([loopPromise, heartbeatPromise, controlHeartbeatPromise]);
+    }
+    await Promise.all(pendingDispatches);
     loopPromise = null;
     heartbeatPromise = null;
     controlHeartbeatPromise = null;

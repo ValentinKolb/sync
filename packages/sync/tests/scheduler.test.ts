@@ -9,6 +9,11 @@ import {
   type SchedulerMetrics,
   type SchedulerTraceEvent,
 } from "../index";
+import {
+  markSchedulerControlAccepted,
+  refreshSchedulerControlRequestBinding,
+  type SchedulerControlRequest,
+} from "../src/scheduler-control";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 
@@ -917,6 +922,34 @@ test("schedulerControl executes one target for a repeated requestId", async () =
   await expect(
     control.runNow({ schedulerId: schedId, scheduleId: "two", requestId, timeoutMs: 2_000 }),
   ).rejects.toThrow("already bound to another schedule");
+});
+
+test("a stale control request cannot refresh or accept a rebound requestId", async () => {
+  const prefix = `test:sched:${uid("control-rebound")}`;
+  const requestId = uid("request");
+  const stale: SchedulerControlRequest = {
+    requestId,
+    schedulerId: "old-scheduler",
+    scheduleId: "old-schedule",
+    requestedAt: Date.now(),
+  };
+  const current: SchedulerControlRequest = {
+    requestId,
+    schedulerId: "new-scheduler",
+    scheduleId: "new-schedule",
+    requestedAt: Date.now(),
+  };
+  const bindingKey = `${prefix}:control:request:${requestId}`;
+  const responseKey = `${prefix}:control:response:${requestId}`;
+  await redis.set(bindingKey, JSON.stringify([current.schedulerId, current.scheduleId]));
+
+  expect(await refreshSchedulerControlRequestBinding(prefix, stale)).toBe(false);
+  expect(await markSchedulerControlAccepted(prefix, stale)).toBe(false);
+  expect(await redis.get(responseKey)).toBeNull();
+
+  expect(await refreshSchedulerControlRequestBinding(prefix, current)).toBe(true);
+  expect(await markSchedulerControlAccepted(prefix, current)).toBe(true);
+  expect(JSON.parse((await redis.get(responseKey)) as string).status).toBe("accepted");
 });
 
 test("schedule meta round-trips byte-equivalent JSON", async () => {

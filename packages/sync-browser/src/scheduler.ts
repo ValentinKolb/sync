@@ -28,6 +28,7 @@ const normalizeMs = (value: number | undefined, fallback: number, minimum: numbe
 
 type StoredSchedule = {
   id: string;
+  revision: string;
   cron: string;
   tz: string;
   createdAt: number;
@@ -194,7 +195,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     Math.floor(leaseMs / 3),
   );
   const tickMs = normalizeMs(config.dispatch?.tickMs, DEFAULT_TICK_MS, 50);
-  const batchSize = Math.max(1, config.dispatch?.batchSize ?? DEFAULT_BATCH_SIZE);
+  const batchSize = Math.max(
+    1,
+    Math.floor(Number.isFinite(config.dispatch?.batchSize) ? config.dispatch!.batchSize! : DEFAULT_BATCH_SIZE),
+  );
   const store = resolveStore(config.store);
   const instanceId = crypto.randomUUID();
 
@@ -275,6 +279,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   let running = false;
   let loopPromise: Promise<void> | null = null;
   let heartbeatPromise: Promise<void> | null = null;
+  let dispatchGeneration = 0;
   // Controllers of the callbacks currently running, so stop() can cancel them.
   const activeRuns = new Set<AbortController>();
   let currentLeaderLock: Lock | null = null;
@@ -405,6 +410,9 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       if (dispatchLeaseLost) {
         throw new Error(`scheduler dispatch lease lost for ${schedule.id}`);
       }
+      if (jobAc.signal.aborted) {
+        throw new Error(`scheduler dispatch stopped for ${schedule.id}`);
+      }
 
       if (error) {
         await emitTrace(handler.trace, {
@@ -445,6 +453,9 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       if (dispatchLeaseLost) {
         throw new Error(`scheduler dispatch lease lost for ${schedule.id}`);
       }
+      if (jobAc.signal.aborted) {
+        throw new Error(`scheduler dispatch stopped for ${schedule.id}`);
+      }
 
       if (error) {
         schedule.failureCount += 1;
@@ -468,6 +479,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       if (
         !current
         || current.runNumber !== expectedRunNumber
+        || current.revision !== schedule.revision
         || !(await dispatchMutex.extend(dispatchLock, leaseMs))
       ) {
         metrics.staleWrites += 1;
@@ -503,24 +515,55 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       shouldContinue?: () => boolean;
     },
   ): Promise<void> => {
+    const generation = dispatchGeneration;
     await serializeDispatch(scheduleId, async () => {
       let dispatchLock = await dispatchMutex.acquire(scheduleId, leaseMs);
       if (trigger === "cron" && !dispatchLock) return;
       while (!dispatchLock) {
-        if (options?.shouldContinue && !options.shouldContinue()) {
+        if (generation !== dispatchGeneration || (options?.shouldContinue && !options.shouldContinue())) {
           throw new Error(`scheduler dispatch stopped for ${scheduleId}`);
         }
         await sleep(Math.max(25, Math.min(100, Math.floor(heartbeatMs / 2))));
         dispatchLock = await dispatchMutex.acquire(scheduleId, leaseMs);
       }
 
+      let preparationLeaseLost = false;
+      let preparationHeartbeatTail = Promise.resolve();
+      const preparationHeartbeat = setInterval(() => {
+        preparationHeartbeatTail = preparationHeartbeatTail
+          .then(async () => {
+            if (preparationLeaseLost) return;
+            if (await dispatchMutex.extend(dispatchLock, leaseMs)) return;
+            preparationLeaseLost = true;
+          })
+          .catch(() => {
+            preparationLeaseLost = true;
+          });
+      }, Math.max(50, Math.floor(heartbeatMs / 2)));
+
       try {
         const schedule = schedules.get(scheduleId);
         if (!schedule) throw new Error(`runNow: schedule ${scheduleId} not found`);
         if (trigger === "cron" && (!currentLeaderLock || schedule.nextRunAt > Date.now())) return;
+        if (
+          generation !== dispatchGeneration
+          || (options?.shouldContinue && !options.shouldContinue())
+        ) {
+          throw new Error(`scheduler dispatch stopped for ${scheduleId}`);
+        }
+        if (preparationLeaseLost || !(await dispatchMutex.extend(dispatchLock, leaseMs))) {
+          throw new Error(`scheduler dispatch lease lost for ${scheduleId}`);
+        }
         await options?.onAcquired?.();
+        clearInterval(preparationHeartbeat);
+        await preparationHeartbeatTail;
+        if (preparationLeaseLost || !(await dispatchMutex.extend(dispatchLock, leaseMs))) {
+          throw new Error(`scheduler dispatch lease lost for ${scheduleId}`);
+        }
         await dispatchOne(schedule, handler, trigger, dispatchLock);
       } finally {
+        clearInterval(preparationHeartbeat);
+        await preparationHeartbeatTail;
         await dispatchMutex.release(dispatchLock);
       }
     });
@@ -593,6 +636,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
     const stored: StoredSchedule = {
       id: cfg.id,
+      revision: crypto.randomUUID(),
       cron: cfg.cron,
       tz,
       createdAt: existing?.createdAt ?? persisted?.updatedAt ?? nowMs,
@@ -700,13 +744,16 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   };
 
   const stop = async (): Promise<void> => {
-    if (!running) return;
+    const wasRunning = running;
     running = false;
+    dispatchGeneration += 1;
+    const pendingDispatches = Array.from(dispatchChains.values());
     // Cancel in-flight callbacks so `ctx.signal.aborted` is a usable
     // cancellation signal instead of something that is always false.
     for (const ac of activeRuns) ac.abort();
     setBrowserSchedulerControlAvailable({ prefix, schedulerId: config.id, instanceId, available: false });
-    await Promise.all([loopPromise, heartbeatPromise]);
+    if (wasRunning) await Promise.all([loopPromise, heartbeatPromise]);
+    await Promise.all(pendingDispatches);
     loopPromise = null;
     heartbeatPromise = null;
     await relinquishLeadership();

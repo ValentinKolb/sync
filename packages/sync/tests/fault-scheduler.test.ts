@@ -546,6 +546,92 @@ test("a run whose record advanced underneath it cannot overwrite the newer state
   expect(s.metric().staleWrites).toBeGreaterThan(0);
 }, 30_000);
 
+test("an in-flight run cannot overwrite a recreated schedule with the same id", async () => {
+  const schedId = uid("schedule-revision");
+  const s = makeScheduler(schedId);
+  let started = false;
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await s.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async () => {
+      started = true;
+      await gate;
+    },
+  });
+  const staleRun = s.runNow({ id: "report" });
+  await waitFor(() => started);
+
+  await s.delete({ id: "report" });
+  await s.create({ id: "report", cron: "0 4 * * *", process: async () => {} });
+  const recreated = await s.get({ id: "report" });
+
+  release();
+  await expect(staleRun).rejects.toThrow("scheduler dispatch state changed");
+
+  const after = await s.get({ id: "report" });
+  expect(after?.cron).toBe("0 4 * * *");
+  expect(after?.runNumber).toBe(0);
+  expect(after?.nextRunAt).toBe(recreated?.nextRunAt);
+}, 20_000);
+
+test("stop fences a direct run even when the scheduler loop was never started", async () => {
+  const schedId = uid("stop-direct");
+  const s = makeScheduler(schedId);
+  let started = false;
+
+  await s.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async ({ ctx }) => {
+      started = true;
+      while (!ctx.signal.aborted) await Bun.sleep(10);
+    },
+  });
+  const before = await s.get({ id: "report" });
+  let runError: Error | undefined;
+  const run = s.runNow({ id: "report" }).catch((error: Error) => {
+    runError = error;
+  });
+  await waitFor(() => started);
+
+  await s.stop();
+  await run;
+  expect(runError?.message).toContain("scheduler dispatch stopped");
+
+  const after = await s.get({ id: "report" });
+  expect(after?.runNumber).toBe(0);
+  expect(after?.nextRunAt).toBe(before?.nextRunAt);
+}, 20_000);
+
+test("non-finite batchSize falls back to a usable default", async () => {
+  const schedId = uid("batch-size-nan");
+  const s = makeScheduler(schedId, {
+    dispatch: { tickMs: 50, batchSize: Number.NaN },
+  });
+  let runs = 0;
+  await s.create({
+    id: "due",
+    cron: "0 3 * * *",
+    process: async () => {
+      runs += 1;
+    },
+  });
+
+  const keyPrefix = `sync:scheduler:${schedId}`;
+  const schedule = JSON.parse((await redis.get(`${keyPrefix}:schedule:due`)) as string);
+  schedule.nextRunAt = Date.now() - 1_000;
+  await redis.set(`${keyPrefix}:schedule:due`, JSON.stringify(schedule));
+  await redis.send("ZADD", [`${keyPrefix}:due`, String(schedule.nextRunAt), "due"]);
+
+  s.start();
+  await waitFor(() => runs === 1);
+}, 20_000);
+
 test("stop cancels the in-flight schedule callback via ctx.signal", async () => {
   const schedId = uid("stop-signal");
   const s = makeScheduler(schedId);
