@@ -390,6 +390,52 @@ test("a claim still inside the grace window is not enqueued twice", async () => 
   j.stop();
 });
 
+test("recovery after a successful enqueue does not duplicate the queued job", async () => {
+  const id = uid("ambiguous-enqueue");
+  const runs: string[] = [];
+  const j = job<{ v: number }>({
+    id,
+    process: async ({ ctx }) => {
+      runs.push(ctx.key);
+    },
+  });
+  const workQueue = queue<{
+    jobId: string;
+    key: string;
+    input: { v: number };
+    keyTtlMs: number;
+    leaseMs: number;
+  }>({
+    id: `${id}:work`,
+    prefix: "sync:job:queue",
+  });
+
+  const idemKey = `sync:job:${id}:idempotency:orders/ambiguous`;
+  await redis.send("SET", [
+    idemKey,
+    JSON.stringify({ jobId: "77", enqueued: false, claimedAt: Date.now() - 120_000 }),
+    "PX",
+    "60000",
+  ]);
+  await workQueue.send({
+    data: {
+      jobId: "77",
+      key: "orders/ambiguous",
+      input: { v: 1 },
+      keyTtlMs: 60_000,
+      leaseMs: 30_000,
+    },
+    idempotencyKey: "77",
+    idempotencyTtlMs: 60_000,
+  });
+
+  expect(await j.submit({ key: "orders/ambiguous", input: { v: 1 }, keyTtlMs: 60_000 })).toBe("77");
+  await waitFor(() => runs.length >= 1);
+  await Bun.sleep(200);
+  expect(runs).toEqual(["orders/ambiguous"]);
+  j.stop();
+});
+
 test("a stale terminal release cannot delete a claim a later submit took over", async () => {
   const id = uid("stale-release");
   const j = job<{ v: number }>({ id, process: async () => {} });

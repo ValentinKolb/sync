@@ -479,6 +479,8 @@ export const job = <Input = void, Result = unknown>(
       await workQueue.send({
         data: payload,
         delayMs,
+        idempotencyKey: jobId,
+        idempotencyTtlMs: initialKeyTtlMs,
         meta: cfg.meta,
       });
     } catch (error) {
@@ -488,7 +490,8 @@ export const job = <Input = void, Result = unknown>(
     }
 
     // Only now is the claim genuinely backed by queued work. A crash before
-    // this point leaves the claim unenqueued, and a later submit re-enqueues it.
+    // this point leaves the claim pending; a later submit retries the enqueue,
+    // while the queue's jobId key prevents a successful send from duplicating.
     await markEnqueued(cfg.key, jobId, initialKeyTtlMs);
 
     const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
