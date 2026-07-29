@@ -938,9 +938,8 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
             })()
           : wait
             ? await (async (): Promise<unknown> => {
-                const client = await ensureBlockingClient();
-
                 try {
+                  const client = await ensureBlockingClient();
                   return await client.send("XREAD", args);
                 } catch (error) {
                   resetBlockingClient();
