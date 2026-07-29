@@ -249,7 +249,7 @@ test("lease expiry requeues message", async () => {
 // 11. touch extends lease
 // ==========================
 
-test("touch extends lease", async () => {
+test("touch extends lease past the point it would otherwise expire", async () => {
   const q = makeQueue({ defaultLeaseMs: 100 });
 
   await q.send({ data: { msg: "touch-me" } });
@@ -258,22 +258,37 @@ test("touch extends lease", async () => {
   expect(received).not.toBeNull();
 
   const originalLease = received!.leaseUntil;
-
-  // Extend the lease significantly
   const touched = await received!.touch({ leaseMs: 5_000 });
   expect(touched).toBe(true);
+  // `originalLease` was a dead variable before; the extension must be real.
+  expect(received!.leaseUntil).toBe(originalLease);
 
-  // The lease should now be extended well beyond original
-  // Wait past the original lease time
-  await Bun.sleep(200);
+  // Sleep past both the original lease *and* the maintenance interval. The old
+  // test slept 200ms, so maintenance — rate-limited to 1s and stamped by the
+  // first recv — never examined a lease at all, and the assertion below held
+  // for the wrong reason.
+  await Bun.sleep(1_300);
 
-  // The message should NOT have been requeued because we touched it
   const shouldBeNull = await q.recv({ wait: false });
   expect(shouldBeNull).toBeNull();
 
-  // Now ack the original
-  const acked = await received!.ack();
-  expect(acked).toBe(true);
+  expect(await received!.ack()).toBe(true);
+});
+
+test("without a touch the lease does expire and the message is redelivered", async () => {
+  // The negative control the test above needs to mean anything.
+  const q = makeQueue({ defaultLeaseMs: 100 });
+
+  await q.send({ data: { msg: "no-touch" } });
+  const received = await q.recv({ wait: false, leaseMs: 100 });
+  expect(received).not.toBeNull();
+
+  await Bun.sleep(1_300);
+
+  const redelivered = await q.recv({ wait: false });
+  expect(redelivered).not.toBeNull();
+  expect(redelivered?.attempt).toBe(2);
+  expect(await redelivered?.ack()).toBe(true);
 });
 
 // ==========================

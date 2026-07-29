@@ -26,15 +26,18 @@ test("concurrent ack/nack/touch on same delivery — exactly one ack or nack suc
     const msg = await q.recv({ wait: false });
     expect(msg).not.toBeNull();
 
-    const [ack, nack, touch] = await Promise.all([
+    const [ack, nack, touched] = await Promise.all([
       msg!.ack(),
       msg!.nack(),
       msg!.touch({ leaseMs: 1000 }),
     ]);
 
-    // At most one of ack/nack succeeds (they delete the delivery)
-    const mutuallyExclusive = (ack ? 1 : 0) + (nack ? 1 : 0);
-    expect(mutuallyExclusive).toBeLessThanOrEqual(1);
+    // Exactly one of ack/nack settles the delivery — the invariant is one, not
+    // "at most one", which also holds if the delivery vanished entirely.
+    expect((ack ? 1 : 0) + (nack ? 1 : 0)).toBe(1);
+    // touch raced the settle, so it may lose; it must never report success
+    // after the delivery is gone.
+    expect(typeof touched).toBe("boolean");
 
     // If nack won, clean up the requeued message
     if (nack) {
@@ -104,24 +107,27 @@ test("maintenance handles delayed expiry, lease expiry, and max deliveries in on
 
   await Bun.sleep(80);
 
-  // Trigger maintenance via recv
-  const afterMaint = await q.recv({ wait: false });
-
-  // Message B should have been moved from delayed to ready
-  // Message C should have been requeued from expired lease
-  // Message A should be in DLQ
-  if (afterMaint) {
-    const id = afterMaint.data.id;
-    expect(["b", "c"]).toContain(id);
-    await afterMaint.ack();
+  // Both assertions used to sit inside `if (...)`, so a completely broken
+  // maintenance pass left them unexecuted and the test still passed. The DLQ
+  // was never read at all, so "A should be in DLQ" was pure comment.
+  const drained = new Set<string>();
+  for (let i = 0; i < 2; i++) {
+    const message = await q.recv({ wait: false });
+    expect(message).not.toBeNull();
+    drained.add(message!.data.id as string);
+    expect(await message!.ack()).toBe(true);
   }
 
-  // Drain remaining
-  const remaining = await q.recv({ wait: false });
-  if (remaining) {
-    expect(["b", "c"]).toContain(remaining.data.id);
-    await remaining.ack();
-  }
+  // B was promoted from delayed, C was requeued from its expired lease.
+  expect(drained).toEqual(new Set(["b", "c"]));
+
+  // A exceeded maxDeliveries and must be in the DLQ, with the right reason.
+  const dead = await q.dlq();
+  expect(dead.length).toBe(1);
+  expect(dead[0]?.data).toEqual({ id: "a" });
+  expect(dead[0]?.reason).toBe("max_deliveries_exceeded");
+
+  expect(await q.recv({ wait: false })).toBeNull();
 });
 
 // ==========================
@@ -208,23 +214,32 @@ test("recv skips message with corrupted payload and does not block queue", async
   // Send a valid message to get a message ID
   await q.send({ data: { v: 1 } });
 
-  // Corrupt the message payload in Redis directly
+  // Corrupt the message payload in Redis directly. The guard around this used
+  // to let the corruption silently no-op.
   const messagesKey = `test:fq:default:${qId}:messages`;
-  const msgIds = await redis.send("HKEYS", [messagesKey]);
-  if (Array.isArray(msgIds) && msgIds.length > 0) {
-    await redis.send("HSET", [messagesKey, String(msgIds[0]), "{{invalid json"]);
-  }
+  const msgIds = (await redis.send("HKEYS", [messagesKey])) as string[];
+  expect(msgIds.length).toBe(1);
+  const poisonId = String(msgIds[0]);
+  await redis.send("HSET", [messagesKey, poisonId, "{{invalid json"]);
 
   // Send another valid message after the corrupted one
   await q.send({ data: { v: 2 } });
 
-  // recv should skip the corrupted message and return the valid one
+  // Every assertion used to sit inside `if (msg)`, and the outcome was
+  // deterministically null, so a regression that made recv throw or wedge the
+  // queue on a poison message shipped green.
   const msg = await q.recv({ wait: false });
-  // May get null (corrupted consumed the recv attempt) or the valid message
-  if (msg) {
-    expect(msg.data.v).toBe(2);
-    await msg.ack();
-  }
+  expect(msg).not.toBeNull();
+  expect(msg!.data.v).toBe(2);
+  expect(await msg!.ack()).toBe(true);
+
+  // The poison record is gone and the queue is not wedged.
+  expect(await redis.send("HEXISTS", [messagesKey, poisonId])).toBe(0);
+  expect(await q.recv({ wait: false })).toBeNull();
+  await q.send({ data: { v: 3 } });
+  const after = await q.recv({ wait: false });
+  expect(after?.data.v).toBe(3);
+  await after?.ack();
 });
 
 // ==========================

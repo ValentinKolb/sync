@@ -1,6 +1,6 @@
 import { beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { job, type JobTraceEvent } from "../index";
+import { job, queue, type JobTraceEvent } from "../index";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 
@@ -478,49 +478,101 @@ test("delayMs delays first execution", async () => {
 // ctx.heartbeat / signal
 // ==========================
 
-test("ctx.heartbeat extends lease for long runs", async () => {
-  let done = false;
+const raceHeartbeat = async (
+  id: string,
+  body: (ctx: { heartbeat: () => Promise<void> }) => Promise<void>,
+): Promise<{ stolen: boolean }> => {
+  let running = false;
+  let finished = false;
 
   const worker = job({
-    id: uid("heartbeat"),
+    id,
     defaults: { leaseMs: 300 },
     process: async ({ ctx }) => {
-      for (let i = 0; i < 5; i++) {
-        await Bun.sleep(100);
-        await ctx.heartbeat();
-      }
-      done = true;
+      running = true;
+      await body(ctx);
+      finished = true;
     },
   });
 
   await worker.submit({ key: "x" });
-  await waitFor(() => done, 5_000);
-  expect(done).toBe(true);
+  await waitFor(() => running, 10_000);
+
+  // A competing consumer on the internal work queue. Its non-waiting recv
+  // forces maintenance, so an expired lease is actually reaped — without one,
+  // a single busy worker means nothing ever reaps and the lease lapsing has no
+  // observable effect at all.
+  const competitor = queue({ id: `${id}:work`, prefix: "sync:job:queue" }).reader();
+  let stolen = false;
+  while (!finished && !stolen) {
+    const taken = await competitor.recv({ wait: false });
+    if (taken) {
+      stolen = true;
+      await taken.ack();
+    } else {
+      await Bun.sleep(50);
+    }
+  }
 
   worker.stop();
-});
+  return { stolen };
+};
+
+test("ctx.heartbeat extends the lease so a long run is not redelivered", async () => {
+  // `done` used to be set by the process body itself, so the old assertion held
+  // whether the heartbeat succeeded, failed, or was never called.
+  const { stolen } = await raceHeartbeat(uid("heartbeat"), async (ctx) => {
+    for (let i = 0; i < 8; i++) {
+      await Bun.sleep(100);
+      await ctx.heartbeat();
+    }
+  });
+
+  expect(stolen).toBe(false);
+}, 30_000);
+
+test("without a heartbeat a long run does lose its lease", async () => {
+  // The negative control that gives the test above its meaning.
+  const { stolen } = await raceHeartbeat(uid("no-heartbeat"), async () => {
+    await Bun.sleep(1_500);
+  });
+
+  expect(stolen).toBe(true);
+}, 30_000);
 
 // ==========================
 // stop()
 // ==========================
 
-test("stop halts the worker", async () => {
-  let ran = false;
+test("stop halts the receive loop until the next submit restarts it", async () => {
+  const processed: string[] = [];
 
   const worker = job({
     id: uid("stop"),
-    process: async () => {
-      ran = true;
+    process: async ({ ctx }) => {
+      processed.push(ctx.key);
     },
   });
 
-  worker.stop();
-  await worker.submit({ key: "x" });
-  await waitFor(() => ran, 5_000);
-  expect(ran).toBe(true);
+  // The old test called stop() before any worker existed — a no-op — then let
+  // submit() restart one, and asserted the job *ran*, under a name promising
+  // the loop halts. Neither half of the documented behaviour was tested.
+  await worker.submit({ key: "first" });
+  await waitFor(() => processed.length === 1, 10_000);
 
   worker.stop();
-});
+  // Enqueue directly, bypassing submit(), so nothing restarts the loop.
+  await redis.send("LPUSH", [`sync:job:queue:default:${worker.id}:work:ready`, "999999"]);
+  await Bun.sleep(400);
+  expect(processed).toEqual(["first"]);
+
+  // A later submit restarts the loop, as documented.
+  await worker.submit({ key: "second" });
+  await waitFor(() => processed.length === 2, 10_000);
+  expect(processed).toEqual(["first", "second"]);
+
+  worker.stop();
+}, 30_000);
 
 // ==========================
 // after error-swallow
