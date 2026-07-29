@@ -360,12 +360,9 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
         const remaining = deadline - Date.now();
         if (remaining <= 0) break;
 
-        // Wait for emitter or timeout
-        const raceTimeout = Math.min(remaining, 1000);
-        await Promise.race([
-          state.emitter.onceWithSignal(recvCfg.signal),
-          sleep(raceTimeout),
-        ]).catch(() => {});
+        // One cancellable wait that always unsubscribes. Racing once() against
+        // a timer left the losing listener registered forever.
+        await state.emitter.waitFor(Math.min(remaining, 1000), recvCfg.signal);
 
         runMaintenance(state);
         const claimed = claimNext(state, leaseMs);

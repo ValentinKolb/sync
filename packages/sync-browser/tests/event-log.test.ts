@@ -1,5 +1,7 @@
 import { test, expect, beforeEach, describe } from "bun:test";
 import { EventLog } from "../src/internal/event-log";
+import { Emitter } from "../src/internal/emitter";
+import { queue } from "../src/queue";
 
 let log: EventLog;
 
@@ -390,4 +392,49 @@ test("subscribe does not lose events during rapid appends", async () => {
   await sub.catch(() => {});
   expect(received.length).toBe(5);
   expect(received).toEqual(["1", "2", "3", "4", "5"]);
+});
+
+// ==========================
+// Emitter listener lifecycle
+// ==========================
+
+test("waitFor leaves no listener behind on timeout, emit or abort", async () => {
+  const emitter = new Emitter<void>();
+  const listenerCount = (): number =>
+    (emitter as unknown as { listeners: Set<unknown> }).listeners.size;
+
+  // Timeout path: this is the one an idle poller takes every second.
+  for (let i = 0; i < 20; i++) {
+    expect(await emitter.waitFor(1)).toBe(false);
+  }
+  expect(listenerCount()).toBe(0);
+
+  // Emit path.
+  const pending = emitter.waitFor(1_000);
+  emitter.emit();
+  expect(await pending).toBe(true);
+  expect(listenerCount()).toBe(0);
+
+  // Abort path.
+  const ac = new AbortController();
+  const aborted = emitter.waitFor(1_000, ac.signal);
+  ac.abort();
+  expect(await aborted).toBe(false);
+  expect(listenerCount()).toBe(0);
+});
+
+test("an idle queue recv does not accumulate listeners", async () => {
+  const q = queue<{ v: number }>({ id: `idle-listeners-${Date.now()}` });
+  await q.send({ data: { v: 1 } });
+  const first = await q.recv({ wait: false });
+  await first?.ack();
+
+  // Four polls that each find nothing and time out.
+  for (let i = 0; i < 4; i++) {
+    expect(await q.recv({ wait: true, timeoutMs: 30 })).toBeNull();
+  }
+
+  // Still delivers afterwards: the wait path did not wedge itself.
+  await q.send({ data: { v: 2 } });
+  expect((await q.recv({ wait: false }))?.data).toEqual({ v: 2 });
 });

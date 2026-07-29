@@ -26,6 +26,41 @@ export class Emitter<T = void> {
     });
   }
 
+  /**
+   * Wait for the next emit, a timeout, or an abort — whichever comes first, and
+   * always unsubscribing.
+   *
+   * `once()` has no cancellation path: its listener is removed only when it
+   * fires. Racing it against a timer therefore leaked one permanently
+   * registered closure per lost race — an idle job worker polls once a second
+   * with no signal, so it accumulated about 3600 listeners per idle hour, each
+   * retaining a promise and its resolve, and every emit() then iterated all of
+   * them. Nothing could remove them, not even stop(), because they live on the
+   * shared state rather than on the worker.
+   *
+   * @returns true if an emit arrived, false on timeout or abort.
+   */
+  waitFor(timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) return Promise.resolve(false);
+
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (emitted: boolean): void => {
+        if (settled) return;
+        settled = true;
+        unsub();
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(emitted);
+      };
+
+      const unsub = this.on(() => finish(true));
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      const onAbort = (): void => finish(false);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
   /** Returns a promise that resolves on the next emit, or rejects on abort. */
   onceWithSignal(signal?: AbortSignal): Promise<T> {
     if (!signal) return this.once();
