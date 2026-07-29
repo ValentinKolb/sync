@@ -18,6 +18,36 @@ type Entry = {
   expiresAt: number | null;
 };
 
+/**
+ * Thrown when the backing storage refuses a write — most often a quota error.
+ * Distinguishable so callers do not mistake a storage failure for a user error.
+ */
+export class StoreWriteError extends Error {
+  readonly key: string;
+  override readonly cause: unknown;
+
+  constructor(key: string, cause: unknown) {
+    super(`store write failed for key "${key}": ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "StoreWriteError";
+    this.key = key;
+    this.cause = cause;
+  }
+}
+
+/**
+ * Values are snapshotted on the way in and out. Handing back the caller's own
+ * object meant `send({ data: payload })` then `payload.x = 1` changed what the
+ * consumer saw, and a consumer mutating a received value mutated the stored
+ * copy across redelivery — neither of which happens on the server, and neither
+ * of which happens with a LocalStorageStore, so swapping stores silently
+ * changed behaviour.
+ */
+const snapshot = (value: unknown): unknown => {
+  if (value === undefined || value === null) return value;
+  if (typeof value !== "object") return value;
+  return structuredClone(value);
+};
+
 export class MemoryStore implements Store {
   private data = new Map<string, Entry>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -32,7 +62,7 @@ export class MemoryStore implements Store {
       return undefined;
     }
 
-    return entry.value;
+    return snapshot(entry.value);
   }
 
   set(key: string, value: unknown, ttlMs?: number): void {
@@ -44,7 +74,7 @@ export class MemoryStore implements Store {
     }
 
     const expiresAt = ttlMs != null && ttlMs > 0 ? Date.now() + ttlMs : null;
-    this.data.set(key, { value, expiresAt });
+    this.data.set(key, { value: snapshot(value), expiresAt });
 
     if (ttlMs != null && ttlMs > 0) {
       this.timers.set(
@@ -140,7 +170,16 @@ export class LocalStorageStore implements Store {
     }
 
     const expiresAt = ttlMs != null && ttlMs > 0 ? Date.now() + ttlMs : null;
-    localStorage.setItem(this.storageKey(key), JSON.stringify({ value, expiresAt }));
+    try {
+      localStorage.setItem(this.storageKey(key), JSON.stringify({ value, expiresAt }));
+    } catch (error) {
+      // A raw QuotaExceededError used to propagate out of topic.pub(),
+      // ratelimit.check() or pump's writeState mid-dispatch, where it landed
+      // inside runAttempt's try and was misreported as a *user* dispatch
+      // failure — incrementing failureCount and eventually marking the run
+      // permanently failed. Keep its true classification.
+      throw new StoreWriteError(key, error);
+    }
 
     if (ttlMs != null && ttlMs > 0) {
       this.timers.set(
@@ -164,14 +203,19 @@ export class LocalStorageStore implements Store {
     const result: string[] = [];
     const fullPrefix = prefix !== undefined ? this.storageKey(prefix) : this.storageKey("");
 
+    // Two passes, the pattern clear() below already uses. localStorage is index
+    // addressed: removing item i shifts every later item down one, so deleting
+    // an expired entry inside the loop skipped exactly one live key per expired
+    // key — silently stalling pump's claimNext, which is the only caller.
+    const storageKeys: string[] = [];
     for (let i = 0; i < localStorage.length; i++) {
       const storageKey = localStorage.key(i);
-      if (!storageKey || !storageKey.startsWith(fullPrefix)) continue;
+      if (storageKey && storageKey.startsWith(fullPrefix)) storageKeys.push(storageKey);
+    }
 
-      // Strip the store prefix to get the logical key
+    for (const storageKey of storageKeys) {
       const logicalKey = storageKey.slice(this.prefix.length + 1);
 
-      // Lazy expiry during iteration
       const raw = localStorage.getItem(storageKey);
       if (raw) {
         try {

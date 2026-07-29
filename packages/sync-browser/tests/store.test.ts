@@ -240,7 +240,7 @@ const createLocalStorageMock = () => {
   } as unknown as Storage;
 };
 
-import { LocalStorageStore, createLocalStorageStore } from "../src/store";
+import { LocalStorageStore, StoreWriteError, createLocalStorageStore } from "../src/store";
 
 // We need to polyfill localStorage for Bun
 const originalLocalStorage = globalThis.localStorage;
@@ -379,6 +379,62 @@ test("createLocalStorageStore factory works", () => {
     const store = createLocalStorageStore("factory-test");
     store.set("k", 42);
     expect(store.get("k")).toBe(42);
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+// ==========================
+// LocalStorageStore.keys() index shift
+// ==========================
+
+test("LocalStorageStore.keys does not skip a live key for each expired key", () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    // An already-expired record with no timer behind it: exactly what a key
+    // written by a since-closed tab leaves behind, since timers are tab-local.
+    localStorage.setItem("shift:a", JSON.stringify({ value: 1, expiresAt: Date.now() - 1 }));
+
+    const store = new LocalStorageStore("shift");
+    store.set("b", 2);
+    store.set("c", 3);
+
+    // localStorage is index addressed, so deleting the expired entry
+    // mid-iteration shifted every later item down and skipped exactly one live
+    // key per expired key — silently stalling pump, the only caller of keys().
+    expect(store.keys().sort()).toEqual(["b", "c"]);
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("MemoryStore hands out snapshots, not live references", () => {
+  const memory = new MemoryStore();
+  const payload = { retries: 0, tags: ["a"] };
+
+  memory.set("k", payload);
+  payload.retries = 99;
+
+  // The stored value must not change under the writer, and a reader mutating
+  // what it got back must not change what the next reader sees.
+  expect((memory.get("k") as typeof payload).retries).toBe(0);
+  (memory.get("k") as typeof payload).tags.push("b");
+  expect((memory.get("k") as typeof payload).tags).toEqual(["a"]);
+});
+
+test("a rejected localStorage write keeps its own classification", () => {
+  const mock = createLocalStorageMock();
+  globalThis.localStorage = mock;
+  try {
+    const store = new LocalStorageStore("quota");
+    (mock as unknown as { setItem: () => void }).setItem = (): void => {
+      throw new Error("QuotaExceededError");
+    };
+
+    // An unwrapped quota error surfaced from topic.pub() or pump's writeState
+    // mid-dispatch and was misreported as a user dispatch failure, eventually
+    // marking the run permanently failed.
+    expect(() => store.set("k", 1)).toThrow(StoreWriteError);
   } finally {
     globalThis.localStorage = originalLocalStorage;
   }
