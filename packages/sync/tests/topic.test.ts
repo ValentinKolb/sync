@@ -768,7 +768,7 @@ test("reader.close cleans every used tenant without deleting pending consumers",
   ]);
   expect(committedConsumers).toEqual([]);
   expect(pendingConsumers).toEqual([
-    expect.arrayContaining(["name", consumerId, "pending", 1]),
+    expect.objectContaining({ name: consumerId, pending: 1 }),
   ]);
 });
 
