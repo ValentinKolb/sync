@@ -243,3 +243,46 @@ test("trace failures do not change pump state", async () => {
     console.warn = originalWarn;
   }
 });
+
+test("a fast run does not starve a run that became due earlier", async () => {
+  const order: string[] = [];
+
+  const worker = track(
+    pump<Input, Cursor, Item>({
+      id: uid("starvation"),
+      batchSize: 1,
+      defaults: { delayMs: 0 },
+      pull: ({ cursor, input }) => {
+        const start = cursor ?? 0;
+        return start >= 4
+          ? { items: [], nextCursor: null }
+          : { items: [{ key: `${input.source}:${start}`, value: start }], nextCursor: start + 1 };
+      },
+      dispatch: async ({ item }) => {
+        order.push(item.key);
+        await Bun.sleep(5);
+      },
+    }),
+  );
+
+  // `a` uses delayMs 0, so it re-arms nextRunAt to now after every page and
+  // looks due on every poll. Taking the first eligible key in store order let
+  // it run to completion before `b` was ever claimed.
+  await worker.start({ key: "a", input: { source: "a" } });
+  await worker.start({ key: "b", input: { source: "b" } });
+
+  await waitFor(
+    async () =>
+      (await worker.get({ key: "a" }))?.state === "completed" &&
+      (await worker.get({ key: "b" }))?.state === "completed",
+    20_000,
+  );
+
+  expect(order.filter((k) => k.startsWith("a")).length).toBe(4);
+  expect(order.filter((k) => k.startsWith("b")).length).toBe(4);
+
+  // Interleaved rather than fully serialised: b's first item lands before a's last.
+  const firstB = order.findIndex((k) => k.startsWith("b"));
+  const lastA = order.map((k) => k.startsWith("a")).lastIndexOf(true);
+  expect(firstB).toBeLessThan(lastA);
+}, 30_000);

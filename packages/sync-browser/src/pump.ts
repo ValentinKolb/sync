@@ -138,7 +138,12 @@ type ActiveWorker = {
   current?: ActiveAttempt;
 };
 
-const workersByStore = new WeakMap<Store, Map<string, ActiveWorker>>();
+// Deliberately not a module-level registry. Keying workers by Store meant that
+// with default per-instance stores every handle ran its own 250ms poll loop and
+// stop() affected only its own — a permanent wakeup source in a tab — while
+// keying them by `${prefix}:${id}` would make a second same-id handle a silent
+// no-op. The worker belongs to the handle that started it; concurrent workers
+// on one run are already resolved by the leaseToken fence.
 
 class LeaseLostError extends Error {
   constructor() {
@@ -221,7 +226,6 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const baseKey = `${prefix}:${config.id}`;
   const runPrefix = `${baseKey}:run:`;
-  const workerId = baseKey;
   const store = config.store ?? createMemoryStore();
   const batchSize = Math.max(1, Math.floor(config.batchSize ?? DEFAULT_BATCH_SIZE));
   const delayMs = Math.max(0, config.delayMs ?? DEFAULT_DELAY_MS);
@@ -242,11 +246,8 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
     jitter: config.retry?.jitter ?? DEFAULT_RETRY_JITTER,
   };
 
-  let workers = workersByStore.get(store);
-  if (!workers) {
-    workers = new Map();
-    workersByStore.set(store, workers);
-  }
+  // The worker belongs to this handle, not to its Store or its id.
+  let activeWorker: ActiveWorker | null = null;
 
   const stateKeyFor = (key: string): string => `${runPrefix}${encodeURIComponent(key)}`;
 
@@ -501,13 +502,24 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
 
   const claimNext = (): { stateKey: string; token: string; state: StoredPumpState<Input, Cursor, Item> } | null => {
     const now = Date.now();
+
+    // Earliest due first, as the server's ZRANGEBYSCORE over the due set does.
+    // Taking the first eligible key in store order let a run with delayMs 0 —
+    // which sets nextRunAt to now after every page, so it looks due on every
+    // poll — starve every run that happened to sort after it.
+    const candidates: Array<{ stateKey: string; state: StoredPumpState<Input, Cursor, Item>; dueAt: number }> = [];
     for (const stateKey of store.keys(runPrefix)) {
       const state = readStateByKey(stateKey);
       if (!state) continue;
       if (state.state === "completed" || state.state === "failed" || state.state === "canceled") continue;
-      if ((state.nextRunAt ?? 0) > now) continue;
+      const dueAt = state.nextRunAt ?? 0;
+      if (dueAt > now) continue;
       if ((state.leaseUntil ?? 0) > now) continue;
+      candidates.push({ stateKey, state, dueAt });
+    }
+    candidates.sort((a, b) => a.dueAt - b.dueAt || (a.stateKey < b.stateKey ? -1 : 1));
 
+    for (const { stateKey, state } of candidates) {
       const token = randomId();
       state.state = "running";
       delete state.nextRunAt;
@@ -520,10 +532,10 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   };
 
   const startWorker = (): void => {
-    if (workers!.has(workerId)) return;
+    if (activeWorker) return;
 
     const worker: ActiveWorker = { abort: new AbortController() };
-    workers!.set(workerId, worker);
+    activeWorker = worker;
 
     void (async () => {
       try {
@@ -540,7 +552,7 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
           }
         }
       } finally {
-        if (workers!.get(workerId) === worker) workers!.delete(workerId);
+        if (activeWorker === worker) activeWorker = null;
       }
     })();
   };
@@ -605,7 +617,7 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
     state.updatedAt = Date.now();
     const stored = writeState(stateKey, state, terminalRetentionMs);
 
-    const worker = workers!.get(workerId);
+    const worker = activeWorker;
     if (worker?.current?.stateKey === stateKey) worker.current.abort.abort();
 
     await emitTrace(config.trace, {
@@ -619,14 +631,14 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   };
 
   const stop = (): void => {
-    const worker = workers!.get(workerId);
+    const worker = activeWorker;
     if (!worker) return;
     worker.abort.abort();
     if (worker.current) {
       worker.current.abort.abort();
       release(worker.current.stateKey, worker.current.token);
     }
-    workers!.delete(workerId);
+    activeWorker = null;
   };
 
   startWorker();

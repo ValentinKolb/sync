@@ -145,13 +145,25 @@ const COMMIT_PAGE_SCRIPT = `
   end
 
   local nextCursorJson = state.pageNextCursorJson
+  -- A page that yielded nothing and did not move the cursor made no progress.
+  -- Resetting failureCount on it, and scheduling the next run immediately when
+  -- delayMs is 0, let a fully-filtered source or an external API returning an
+  -- empty page with a nextPageToken hammer Redis and the upstream forever, with
+  -- no terminal state and no trace signal. Such a round now counts as a failure
+  -- so the configured backoff and maxAttempts apply.
+  local stalled = tonumber(state.pageItemCount) == 0 and nextCursorJson == state.cursorJson
   state.cursorJson = nextCursorJson
   state.pageItemsJson = nil
   state.pageNextCursorJson = nil
   state.pageNextIndex = nil
   state.pageItemCount = nil
-  state.failureCount = 0
-  state.lastError = nil
+  if stalled then
+    state.failureCount = (tonumber(state.failureCount) or 0) + 1
+    state.lastError = "pull returned an empty page without advancing the cursor"
+  else
+    state.failureCount = 0
+    state.lastError = nil
+  end
   state.leaseToken = nil
   state.leaseUntil = nil
   state.updatedAt = tonumber(ARGV[3])
@@ -166,10 +178,11 @@ const COMMIT_PAGE_SCRIPT = `
   end
 
   state.state = "waiting"
-  state.nextRunAt = tonumber(ARGV[4])
+  -- ARGV[6] carries the backoff deadline used when the round made no progress.
+  state.nextRunAt = stalled and tonumber(ARGV[6]) or tonumber(ARGV[4])
   local encoded = cjson.encode(state)
   redis.call("SET", KEYS[1], encoded)
-  redis.call("ZADD", KEYS[2], ARGV[4], ARGV[1])
+  redis.call("ZADD", KEYS[2], tostring(state.nextRunAt), ARGV[1])
   return encoded
 `;
 
@@ -387,7 +400,11 @@ type ActiveWorker = {
   current?: ActiveAttempt;
 };
 
-const activeWorkers = new Map<string, ActiveWorker>();
+// Deliberately not a module-level registry keyed by `${prefix}:${id}`. That
+// made a second handle with the same id a silent no-op — its pull, dispatch and
+// trace callbacks were never invoked, so after a hot reload stale code kept
+// serving live traffic — and either handle's stop() aborted the shared worker.
+// Concurrent workers on one id are already resolved by the leaseToken fence.
 
 class LeaseLostError extends Error {
   constructor() {
@@ -505,7 +522,8 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const baseKey = `${prefix}:${config.id}`;
   const dueKey = `${baseKey}:due`;
-  const workerId = baseKey;
+  // The worker belongs to this handle, not to the id.
+  let activeWorker: ActiveWorker | null = null;
   const batchSize = Math.max(1, Math.floor(config.batchSize ?? DEFAULT_BATCH_SIZE));
   const delayMs = Math.max(0, config.delayMs ?? DEFAULT_DELAY_MS);
   const leaseMs = Math.max(50, config.defaults?.leaseMs ?? DEFAULT_LEASE_MS);
@@ -676,11 +694,15 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
       }
 
       const nextRunAt = Date.now() + delayMs;
+      // Deadline used when the round made no progress, so a non-advancing empty
+      // page backs off instead of spinning.
+      const stalledRunAt =
+        Date.now() + Math.max(delayMs, expBackoff((state.failureCount ?? 0) + 1, { baseMs: 250, maxMs: 30_000 }));
       const committed = parseState<Input, Cursor, Item>(
         await evalScript(
           COMMIT_PAGE_SCRIPT,
           [stateKeyForMember(member), dueKey],
-          [member, token, Date.now(), nextRunAt, terminalRetentionMs],
+          [member, token, Date.now(), nextRunAt, terminalRetentionMs, stalledRunAt],
         ),
       );
       if (!committed) throw new LeaseLostError();
@@ -747,10 +769,10 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   };
 
   const startWorker = (): void => {
-    if (activeWorkers.has(workerId)) return;
+    if (activeWorker) return;
 
     const worker: ActiveWorker = { abort: new AbortController() };
-    activeWorkers.set(workerId, worker);
+    activeWorker = worker;
 
     void (async () => {
       try {
@@ -792,8 +814,7 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
           }
         }
       } finally {
-        const current = activeWorkers.get(workerId);
-        if (current === worker) activeWorkers.delete(workerId);
+        if (activeWorker === worker) activeWorker = null;
       }
     })();
   };
@@ -863,7 +884,7 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
     const changed = Number(result[1]) > 0;
     if (!state || !changed) return false;
 
-    const worker = activeWorkers.get(workerId);
+    const worker = activeWorker;
     if (worker?.current?.member === member) worker.current.abort.abort();
 
     await emitTrace(config.trace, {
@@ -877,14 +898,14 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   };
 
   const stop = (): void => {
-    const worker = activeWorkers.get(workerId);
+    const worker = activeWorker;
     if (!worker) return;
     worker.abort.abort();
     worker.current?.abort.abort();
     if (worker.current) {
       void release(worker.current.member, worker.current.token).catch(() => undefined);
     }
-    activeWorkers.delete(workerId);
+    activeWorker = null;
   };
 
   startWorker();
