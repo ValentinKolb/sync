@@ -477,6 +477,56 @@ test("manual runs are serialized across scheduler handles for the full callback 
   expect((await first.get({ id: "serial" }))?.runNumber).toBe(2);
 }, 20_000);
 
+test("a dispatch waiting for the lock resolves the current handler", async () => {
+  const schedId = uid("fresh-handler");
+  const options = {
+    leader: { leaseMs: 500, heartbeatMs: 50 },
+    dispatch: { tickMs: 50 },
+  };
+  const holder = makeScheduler(schedId, options);
+  const waiting = makeScheduler(schedId, options);
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let holderStarted = false;
+  let oldRuns = 0;
+  let newRuns = 0;
+
+  await holder.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async () => {
+      holderStarted = true;
+      await gate;
+    },
+  });
+  await waiting.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async () => {
+      oldRuns += 1;
+    },
+  });
+
+  const heldRun = holder.runNow({ id: "report" });
+  await waitFor(() => holderStarted);
+  const queuedRun = waiting.runNow({ id: "report" });
+  await Bun.sleep(100);
+  await waiting.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async () => {
+      newRuns += 1;
+    },
+  });
+
+  release();
+  await Promise.all([heldRun.catch(() => {}), queuedRun]);
+  expect(oldRuns).toBe(0);
+  expect(newRuns).toBe(1);
+}, 20_000);
+
 test("losing the dispatch lease aborts the callback and rejects the run", async () => {
   const schedId = uid("dispatch-lease-loss");
   const s = makeScheduler(schedId, {

@@ -60,6 +60,7 @@ export class SchedulerControlTimeoutError extends SchedulerControlUnavailableErr
 }
 
 type BrowserScheduleRegistration = {
+  prefix: string;
   instanceId: string;
   schedulerId: string;
   scheduleId: string;
@@ -70,17 +71,26 @@ type BrowserScheduleRegistration = {
 };
 
 const registrations = new Map<string, Map<string, BrowserScheduleRegistration>>();
-const requests = new Map<string, { target: string; accepted: Promise<void>; expiresAt: number }>();
+const requests = new Map<
+  string,
+  { target: string; accepted: Promise<void>; expiresAt: number; retentionMs: number }
+>();
 let requestPruneTimer: ReturnType<typeof setTimeout> | undefined;
 
 const groupKey = (prefix: string, schedulerId: string, scheduleId: string): string =>
-  `${prefix}:${schedulerId}:${scheduleId}`;
+  JSON.stringify([prefix, schedulerId, scheduleId]);
 
 const assertId = (name: string, value: string): void => {
   if (!value) throw new Error(`${name} is required`);
 };
 
-const requestKey = (prefix: string, requestId: string): string => `${prefix}:${requestId}`;
+const assertPositiveMs = (name: string, value: number | undefined): void => {
+  if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+    throw new Error(`${name} must be a finite number greater than 0`);
+  }
+};
+
+const requestKey = (prefix: string, requestId: string): string => JSON.stringify([prefix, requestId]);
 
 const pruneRequests = (now: number): void => {
   for (const [key, request] of requests) {
@@ -97,6 +107,7 @@ const scheduleRequestPrune = (): void => {
   for (const request of requests.values()) {
     nextExpiry = Math.min(nextExpiry, request.expiresAt);
   }
+  if (!Number.isFinite(nextExpiry)) return;
   requestPruneTimer = setTimeout(() => {
     requestPruneTimer = undefined;
     pruneRequests(Date.now());
@@ -142,6 +153,7 @@ export const registerBrowserSchedulerControl = (cfg: {
   const key = groupKey(cfg.prefix, cfg.schedulerId, cfg.scheduleId);
   const group = registrations.get(key) ?? new Map<string, BrowserScheduleRegistration>();
   group.set(cfg.instanceId, {
+    prefix: cfg.prefix,
     instanceId: cfg.instanceId,
     schedulerId: cfg.schedulerId,
     scheduleId: cfg.scheduleId,
@@ -158,9 +170,9 @@ export const setBrowserSchedulerControlAvailable = (cfg: {
   instanceId: string;
   available: boolean;
 }): void => {
-  const prefix = `${cfg.prefix}:${cfg.schedulerId}:`;
-  for (const [key, group] of registrations) {
-    if (!key.startsWith(prefix)) continue;
+  for (const group of registrations.values()) {
+    const first = group.values().next().value as BrowserScheduleRegistration | undefined;
+    if (!first || first.prefix !== cfg.prefix || first.schedulerId !== cfg.schedulerId) continue;
     const registration = group.get(cfg.instanceId);
     if (registration) registration.available = cfg.available;
   }
@@ -181,14 +193,14 @@ export const unregisterBrowserSchedulerControl = (cfg: {
 
 export const schedulerControl = (config: SchedulerControlConfig = {}): SchedulerControl => {
   const prefix = config.prefix ?? DEFAULT_PREFIX;
+  assertPositiveMs("timeoutMs", config.timeoutMs);
   const defaultTimeoutMs = Math.max(1, config.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
   const list = async (): Promise<SchedulerControlInfo[]> => {
     const out: SchedulerControlInfo[] = [];
-    for (const [key, group] of registrations) {
-      if (!key.startsWith(`${prefix}:`)) continue;
+    for (const group of registrations.values()) {
       const first = Array.from(group.values())[0];
-      if (!first) continue;
+      if (!first || first.prefix !== prefix) continue;
       const info = first.getInfo();
       if (!info) continue;
       const available = Array.from(group.values()).some((registration) => registration.available);
@@ -214,6 +226,7 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
   const runNow = async (cfg: SchedulerControlRunNowConfig): Promise<void> => {
     assertId("schedulerId", cfg.schedulerId);
     assertId("scheduleId", cfg.scheduleId);
+    assertPositiveMs("timeoutMs", cfg.timeoutMs);
     const timeoutMs = Math.max(1, cfg.timeoutMs ?? defaultTimeoutMs);
     const requestId = cfg.requestId ?? crypto.randomUUID();
     assertId("requestId", requestId);
@@ -227,7 +240,10 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
       throw new Error(`schedulerControl.runNow: requestId ${requestId} is already bound to another schedule`);
     }
     if (request) {
-      request.expiresAt = now + Math.max(REQUEST_TTL_MS, timeoutMs * 2);
+      request.retentionMs = Math.max(request.retentionMs, REQUEST_TTL_MS, timeoutMs * 2);
+      if (Number.isFinite(request.expiresAt)) {
+        request.expiresAt = now + request.retentionMs;
+      }
       scheduleRequestPrune();
       await waitForAcceptance(request.accepted, timeoutMs, cfg.schedulerId, cfg.scheduleId);
       return;
@@ -249,31 +265,46 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
 
     let settleAccepted: () => void = () => {};
     let failAccepted: (error: unknown) => void = () => {};
-    let settled = false;
+    let acceptanceSettled = false;
     const accepted = new Promise<void>((resolve, reject) => {
       settleAccepted = () => {
-        settled = true;
+        if (acceptanceSettled) return;
+        acceptanceSettled = true;
         resolve();
       };
-      failAccepted = reject;
+      failAccepted = (error) => {
+        if (acceptanceSettled) return;
+        acceptanceSettled = true;
+        reject(error);
+      };
     });
+    const retentionMs = Math.max(REQUEST_TTL_MS, timeoutMs * 2);
     request = {
       target: key,
       accepted,
-      expiresAt: now + Math.max(REQUEST_TTL_MS, timeoutMs * 2),
+      expiresAt: Number.POSITIVE_INFINITY,
+      retentionMs,
     };
     requests.set(idempotencyKey, request);
     scheduleRequestPrune();
 
+    const finishRequest = (): void => {
+      if (requests.get(idempotencyKey) !== request) return;
+      request.expiresAt = Date.now() + request.retentionMs;
+      scheduleRequestPrune();
+    };
     try {
       const run = registration.runNow(settleAccepted);
       // A failure before acceptance is the caller's to see; one after
       // acceptance belongs to the scheduler run, not this control request.
-      void run.catch((error: unknown) => {
-        if (!settled) failAccepted(error);
-      });
+      void run
+        .catch((error: unknown) => {
+          failAccepted(error);
+        })
+        .finally(finishRequest);
     } catch (error) {
       failAccepted(error);
+      finishRequest();
     }
 
     await waitForAcceptance(accepted, timeoutMs, cfg.schedulerId, cfg.scheduleId);

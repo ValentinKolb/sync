@@ -23,6 +23,28 @@ const BIND_REQUEST_SCRIPT = `
 const REFRESH_REQUEST_SCRIPT = `
   if redis.call("GET", KEYS[1]) ~= ARGV[1] then return 0 end
   redis.call("PEXPIRE", KEYS[1], ARGV[2])
+  if redis.call("EXISTS", KEYS[2]) == 1 then
+    redis.call("PEXPIRE", KEYS[2], ARGV[2])
+  end
+  return 1
+`;
+
+const WRITE_PENDING_RESPONSE_SCRIPT = `
+  if redis.call("GET", KEYS[1]) ~= ARGV[1] then return 0 end
+  redis.call("PEXPIRE", KEYS[1], ARGV[2])
+  local raw = redis.call("GET", KEYS[2])
+  if raw then
+    local ok, response = pcall(cjson.decode, raw)
+    if ok and response.status == "accepted" then
+      redis.call("PEXPIRE", KEYS[2], ARGV[2])
+      return 2
+    end
+    if ok and (response.status == "not_found" or response.status == "unavailable") then
+      redis.call("PEXPIRE", KEYS[2], ARGV[2])
+      return 3
+    end
+  end
+  redis.call("SET", KEYS[2], ARGV[3], "PX", ARGV[2])
   return 1
 `;
 
@@ -109,6 +131,7 @@ export type SchedulerControlRequest = {
 };
 
 type SchedulerControlResponse =
+  | { status: "pending"; pendingAt: number }
   | { status: "accepted"; acceptedAt: number }
   | { status: "not_found"; error: string }
   | { status: "unavailable"; error: string };
@@ -121,11 +144,20 @@ const handlerIndexKey = (prefix: string, schedulerId: string, scheduleId: string
   `${prefix}:${schedulerId}:control:${scheduleId}:handlers`;
 const handlerInstanceKey = (prefix: string, schedulerId: string, scheduleId: string, instanceId: string): string =>
   `${prefix}:${schedulerId}:control:${scheduleId}:handler:${instanceId}`;
-const responseKey = (prefix: string, requestId: string): string => `${prefix}:control:response:${requestId}`;
-const requestKey = (prefix: string, requestId: string): string => `${prefix}:control:request:${requestId}`;
+const encodedIdentity = (value: string): string => value.replaceAll("%", "%25").replaceAll(":", "%3A");
+const responseKey = (prefix: string, requestId: string): string =>
+  `${prefix}:control:response:${encodedIdentity(requestId)}`;
+const requestKey = (prefix: string, requestId: string): string =>
+  `${prefix}:control:request:${encodedIdentity(requestId)}`;
 
 const assertId = (name: string, value: string): void => {
   if (!value) throw new Error(`${name} is required`);
+};
+
+const assertPositiveMs = (name: string, value: number | undefined): void => {
+  if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+    throw new Error(`${name} must be a finite number greater than 0`);
+  }
 };
 
 const parseSchedule = (raw: string | null): StoredSchedule | null => {
@@ -192,7 +224,12 @@ const readResponse = async (prefix: string, requestId: string): Promise<Schedule
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as SchedulerControlResponse;
-    if (parsed.status === "accepted" || parsed.status === "not_found" || parsed.status === "unavailable") {
+    if (
+      parsed.status === "pending"
+      || parsed.status === "accepted"
+      || parsed.status === "not_found"
+      || parsed.status === "unavailable"
+    ) {
       return parsed;
     }
   } catch {
@@ -274,6 +311,7 @@ export const refreshSchedulerControlHandler = async (cfg: {
   instanceId: string;
   ttlMs?: number;
 }): Promise<void> => {
+  assertPositiveMs("ttlMs", cfg.ttlMs);
   const ttlMs = Math.max(1_000, cfg.ttlMs ?? DEFAULT_HANDLER_TTL_MS);
   const key = handlerInstanceKey(cfg.prefix, cfg.schedulerId, cfg.scheduleId, cfg.instanceId);
   await redis.send("SADD", [handlerIndexKey(cfg.prefix, cfg.schedulerId, cfg.scheduleId), key]);
@@ -303,7 +341,7 @@ export const schedulerControlQueue = (
   scheduleId: string,
 ): Queue<SchedulerControlRequest> =>
   queue<SchedulerControlRequest>({
-    id: `${schedulerId}:${scheduleId}:manual`,
+    id: `${encodedIdentity(schedulerId)}:${encodedIdentity(scheduleId)}:manual`,
     prefix: `${prefix}:control`,
     delivery: { defaultLeaseMs: 30_000, maxDeliveries: Number.MAX_SAFE_INTEGER },
     limits: { maxMessageAgeMs: 5 * 60_000, dlqRetentionMs: 60_000 },
@@ -314,6 +352,29 @@ export const markSchedulerControlAccepted = async (
   request: SchedulerControlRequest,
 ): Promise<boolean> =>
   await writeBoundResponse(prefix, request, { status: "accepted", acceptedAt: Date.now() });
+
+export const markSchedulerControlPending = async (
+  prefix: string,
+  request: SchedulerControlRequest,
+  ttlMs = DEFAULT_RESPONSE_TTL_MS,
+): Promise<"pending" | "accepted" | "terminal" | null> => {
+  assertPositiveMs("ttlMs", ttlMs);
+  const result = Number(
+    await redis.send("EVAL", [
+      WRITE_PENDING_RESPONSE_SCRIPT,
+      "2",
+      requestKey(prefix, request.requestId),
+      responseKey(prefix, request.requestId),
+      requestTarget(request),
+      String(ttlMs),
+      JSON.stringify({ status: "pending", pendingAt: Date.now() }),
+    ]),
+  );
+  if (result === 3) return "terminal";
+  if (result === 2) return "accepted";
+  if (result === 1) return "pending";
+  return null;
+};
 
 export const markSchedulerControlNotFound = async (
   prefix: string,
@@ -333,19 +394,23 @@ export const refreshSchedulerControlRequestBinding = async (
   prefix: string,
   request: SchedulerControlRequest,
   ttlMs = DEFAULT_RESPONSE_TTL_MS,
-): Promise<boolean> =>
-  Number(
+): Promise<boolean> => {
+  assertPositiveMs("ttlMs", ttlMs);
+  return Number(
     await redis.send("EVAL", [
       REFRESH_REQUEST_SCRIPT,
-      "1",
+      "2",
       requestKey(prefix, request.requestId),
+      responseKey(prefix, request.requestId),
       requestTarget(request),
       String(ttlMs),
     ]),
   ) > 0;
+};
 
 export const schedulerControl = (config: SchedulerControlConfig = {}): SchedulerControl => {
   const prefix = config.prefix ?? DEFAULT_PREFIX;
+  assertPositiveMs("timeoutMs", config.timeoutMs);
   const defaultTimeoutMs = Math.max(1, config.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
   const list = async (): Promise<SchedulerControlInfo[]> => {
@@ -381,6 +446,7 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
     assertId("schedulerId", cfg.schedulerId);
     assertId("scheduleId", cfg.scheduleId);
 
+    assertPositiveMs("timeoutMs", cfg.timeoutMs);
     const timeoutMs = Math.max(1, cfg.timeoutMs ?? defaultTimeoutMs);
     const requestId = cfg.requestId ?? crypto.randomUUID();
     assertId("requestId", requestId);
@@ -392,30 +458,34 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
     // same request id.
     const existing = await readResponse(prefix, requestId);
     if (existing?.status === "accepted") return;
+    if (existing?.status === "not_found") throw new SchedulerControlNotFoundError(existing.error);
+    if (existing?.status === "unavailable") throw new SchedulerControlUnavailableError(existing.error);
 
-    const schedule = parseSchedule(await redis.get(scheduleKey(prefix, cfg.schedulerId, cfg.scheduleId)));
-    if (!schedule) {
-      throw new SchedulerControlNotFoundError(
-        `schedulerControl.runNow: schedule ${cfg.schedulerId}/${cfg.scheduleId} not found`,
-      );
+    if (existing?.status !== "pending") {
+      const schedule = parseSchedule(await redis.get(scheduleKey(prefix, cfg.schedulerId, cfg.scheduleId)));
+      if (!schedule) {
+        throw new SchedulerControlNotFoundError(
+          `schedulerControl.runNow: schedule ${cfg.schedulerId}/${cfg.scheduleId} not found`,
+        );
+      }
+
+      if (!(await hasLiveSchedulerControlHandler(prefix, cfg.schedulerId, cfg.scheduleId))) {
+        throw new SchedulerControlUnavailableError(
+          `schedulerControl.runNow: no live handler for schedule ${cfg.schedulerId}/${cfg.scheduleId}`,
+        );
+      }
+
+      await schedulerControlQueue(prefix, cfg.schedulerId, cfg.scheduleId).send({
+        data: {
+          requestId,
+          schedulerId: cfg.schedulerId,
+          scheduleId: cfg.scheduleId,
+          requestedAt: Date.now(),
+        },
+        idempotencyKey: requestId,
+        idempotencyTtlMs: requestTtlMs,
+      });
     }
-
-    if (!(await hasLiveSchedulerControlHandler(prefix, cfg.schedulerId, cfg.scheduleId))) {
-      throw new SchedulerControlUnavailableError(
-        `schedulerControl.runNow: no live handler for schedule ${cfg.schedulerId}/${cfg.scheduleId}`,
-      );
-    }
-
-    await schedulerControlQueue(prefix, cfg.schedulerId, cfg.scheduleId).send({
-      data: {
-        requestId,
-        schedulerId: cfg.schedulerId,
-        scheduleId: cfg.scheduleId,
-        requestedAt: Date.now(),
-      },
-      idempotencyKey: requestId,
-      idempotencyTtlMs: requestTtlMs,
-    });
 
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {

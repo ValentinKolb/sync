@@ -22,6 +22,18 @@ const MIN_HEARTBEAT_MS = 100;
 const normalizeMs = (value: number | undefined, fallback: number, minimum: number): number =>
   Math.max(minimum, Math.floor(value !== undefined && Number.isFinite(value) ? value : fallback));
 
+const assertPositiveMs = (name: string, value: number | undefined): void => {
+  if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+    throw new Error(`${name} must be a finite number greater than 0`);
+  }
+};
+
+const assertNonNegativeMs = (name: string, value: number | undefined): void => {
+  if (value !== undefined && (!Number.isFinite(value) || value < 0)) {
+    throw new Error(`${name} must be a finite non-negative number`);
+  }
+};
+
 // ==========================
 // Types
 // ==========================
@@ -188,6 +200,9 @@ const asInfo = (schedule: StoredSchedule): SchedulerInfo => ({
 // ==========================
 
 export const scheduler = (config: SchedulerConfig): Scheduler => {
+  assertPositiveMs("leader.leaseMs", config.leader?.leaseMs);
+  assertPositiveMs("leader.heartbeatMs", config.leader?.heartbeatMs);
+  assertPositiveMs("dispatch.tickMs", config.dispatch?.tickMs);
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const leaseMs = normalizeMs(config.leader?.leaseMs, DEFAULT_LEASE_MS, MIN_LEASE_MS);
   const heartbeatMs = Math.min(
@@ -437,6 +452,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       if (error) afterCtx.error = error;
       if (!error) afterCtx.data = result;
       afterCtx.reschedule = (rcfg?: { delayMs?: number }): void => {
+        assertNonNegativeMs("reschedule.delayMs", rcfg?.delayMs);
         rescheduleRequested = { delayMs: rcfg?.delayMs };
       };
       afterCtx.expBackoff = (bcfg?: BackoffOptions): number => expBackoff(failureCountBefore + 1, bcfg);
@@ -467,7 +483,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
       let traceRescheduled: { delayMs: number } | null = null;
       if (rescheduleRequested) {
-        const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
+        const delayMs = (rescheduleRequested as { delayMs?: number }).delayMs ?? 0;
         schedule.nextRunAt = Date.now() + delayMs;
         traceRescheduled = { delayMs };
       } else if (advanceCron) {
@@ -508,7 +524,6 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
   const dispatchSchedule = async (
     scheduleId: string,
-    handler: HandlerEntry,
     trigger: "cron" | "manual",
     options?: {
       onAcquired?: () => Promise<void> | void;
@@ -544,6 +559,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       try {
         const schedule = schedules.get(scheduleId);
         if (!schedule) throw new Error(`runNow: schedule ${scheduleId} not found`);
+        const handler = handlers.get(scheduleId);
+        if (!handler) throw new Error(`runNow: no current handler registered for schedule ${scheduleId}`);
         if (trigger === "cron" && (!currentLeaderLock || schedule.nextRunAt > Date.now())) return;
         if (
           generation !== dispatchGeneration
@@ -559,6 +576,12 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         await preparationHeartbeatTail;
         if (preparationLeaseLost || !(await dispatchMutex.extend(dispatchLock, leaseMs))) {
           throw new Error(`scheduler dispatch lease lost for ${scheduleId}`);
+        }
+        if (
+          generation !== dispatchGeneration
+          || (options?.shouldContinue && !options.shouldContinue())
+        ) {
+          throw new Error(`scheduler dispatch stopped for ${scheduleId}`);
         }
         await dispatchOne(schedule, handler, trigger, dispatchLock);
       } finally {
@@ -591,7 +614,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         return;
       }
 
-      await dispatchSchedule(schedule.id, handler, "cron");
+      await dispatchSchedule(schedule.id, "cron");
     }
   };
 
@@ -665,6 +688,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     }
 
     const created = !existing;
+    writePersistedState(stored);
     schedules.set(cfg.id, stored);
 
     handlers.set(cfg.id, {
@@ -687,7 +711,6 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       setBrowserSchedulerControlAvailable({ prefix, schedulerId: config.id, instanceId, available: true });
     }
 
-    writePersistedState(stored);
     await emitTrace(cfg.trace, {
       type: "scheduled",
       scheduleId: cfg.id,
@@ -713,10 +736,9 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const runNow = async (cfg: { id: string }, onAccepted?: () => void): Promise<void> => {
     const schedule = schedules.get(cfg.id);
     if (!schedule) throw new Error(`runNow: schedule ${cfg.id} not found`);
-    const handler = handlers.get(cfg.id);
-    if (!handler) throw new Error(`runNow: no handler registered for schedule ${cfg.id}`);
+    if (!handlers.has(cfg.id)) throw new Error(`runNow: no handler registered for schedule ${cfg.id}`);
 
-    await dispatchSchedule(cfg.id, handler, "manual", {
+    await dispatchSchedule(cfg.id, "manual", {
       onAcquired: onAccepted,
       ...(onAccepted ? { shouldContinue: () => running } : {}),
     });

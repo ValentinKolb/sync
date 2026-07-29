@@ -11,11 +11,14 @@ import {
 } from "../index";
 import {
   markSchedulerControlAccepted,
+  markSchedulerControlPending,
   refreshSchedulerControlRequestBinding,
+  schedulerControlQueue,
   type SchedulerControlRequest,
 } from "../src/scheduler-control";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+const encodedIdentity = (value: string): string => value.replaceAll("%", "%25").replaceAll(":", "%3A");
 
 const waitFor = async (pred: () => boolean | Promise<boolean>, timeoutMs = 5_000, pollMs = 20): Promise<void> => {
   const start = Date.now();
@@ -276,6 +279,26 @@ test("ctx.reschedule in after overrides cron advance", async () => {
 
   await waitFor(() => runs >= 2, 3_000);
   expect(runs).toBe(2);
+});
+
+test("non-finite reschedule delays cannot corrupt durable state", async () => {
+  const s = makeScheduler(uid("reschedule-invalid"));
+  await s.create({
+    id: "poll",
+    cron: "0 3 * * *",
+    process: async () => {},
+    after: async ({ ctx }) => {
+      ctx.reschedule({ delayMs: Number.NaN });
+    },
+  });
+  const before = await s.get({ id: "poll" });
+
+  await s.runNow({ id: "poll" });
+
+  const after = await s.get({ id: "poll" });
+  expect(after?.runNumber).toBe(1);
+  expect(after?.nextRunAt).toBe(before?.nextRunAt);
+  expect(Number.isFinite(after?.nextRunAt)).toBe(true);
 });
 
 test("ctx.reschedule on success triggers immediate re-run (polling pattern)", async () => {
@@ -924,6 +947,102 @@ test("schedulerControl executes one target for a repeated requestId", async () =
   ).rejects.toThrow("already bound to another schedule");
 });
 
+test("scheduler control queues keep colon-rich target identities distinct", async () => {
+  const prefix = `test:sched:${uid("control-identity")}`;
+  const first = schedulerControlQueue(prefix, "a:b", "c");
+  const second = schedulerControlQueue(prefix, "a", "b:c");
+
+  await first.send({
+    data: { requestId: "same", schedulerId: "a:b", scheduleId: "c", requestedAt: Date.now() },
+    idempotencyKey: "same",
+  });
+  await second.send({
+    data: { requestId: "same", schedulerId: "a", scheduleId: "b:c", requestedAt: Date.now() },
+    idempotencyKey: "same",
+  });
+
+  const firstMessage = await first.recv({ wait: false });
+  const secondMessage = await second.recv({ wait: false });
+  expect(firstMessage?.data.schedulerId).toBe("a:b");
+  expect(secondMessage?.data.schedulerId).toBe("a");
+  await firstMessage?.ack();
+  await secondMessage?.ack();
+});
+
+test("scheduler control request identities include the full prefix", async () => {
+  const root = `test:sched:${uid("request-prefix")}`;
+  const first = makeScheduler("first", { prefix: `${root}:control:request:child`, dispatch: { tickMs: 20 } });
+  const second = makeScheduler("second", { prefix: root, dispatch: { tickMs: 20 } });
+  let firstRuns = 0;
+  let secondRuns = 0;
+
+  await first.create({
+    id: "run",
+    cron: "0 3 * * *",
+    process: async () => {
+      firstRuns += 1;
+    },
+  });
+  await second.create({
+    id: "run",
+    cron: "0 3 * * *",
+    process: async () => {
+      secondRuns += 1;
+    },
+  });
+  first.start();
+  second.start();
+
+  await Promise.all([
+    schedulerControl({ prefix: `${root}:control:request:child` }).runNow({
+      schedulerId: "first",
+      scheduleId: "run",
+      requestId: "request",
+    }),
+    schedulerControl({ prefix: root }).runNow({
+      schedulerId: "second",
+      scheduleId: "run",
+      requestId: "child:control:request:request",
+    }),
+  ]);
+  await waitFor(() => firstRuns === 1 && secondRuns === 1);
+});
+
+test("scheduler rejects a control request whose payload targets another schedule", async () => {
+  const prefix = `test:sched:${uid("control-mismatch")}`;
+  const schedulerId = uid("control-local");
+  const sched = makeScheduler(schedulerId, { prefix, dispatch: { tickMs: 20 } });
+  let runs = 0;
+  await sched.create({
+    id: "local",
+    cron: "0 3 * * *",
+    process: async () => {
+      runs += 1;
+    },
+  });
+  sched.start();
+
+  const request: SchedulerControlRequest = {
+    requestId: uid("mismatch"),
+    schedulerId: "other",
+    scheduleId: "remote",
+    requestedAt: Date.now(),
+  };
+  await redis.set(
+    `${prefix}:control:request:${encodedIdentity(request.requestId)}`,
+    JSON.stringify([request.schedulerId, request.scheduleId]),
+  );
+  await schedulerControlQueue(prefix, schedulerId, "local").send({
+    data: request,
+    idempotencyKey: request.requestId,
+  });
+
+  const responseKey = `${prefix}:control:response:${encodedIdentity(request.requestId)}`;
+  await waitFor(async () => (await redis.get(responseKey)) !== null);
+  expect(JSON.parse((await redis.get(responseKey)) as string).status).toBe("unavailable");
+  expect(runs).toBe(0);
+});
+
 test("a stale control request cannot refresh or accept a rebound requestId", async () => {
   const prefix = `test:sched:${uid("control-rebound")}`;
   const requestId = uid("request");
@@ -939,8 +1058,8 @@ test("a stale control request cannot refresh or accept a rebound requestId", asy
     scheduleId: "new-schedule",
     requestedAt: Date.now(),
   };
-  const bindingKey = `${prefix}:control:request:${requestId}`;
-  const responseKey = `${prefix}:control:response:${requestId}`;
+  const bindingKey = `${prefix}:control:request:${encodedIdentity(requestId)}`;
+  const responseKey = `${prefix}:control:response:${encodedIdentity(requestId)}`;
   await redis.set(bindingKey, JSON.stringify([current.schedulerId, current.scheduleId]));
 
   expect(await refreshSchedulerControlRequestBinding(prefix, stale)).toBe(false);
@@ -948,8 +1067,41 @@ test("a stale control request cannot refresh or accept a rebound requestId", asy
   expect(await redis.get(responseKey)).toBeNull();
 
   expect(await refreshSchedulerControlRequestBinding(prefix, current)).toBe(true);
+  expect(await markSchedulerControlPending(prefix, current)).toBe("pending");
+  await redis.send("PEXPIRE", [responseKey, "20"]);
+  expect(await refreshSchedulerControlRequestBinding(prefix, current, 1_000)).toBe(true);
+  await Bun.sleep(40);
+  expect(JSON.parse((await redis.get(responseKey)) as string).status).toBe("pending");
+
   expect(await markSchedulerControlAccepted(prefix, current)).toBe(true);
   expect(JSON.parse((await redis.get(responseKey)) as string).status).toBe("accepted");
+
+  await redis.send("PEXPIRE", [responseKey, "20"]);
+  expect(await refreshSchedulerControlRequestBinding(prefix, current, 1_000)).toBe(true);
+  await Bun.sleep(40);
+  expect(JSON.parse((await redis.get(responseKey)) as string).status).toBe("accepted");
+});
+
+test("scheduler timing options reject non-finite values before use", async () => {
+  expect(() => scheduler({ id: uid("invalid-lease"), leader: { leaseMs: Number.NaN } })).toThrow(
+    "leader.leaseMs",
+  );
+  expect(() => scheduler({ id: uid("invalid-heartbeat"), leader: { heartbeatMs: Number.POSITIVE_INFINITY } }))
+    .toThrow("leader.heartbeatMs");
+  expect(() => scheduler({ id: uid("invalid-tick"), dispatch: { tickMs: Number.NaN } })).toThrow(
+    "dispatch.tickMs",
+  );
+  expect(() => schedulerControl({ timeoutMs: Number.NaN })).toThrow("timeoutMs");
+
+  const prefix = `test:sched:${uid("invalid-control-timeout")}`;
+  await expect(
+    schedulerControl({ prefix }).runNow({
+      schedulerId: "missing",
+      scheduleId: "missing",
+      timeoutMs: Number.POSITIVE_INFINITY,
+    }),
+  ).rejects.toThrow("timeoutMs");
+  expect(await redis.send("KEYS", [`${prefix}:*`])).toEqual([]);
 });
 
 test("schedule meta round-trips byte-equivalent JSON", async () => {
@@ -1032,7 +1184,7 @@ test("a repeatedly failing control dispatch is reported, not replayed forever", 
   // The control queue allows effectively unlimited deliveries, so an
   // unconditional nack replayed the user's callback about every 250ms for the
   // full five-minute message-age window.
-  expect(settled).toBeGreaterThanOrEqual(1);
+  expect(settled).toBeGreaterThanOrEqual(2);
   expect(settled).toBeLessThanOrEqual(3);
   expect(runs).toBe(settled);
 

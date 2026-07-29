@@ -1,6 +1,6 @@
 import { test, expect, afterEach } from "bun:test";
 import { scheduler, type Scheduler, type SchedulerTraceEvent } from "../src/scheduler";
-import { createMemoryStore } from "../src/store";
+import { createMemoryStore, type Store } from "../src/store";
 import {
   SchedulerControlNotFoundError,
   SchedulerControlTimeoutError,
@@ -80,6 +80,26 @@ test("create with invalid cron throws", async () => {
   await expect(
     s.create({ id: "x", cron: "not a cron", process: async () => {} }),
   ).rejects.toThrow();
+});
+
+test("scheduler timing options reject non-finite values before use", async () => {
+  expect(() => scheduler({ id: uid("invalid-lease"), leader: { leaseMs: Number.NaN } })).toThrow(
+    "leader.leaseMs",
+  );
+  expect(() => scheduler({ id: uid("invalid-heartbeat"), leader: { heartbeatMs: Number.POSITIVE_INFINITY } }))
+    .toThrow("leader.heartbeatMs");
+  expect(() => scheduler({ id: uid("invalid-tick"), dispatch: { tickMs: Number.NaN } })).toThrow(
+    "dispatch.tickMs",
+  );
+  expect(() => schedulerControl({ timeoutMs: Number.NaN })).toThrow("timeoutMs");
+
+  await expect(
+    schedulerControl({ prefix: uid("invalid-timeout") }).runNow({
+      schedulerId: "missing",
+      scheduleId: "missing",
+      timeoutMs: Number.POSITIVE_INFINITY,
+    }),
+  ).rejects.toThrow("timeoutMs");
 });
 
 test("delete removes schedule", async () => {
@@ -181,6 +201,26 @@ test("ctx.reschedule in after triggers re-run with delay", async () => {
   await s.runNow({ id: "r" });
   await waitFor(() => runs >= 2, 3_000);
   expect(runs).toBe(2);
+});
+
+test("non-finite reschedule delays cannot corrupt persisted state", async () => {
+  const s = makeScheduler(uid("reschedule-invalid"));
+  await s.create({
+    id: "poll",
+    cron: "0 3 * * *",
+    process: async () => {},
+    after: async ({ ctx }) => {
+      ctx.reschedule({ delayMs: Number.NaN });
+    },
+  });
+  const before = await s.get({ id: "poll" });
+
+  await s.runNow({ id: "poll" });
+
+  const after = await s.get({ id: "poll" });
+  expect(after?.runNumber).toBe(1);
+  expect(after?.nextRunAt).toBe(before?.nextRunAt);
+  expect(Number.isFinite(after?.nextRunAt)).toBe(true);
 });
 
 test("ctx.reschedule on success (polling pattern)", async () => {
@@ -549,6 +589,37 @@ test("schedulerControl lists schedules with meta and availability", async () => 
   expect(info?.state).toBe("available");
 });
 
+test("schedulerControl keeps colon-rich target identities distinct", async () => {
+  const prefix = uid("control-identity");
+  const first = makeScheduler("a:b", { prefix });
+  const second = makeScheduler("a", { prefix });
+  let firstRuns = 0;
+  let secondRuns = 0;
+
+  await first.create({
+    id: "c",
+    cron: "0 3 * * *",
+    process: async () => {
+      firstRuns += 1;
+    },
+  });
+  await second.create({
+    id: "b:c",
+    cron: "0 3 * * *",
+    process: async () => {
+      secondRuns += 1;
+    },
+  });
+  first.start();
+  second.start();
+
+  const control = schedulerControl({ prefix });
+  expect(await control.list()).toHaveLength(2);
+  await control.runNow({ schedulerId: "a:b", scheduleId: "c" });
+  await control.runNow({ schedulerId: "a", scheduleId: "b:c" });
+  await waitFor(() => firstRuns === 1 && secondRuns === 1);
+});
+
 test("schedulerControl runNow executes on a live scheduler and does not advance cron", async () => {
   const prefix = uid("control-run-prefix");
   const s = makeScheduler(uid("control-run"), { prefix });
@@ -794,6 +865,116 @@ test("schedulerControl executes one run for repeated requestId calls", async () 
   expect(runs).toBe(1);
 });
 
+test("schedulerControl request identities include the full prefix", async () => {
+  const root = uid("request-prefix");
+  const registrations = [
+    { prefix: `${root}:child`, schedulerId: "first", requestId: "request" },
+    { prefix: root, schedulerId: "second", requestId: "child:request" },
+  ];
+  const runs = [0, 0];
+
+  registrations.forEach((entry, index) => {
+    registerBrowserSchedulerControl({
+      prefix: entry.prefix,
+      schedulerId: entry.schedulerId,
+      scheduleId: "run",
+      instanceId: `instance-${index}`,
+      getInfo: () => ({
+        id: "run",
+        cron: "0 3 * * *",
+        tz: "UTC",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        nextRunAt: Date.now() + 60_000,
+        runNumber: 0,
+        failureCount: 0,
+      }),
+      runNow: async (onAccepted) => {
+        runs[index]! += 1;
+        onAccepted?.();
+      },
+    });
+    setBrowserSchedulerControlAvailable({
+      prefix: entry.prefix,
+      schedulerId: entry.schedulerId,
+      instanceId: `instance-${index}`,
+      available: true,
+    });
+  });
+
+  try {
+    await Promise.all(
+      registrations.map((entry) =>
+        schedulerControl({ prefix: entry.prefix }).runNow({
+          schedulerId: entry.schedulerId,
+          scheduleId: "run",
+          requestId: entry.requestId,
+        }),
+      ),
+    );
+    expect(runs).toEqual([1, 1]);
+  } finally {
+    registrations.forEach((entry, index) => {
+      unregisterBrowserSchedulerControl({
+        prefix: entry.prefix,
+        schedulerId: entry.schedulerId,
+        scheduleId: "run",
+        instanceId: `instance-${index}`,
+      });
+    });
+  }
+});
+
+test("schedulerControl retains an accepted request until its run settles", async () => {
+  const prefix = uid("request-lifetime");
+  const schedulerId = uid("request-lifetime-scheduler");
+  const instanceId = uid("request-lifetime-instance");
+  let runs = 0;
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const originalNow = Date.now;
+  let now = originalNow();
+
+  registerBrowserSchedulerControl({
+    prefix,
+    schedulerId,
+    scheduleId: "long",
+    instanceId,
+    getInfo: () => ({
+      id: "long",
+      cron: "0 3 * * *",
+      tz: "UTC",
+      createdAt: now,
+      updatedAt: now,
+      nextRunAt: now + 60_000,
+      runNumber: 0,
+      failureCount: 0,
+    }),
+    runNow: async (onAccepted) => {
+      runs += 1;
+      onAccepted?.();
+      await gate;
+    },
+  });
+  setBrowserSchedulerControlAvailable({ prefix, schedulerId, instanceId, available: true });
+
+  try {
+    Date.now = () => now;
+    const control = schedulerControl({ prefix });
+    const request = { schedulerId, scheduleId: "long", requestId: uid("long-request") };
+    await control.runNow(request);
+    now += 6 * 60_000;
+    await control.runNow(request);
+    expect(runs).toBe(1);
+  } finally {
+    Date.now = originalNow;
+    release();
+    unregisterBrowserSchedulerControl({ prefix, schedulerId, scheduleId: "long", instanceId });
+  }
+});
+
 test("schedulerControl binds a requestId to one schedule", async () => {
   const prefix = uid("control-target-prefix");
   const s = makeScheduler(uid("control-target"), { prefix });
@@ -824,6 +1005,31 @@ const seedPersistedState = async (
   store.set(`${prefix}:${schedulerId}:state:${scheduleId}`, state);
   return store;
 };
+
+test("a failed create persistence write does not publish schedule state or control registration", async () => {
+  const prefix = uid("persist-create-failure");
+  const backing = createMemoryStore();
+  const store: Store = {
+    get: (key) => backing.get(key),
+    set: () => {
+      throw new Error("storage unavailable");
+    },
+    del: (key) => backing.del(key),
+    keys: (keyPrefix) => backing.keys(keyPrefix),
+  };
+  const s = makeScheduler(uid("persist-create-failure-scheduler"), { prefix, store });
+
+  await expect(
+    s.create({
+      id: "report",
+      cron: "0 3 * * *",
+      process: async () => {},
+    }),
+  ).rejects.toThrow("storage unavailable");
+
+  expect(await s.get({ id: "report" })).toBeNull();
+  expect(await schedulerControl({ prefix }).list()).toEqual([]);
+});
 
 test("a persisted schedule does not resume a stale nextRunAt after the cron changes", async () => {
   const prefix = uid("persist-cron");
@@ -1085,6 +1291,92 @@ test("manual runs are serialized across default scheduler handles", async () => 
   expect(starts).toBe(2);
   expect(maxActive).toBe(1);
   expect((await first.get({ id: "serial" }))?.runNumber).toBe(2);
+});
+
+test("a dispatch waiting for the lock resolves the current handler", async () => {
+  const schedulerId = uid("fresh-handler");
+  const options = {
+    leader: { leaseMs: 500, heartbeatMs: 50 },
+    dispatch: { tickMs: 20 },
+  };
+  const holder = makeScheduler(schedulerId, options);
+  const waiting = makeScheduler(schedulerId, options);
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let holderStarted = false;
+  let oldRuns = 0;
+  let newRuns = 0;
+
+  await holder.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async () => {
+      holderStarted = true;
+      await gate;
+    },
+  });
+  await waiting.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async () => {
+      oldRuns += 1;
+    },
+  });
+
+  const heldRun = holder.runNow({ id: "report" });
+  await waitFor(() => holderStarted);
+  const queuedRun = waiting.runNow({ id: "report" });
+  await Bun.sleep(50);
+  await waiting.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async () => {
+      newRuns += 1;
+    },
+  });
+
+  release();
+  await Promise.all([heldRun.catch(() => {}), queuedRun]);
+  expect(oldRuns).toBe(0);
+  expect(newRuns).toBe(1);
+});
+
+test("stop during final dispatch preparation prevents the callback", async () => {
+  const prefix = uid("stop-preparation");
+  const backing = createMemoryStore();
+  let dispatchWrites = 0;
+  let stopPromise: Promise<void> | undefined;
+  let s: Scheduler;
+  const store: Store = {
+    get: (key) => backing.get(key),
+    set: (key, value, ttlMs) => {
+      backing.set(key, value, ttlMs);
+      if (key.includes(":dispatch:") && ++dispatchWrites === 3) {
+        stopPromise = s.stop();
+      }
+    },
+    del: (key) => backing.del(key),
+    keys: (keyPrefix) => backing.keys(keyPrefix),
+  };
+  s = makeScheduler(uid("stop-preparation-scheduler"), {
+    prefix,
+    store,
+    leader: { leaseMs: 500, heartbeatMs: 50 },
+  });
+  let ran = false;
+  await s.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async () => {
+      ran = true;
+    },
+  });
+
+  await expect(s.runNow({ id: "report" })).rejects.toThrow("scheduler dispatch stopped");
+  await stopPromise;
+  expect(ran).toBe(false);
 });
 
 test("losing the dispatch lease aborts the callback and rejects the run", async () => {

@@ -6,6 +6,7 @@ import { emitTrace, type TraceHandler } from "./trace";
 import {
   markSchedulerControlAccepted,
   markSchedulerControlNotFound,
+  markSchedulerControlPending,
   markSchedulerControlUnavailable,
   refreshSchedulerControlRequestBinding,
   refreshSchedulerControlHandler,
@@ -28,6 +29,18 @@ const MIN_HEARTBEAT_MS = 100;
 
 const normalizeMs = (value: number | undefined, fallback: number, minimum: number): number =>
   Math.max(minimum, Math.floor(value !== undefined && Number.isFinite(value) ? value : fallback));
+
+const assertPositiveMs = (name: string, value: number | undefined): void => {
+  if (value !== undefined && (!Number.isFinite(value) || value <= 0)) {
+    throw new Error(`${name} must be a finite number greater than 0`);
+  }
+};
+
+const assertNonNegativeMs = (name: string, value: number | undefined): void => {
+  if (value !== undefined && (!Number.isFinite(value) || value < 0)) {
+    throw new Error(`${name} must be a finite non-negative number`);
+  }
+};
 
 // Upsert: creates or updates the schedule record. Preserves runNumber always;
 // preserves nextRunAt/failureCount iff cron/tz unchanged.
@@ -313,6 +326,9 @@ const asInfo = (schedule: StoredSchedule): SchedulerInfo => ({
 // ==========================
 
 export const scheduler = (config: SchedulerConfig): Scheduler => {
+  assertPositiveMs("leader.leaseMs", config.leader?.leaseMs);
+  assertPositiveMs("leader.heartbeatMs", config.leader?.heartbeatMs);
+  assertPositiveMs("dispatch.tickMs", config.dispatch?.tickMs);
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const leaseMs = normalizeMs(config.leader?.leaseMs, DEFAULT_LEASE_MS, MIN_LEASE_MS);
   const heartbeatMs = Math.min(
@@ -575,6 +591,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       if (error) afterCtx.error = error;
       if (!error) afterCtx.data = result;
       afterCtx.reschedule = (rcfg?: { delayMs?: number }): void => {
+        assertNonNegativeMs("reschedule.delayMs", rcfg?.delayMs);
         rescheduleRequested = { delayMs: rcfg?.delayMs };
       };
       afterCtx.expBackoff = (bcfg?: BackoffOptions): number => expBackoff(failureCountBefore + 1, bcfg);
@@ -605,7 +622,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
       let traceRescheduled: { delayMs: number } | null = null;
       if (rescheduleRequested) {
-        const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
+        const delayMs = (rescheduleRequested as { delayMs?: number }).delayMs ?? 0;
         schedule.nextRunAt = Date.now() + delayMs;
         traceRescheduled = { delayMs };
       } else if (advanceCron) {
@@ -642,7 +659,6 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
   const dispatchSchedule = async (
     scheduleId: string,
-    handler: HandlerEntry,
     trigger: "cron" | "manual",
     options?: {
       onAcquired?: () => Promise<void> | void;
@@ -678,6 +694,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       try {
         const schedule = parseSchedule(await redis.get(scheduleKey(scheduleId)));
         if (!schedule) throw new Error(`runNow: schedule ${scheduleId} not found`);
+        const handler = handlers.get(scheduleId);
+        if (!handler) throw new Error(`runNow: no current handler registered for schedule ${scheduleId} on this pod`);
         if (trigger === "cron" && (!currentLeaderLock || schedule.nextRunAt > Date.now())) return;
         if (
           generation !== dispatchGeneration
@@ -693,6 +711,12 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         await preparationHeartbeatTail;
         if (preparationLeaseLost || !(await dispatchMutex.extend(dispatchLock, leaseMs))) {
           throw new Error(`scheduler dispatch lease lost for ${scheduleId}`);
+        }
+        if (
+          generation !== dispatchGeneration
+          || (options?.shouldContinue && !options.shouldContinue())
+        ) {
+          throw new Error(`scheduler dispatch stopped for ${scheduleId}`);
         }
         await dispatchOne(schedule, handler, trigger, dispatchLock);
       } finally {
@@ -742,12 +766,12 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         return;
       }
 
-      await dispatchSchedule(scheduleId, handler, "cron");
+      await dispatchSchedule(scheduleId, "cron");
     }
   };
 
   const refreshControlHandlers = async (): Promise<void> => {
-    await Promise.all(
+    const results = await Promise.allSettled(
       Array.from(handlers.keys()).map((scheduleId) =>
         refreshSchedulerControlHandler({
           prefix,
@@ -758,6 +782,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         }),
       ),
     );
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failed) throw failed.reason;
   };
 
   const removeControlHandlers = async (): Promise<void> => {
@@ -776,7 +802,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const dispatchControlRequests = async (): Promise<void> => {
     let dispatched = 0;
     const controlLeaseMs = 30_000;
-    for (const [scheduleId, handler] of handlers) {
+    for (const scheduleId of handlers.keys()) {
       if (dispatched >= batchSize) break;
       const message = await controlQueueForSchedule(scheduleId).recv({
         wait: false,
@@ -786,7 +812,29 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       if (!message) continue;
 
       const request: SchedulerControlRequest = message.data;
+      if (request.schedulerId !== config.id || request.scheduleId !== scheduleId) {
+        await markSchedulerControlUnavailable(
+          prefix,
+          request,
+          `schedulerControl.runNow: request target does not match ${config.id}/${scheduleId}`,
+        );
+        await message.ack();
+        dispatched += 1;
+        continue;
+      }
       if (!(await refreshSchedulerControlRequestBinding(prefix, request))) {
+        await message.ack();
+        dispatched += 1;
+        continue;
+      }
+      const pending = await markSchedulerControlPending(prefix, request);
+      // A first-delivery message for an already accepted request is a duplicate
+      // enqueue. Higher attempts are the original message's transport retry.
+      if (
+        pending === "terminal"
+        || pending === null
+        || (pending === "accepted" && message.attempt === 1)
+      ) {
         await message.ack();
         dispatched += 1;
         continue;
@@ -822,7 +870,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         void refreshSchedulerControlRequestBinding(prefix, request).catch(() => {});
       }, Math.floor(controlLeaseMs / 3));
       try {
-        await dispatchSchedule(scheduleId, handler, "manual", {
+        await dispatchSchedule(scheduleId, "manual", {
           onAcquired: async () => {
             if (!(await markSchedulerControlAccepted(prefix, request))) {
               throw new Error(`schedulerControl.runNow: stale request ${request.requestId}`);
@@ -982,15 +1030,14 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     const raw = await redis.get(scheduleKey(cfg.id));
     const schedule = parseSchedule(raw);
     if (!schedule) throw new Error(`runNow: schedule ${cfg.id} not found`);
-    const handler = handlers.get(cfg.id);
-    if (!handler) throw new Error(`runNow: no handler registered for schedule ${cfg.id} on this pod`);
+    if (!handlers.has(cfg.id)) throw new Error(`runNow: no handler registered for schedule ${cfg.id} on this pod`);
 
     // `runNow` does not advance cron — regular schedule continues as before,
     // unless user explicitly calls ctx.reschedule in after. Serialising it
     // against tick dispatch is what keeps that promise: an unsynchronised
     // read-modify-write let a manual run persist a stale snapshot and rewind
     // nextRunAt, making the slot immediately due again.
-    await dispatchSchedule(cfg.id, handler, "manual");
+    await dispatchSchedule(cfg.id, "manual");
   };
 
   const get = async (cfg: { id: string }): Promise<SchedulerInfo | null> => {
