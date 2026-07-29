@@ -46,6 +46,8 @@ const CLAIM_KEY_SCRIPT = `
     if type(record.payloadJson) == "string" and record.payloadJson ~= "" then
       -- Every contender retries the exact payload captured by the first claim.
       -- The work queue's jobId idempotency key makes concurrent sends harmless.
+      record.claimedAt = now
+      redis.call("SET", idemKey, cjson.encode(record), "PX", tostring(ttlMs))
       return { record.jobId, 1, record.payloadJson }
     end
     if (now - (tonumber(record.claimedAt) or 0)) <= graceMs then
@@ -77,7 +79,16 @@ const CLAIM_KEY_SCRIPT = `
 // Mark the claim as backed by a real queue message, and refresh its TTL.
 const MARK_ENQUEUED_SCRIPT = `
   local existing = redis.call("GET", KEYS[1])
-  if not existing then return 0 end
+  if not existing then
+    redis.call(
+      "SET",
+      KEYS[1],
+      cjson.encode({ jobId = ARGV[1], enqueued = true, claimedAt = tonumber(ARGV[3]) }),
+      "PX",
+      tostring(ARGV[2])
+    )
+    return 1
+  end
   local ok, record = pcall(cjson.decode, existing)
   if not ok or type(record) ~= "table" or record.jobId ~= ARGV[1] then return 0 end
   if record.enqueued then
@@ -280,17 +291,15 @@ export const job = <Input = void, Result = unknown>(
     return Number(result) > 0;
   };
 
-  const refreshKey = async (key: string, jobId: JobId, keyTtlMs: number): Promise<void> => {
-    try {
-      await extendKey(key, jobId, keyTtlMs);
-    } catch {
-      // best effort — a missed refresh only shortens the dedup window
-    }
-  };
-
-  const markEnqueued = async (key: string, jobId: JobId, keyTtlMs: number): Promise<boolean> => {
-    const result = await evalKeyScript(MARK_ENQUEUED_SCRIPT, key, [jobId, String(keyTtlMs)]);
-    return Number(result) === 1;
+  const markEnqueued = async (
+    key: string,
+    jobId: JobId,
+    keyTtlMs: number,
+  ): Promise<"new" | "existing" | "lost"> => {
+    const result = await evalKeyScript(MARK_ENQUEUED_SCRIPT, key, [jobId, String(keyTtlMs), String(Date.now())]);
+    if (Number(result) === 1) return "new";
+    if (Number(result) === 2) return "existing";
+    return "lost";
   };
 
   const claimKey = async (
@@ -364,6 +373,7 @@ export const job = <Input = void, Result = unknown>(
             const startedAt = Date.now();
             const jobAc = new AbortController();
             let leaseLost = false;
+            let claimLost = false;
             activeJobAc = jobAc;
 
             try {
@@ -375,8 +385,22 @@ export const job = <Input = void, Result = unknown>(
                   jobAc.abort();
                   return false;
                 }
-                // A job that outlives keyTtlMs must not lose its dedup claim.
-                await refreshKey(payload.key, payload.jobId, payload.keyTtlMs);
+                // A job may run only while it still owns the idempotency claim.
+                // Transport uncertainty aborts this attempt; a false result
+                // means a newer submit owns the key and this delivery is stale.
+                let ownsClaim: boolean;
+                try {
+                  ownsClaim = await extendKey(payload.key, payload.jobId, payload.keyTtlMs);
+                } catch (error) {
+                  leaseLost = true;
+                  jobAc.abort();
+                  throw error;
+                }
+                if (!ownsClaim) {
+                  claimLost = true;
+                  jobAc.abort();
+                  return false;
+                }
                 return true;
               };
               const canceled = (): boolean => ac.signal.aborted || leaseLost || jobAc.signal.aborted;
@@ -515,6 +539,13 @@ export const job = <Input = void, Result = unknown>(
                 durationMs: Date.now() - startedAt,
               });
             } finally {
+              if (claimLost) {
+                try {
+                  await message.ack();
+                } catch {
+                  // A lost queue connection leaves the stale delivery to expire.
+                }
+              }
               // Ordinary completion keeps the signal live through after().
               // Only clear the controller if this attempt still owns the slot.
               if (activeJobAc === jobAc) activeJobAc = null;
@@ -595,9 +626,12 @@ export const job = <Input = void, Result = unknown>(
     // Only now is the claim genuinely backed by queued work. A crash before
     // this point leaves the claim pending; a later submit retries the enqueue,
     // while the queue's jobId key prevents a successful send from duplicating.
-    const newlyEnqueued = await markEnqueued(cfg.key, claim.jobId, pending.idempotencyTtlMs);
+    const enqueueState = await markEnqueued(cfg.key, claim.jobId, pending.idempotencyTtlMs);
+    if (enqueueState === "lost") {
+      throw new Error(`job submit lost idempotency claim for key ${cfg.key}`);
+    }
 
-    if (newlyEnqueued) {
+    if (enqueueState === "new") {
       const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
       await emitTrace(config.trace, {
         type: "submitted",

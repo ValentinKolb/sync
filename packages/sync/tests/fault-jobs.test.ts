@@ -534,7 +534,78 @@ test("an immediate retry re-enqueues a transport failure that happened before th
   j.stop();
 });
 
-test("a stale terminal release cannot delete a claim a later submit took over", async () => {
+test("a retry near claim expiry cannot accept stale work under a newer claim", async () => {
+  const id = uid("expiring-send-retry");
+  const targetSeqKey = `sync:job:queue:default:${id}:work:seq`;
+  const seen: number[] = [];
+  let releaseCurrent = (): void => {};
+  const currentGate = new Promise<void>((resolve) => {
+    releaseCurrent = resolve;
+  });
+  const j = job<{ value: number }>({
+    id,
+    process: async ({ ctx }) => {
+      seen.push(ctx.input.value);
+      if (ctx.input.value === 2) await currentGate;
+    },
+  });
+  const originalSend = redis.send.bind(redis);
+  let failFirst = true;
+  redis.send = (async (command, args) => {
+    if (failFirst && command === "EVAL" && args.includes(targetSeqKey)) {
+      failFirst = false;
+      const error = new Error("connection refused before write") as Error & { code: string };
+      error.code = "ECONNREFUSED";
+      throw error;
+    }
+    return await originalSend(command, args);
+  }) as typeof redis.send;
+  try {
+    await expect(
+      j.submit({ key: "orders/expiring", input: { value: 1 }, keyTtlMs: 1_000 }),
+    ).rejects.toThrow("connection refused before write");
+  } finally {
+    redis.send = originalSend as typeof redis.send;
+  }
+
+  let releaseSend = (): void => {};
+  const sendGate = new Promise<void>((resolve) => {
+    releaseSend = resolve;
+  });
+  let retrySendStarted = false;
+  redis.send = (async (command, args) => {
+    if (!retrySendStarted && command === "EVAL" && args.includes(targetSeqKey)) {
+      retrySendStarted = true;
+      await sendGate;
+    }
+    return await originalSend(command, args);
+  }) as typeof redis.send;
+
+  try {
+    const staleRetry = j.submit({ key: "orders/expiring", input: { value: 99 }, keyTtlMs: 1_000 });
+    await waitFor(() => retrySendStarted);
+    await Bun.sleep(1_100);
+    const currentJobId = await j.submit({
+      key: "orders/expiring",
+      input: { value: 2 },
+      keyTtlMs: 1_000,
+    });
+    expect(currentJobId).toBe("2");
+    releaseSend();
+    await expect(staleRetry).rejects.toThrow("lost idempotency claim");
+  } finally {
+    releaseSend();
+    releaseCurrent();
+    redis.send = originalSend as typeof redis.send;
+  }
+
+  await waitFor(() => seen.length === 1);
+  await Bun.sleep(100);
+  expect(seen).toEqual([2]);
+  j.stop();
+});
+
+test("a stale attempt cannot delete a claim a later submit took over", async () => {
   const id = uid("stale-release");
   let started = false;
   let release: (() => void) | undefined;
@@ -556,12 +627,14 @@ test("a stale terminal release cannot delete a claim a later submit took over", 
   // A later submit takes the key over under a different jobId.
   await redis.send("SET", [idemKey, JSON.stringify({ jobId: "999", enqueued: true, claimedAt: Date.now() })]);
 
-  // The first job's terminal release must be a no-op against the new owner.
+  // The first job is fenced before terminal completion and must not touch the
+  // new owner or report a successful dispatch.
   release?.();
-  await waitFor(() => j.metric().dispatches === 1);
+  await Bun.sleep(100);
   const stillThere = await redis.send("GET", [idemKey]);
   expect(stillThere).not.toBeNull();
   expect(JSON.parse(stillThere as string).jobId).toBe("999");
+  expect(j.metric().dispatches).toBe(0);
   j.stop();
 });
 
