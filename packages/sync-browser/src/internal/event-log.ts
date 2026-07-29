@@ -27,7 +27,12 @@ export class EventLog {
   private retentionMs: number;
 
   constructor(config: EventLogConfig = {}) {
-    this.maxLen = config.maxLen ?? 50_000;
+    // No implicit count cap. topic constructed this without a maxLen and the
+    // 50 000 default applied silently, so a high-throughput browser topic
+    // dropped events inside its own stated retentionMs window while the server
+    // trims by MINID only. Callers that genuinely want a count bound — ephemeral
+    // does, via its documented eventMaxLen — pass one.
+    this.maxLen = config.maxLen ?? Number.POSITIVE_INFINITY;
     this.retentionMs = config.retentionMs ?? 5 * 60 * 1000;
   }
 

@@ -4,6 +4,7 @@ import {
   EphemeralCapacityError,
   EphemeralPayloadTooLargeError,
 } from "../src/ephemeral";
+import { sharedState } from "../src/internal/shared-state";
 
 // ==========================
 // Helpers
@@ -560,4 +561,48 @@ describe("createdAt", () => {
     const snap = await store.snapshot();
     expect(snap.entries[0]?.createdAt).toBe(entry.createdAt);
   });
+});
+
+// ==========================
+// Lazy expiry and reader anchoring
+// ==========================
+
+test("reads and writes do not see entries whose ttl has passed", async () => {
+  const id = `sweep-${Date.now()}`;
+  const store = makeStore({ id, ttlMs: 60_000 });
+
+  await store.upsert({ key: "user:1", value: { status: "online" } });
+  await store.upsert({ key: "user:2", value: { status: "online" } });
+
+  // Browsers clamp and defer setTimeout in a background tab — a one-second
+  // floor, and minutes under intensive throttling or bfcache — so the deadline
+  // passes while the timer has not fired. Reproduce exactly that: move the
+  // deadline into the past without touching the pending timer.
+  const states = sharedState(`ephemeral:${id}`, undefined, () => new Map()) as Map<
+    string,
+    { entries: Map<string, { expiresAt: number }> }
+  >;
+  states.get("default")!.entries.get("user:1")!.expiresAt = Date.now() - 1;
+
+  const snap = await store.snapshot({});
+  expect(snap.entries.map((e) => e.key)).toEqual(["user:2"]);
+
+  // touch() on a logically dead key must not resurrect it; the server returns
+  // ok:false here.
+  expect((await store.touch({ key: "user:1" })).ok).toBe(false);
+});
+
+test("a reader anchors at its first recv, not at construction", async () => {
+  const store = makeStore({ id: `anchor-${Date.now()}`, ttlMs: 60_000 });
+
+  const reader = store.reader();
+  await store.upsert({ key: "after-construction", value: { status: "online" } });
+
+  // The server anchors lazily, so this upsert is *not* delivered.
+  expect(await reader.recv({ wait: false })).toBeNull();
+
+  await store.upsert({ key: "after-first-recv", value: { status: "away" } });
+  const event = await reader.recv({ wait: false });
+  expect(event?.type).toBe("upsert");
+  if (event?.type === "upsert") expect(event.entry.key).toBe("after-first-recv");
 });

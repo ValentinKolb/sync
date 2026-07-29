@@ -186,6 +186,37 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     return state;
   };
 
+  /**
+   * Expire everything already past its deadline, appending the same `expire`
+   * events the timer would have.
+   *
+   * Expiry used to happen only via setTimeout, and no read path checked
+   * expiresAt at all. Browsers clamp and defer timers in background tabs — a
+   * one-second floor, and minutes of deferral under intensive throttling or
+   * bfcache — so a hidden tab kept returning expired members from snapshot(),
+   * and touch() on a logically dead key returned ok and resurrected it where
+   * the server returns ok:false. The server reconciles before every read and
+   * write; this is that reconcile. Timers stay as the low-latency path.
+   */
+  const sweep = (state: TenantState<TData>): void => {
+    const now = Date.now();
+    for (const [logicalKey, entry] of [...state.entries]) {
+      if (entry.expiresAt > now) continue;
+      state.entries.delete(logicalKey);
+      const timer = state.timers.get(logicalKey);
+      if (timer) {
+        clearTimeout(timer);
+        state.timers.delete(logicalKey);
+      }
+      state.eventLog.append({
+        type: "expire",
+        key: logicalKey,
+        version: String(++state.seq),
+        expiredAt: now,
+      });
+    }
+  };
+
   const scheduleExpiry = (state: TenantState<TData>, logicalKey: string, ttlMs: number): void => {
     // Clear existing timer
     const existing = state.timers.get(logicalKey);
@@ -216,9 +247,11 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
   // ==========================
 
   const upsert = async (cfg: EphemeralUpsertConfig<TData>): Promise<EphemeralEntry<TData>> => {
+    // Reconcile expirations first, as the server does before every read/write.
     assertLogicalKey(cfg.key);
     const tenantId = resolveTenant(cfg.tenantId);
     const state = getTenantState(tenantId);
+    sweep(state);
 
     const ttlMs = cfg.ttlMs ?? config.ttlMs;
     if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
@@ -281,9 +314,11 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
   // ==========================
 
   const touch = async (cfg: EphemeralTouchConfig): Promise<{ ok: boolean; version?: string; expiresAt?: number }> => {
+    // Reconcile expirations first, as the server does before every read/write.
     assertLogicalKey(cfg.key);
     const tenantId = resolveTenant(cfg.tenantId);
     const state = getTenantState(tenantId);
+    sweep(state);
 
     const existing = state.entries.get(cfg.key);
     if (!existing) return { ok: false };
@@ -318,9 +353,11 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
   // ==========================
 
   const remove = async (cfg: EphemeralRemoveConfig): Promise<boolean> => {
+    // Reconcile expirations first, as the server does before every read/write.
     assertLogicalKey(cfg.key);
     const tenantId = resolveTenant(cfg.tenantId);
     const state = getTenantState(tenantId);
+    sweep(state);
 
     const existing = state.entries.get(cfg.key);
     if (!existing) return false;
@@ -353,8 +390,10 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
   // ==========================
 
   const snapshot = async (cfg: { tenantId?: string; prefix?: string } = {}): Promise<EphemeralSnapshot<TData>> => {
+    // Reconcile expirations first, as the server does before every read/write.
     const tenantId = resolveTenant(cfg.tenantId);
     const state = getTenantState(tenantId);
+    sweep(state);
     const prefix = cfg.prefix;
 
     const entries: EphemeralEntry<TData>[] = [];
@@ -394,21 +433,33 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       return event.key.startsWith(prefix);
     };
 
-    let cursor = readerCfg.after ?? state.eventLog.latest();
+    // Anchored lazily at the first recv(), matching the server. Anchoring at
+    // construction meant `const r = store.reader(); await store.upsert(...);
+    // await r.recv()` delivered the upsert here and skipped it there.
+    let cursor = readerCfg.after ?? null;
     let overflowPending: EphemeralEvent<TData> | null = null;
     let replayChecked = false;
+
+    const anchor = (): string => {
+      if (cursor === null) cursor = state.eventLog.latest();
+      return cursor;
+    };
 
     const checkReplayGap = (): void => {
       if (replayChecked) return;
       replayChecked = true;
 
       const after = readerCfg.after;
-      if (!after || after === "0") return;
+      if (!after) return;
 
       const earliest = state.eventLog.earliest();
       if (!earliest) return;
 
-      if (!state.eventLog.has(after) && Number(after) < Number(earliest)) {
+      // "0" and the documented "0-0" both mean "replay everything", which is an
+      // overflow whenever the log has already been trimmed. Number("0-0") is
+      // NaN, so the old comparison silently read from the beginning instead.
+      const replayAll = after === "0" || after === "0-0";
+      if (replayAll ? Number(earliest) > 1 : !state.eventLog.has(after) && Number(after) < Number(earliest)) {
         const liveCursor = state.eventLog.latest();
         overflowPending = {
           type: "overflow",
@@ -488,6 +539,8 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     };
 
     const recv = async (cfg: EphemeralRecvConfig = {}): Promise<EphemeralEvent<TData> | null> => {
+      anchor();
+      sweep(state);
       checkReplayGap();
 
       if (overflowPending) {
@@ -502,7 +555,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       // Loop to skip prefix-mismatched events. One pass if no prefix configured.
       while (true) {
         // Try buffered entries first
-        const entries = state.eventLog.range(cursor, 1);
+        const entries = state.eventLog.range(anchor(), 1);
         if (entries.length > 0) {
           cursor = entries[0]!.id;
           const parsed = parseEvent(entries[0]!);
@@ -520,7 +573,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
 
         let got: EphemeralEvent<TData> | null = null;
         try {
-          for await (const entry of state.eventLog.subscribe(cursor, ac.signal)) {
+          for await (const entry of state.eventLog.subscribe(anchor(), ac.signal)) {
             cursor = entry.id;
             const parsed = parseEvent(entry);
             if (!parsed) continue;
