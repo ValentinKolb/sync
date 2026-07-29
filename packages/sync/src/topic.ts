@@ -301,7 +301,12 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       throw new Error(`payload exceeds limit (${maxPayloadBytes} bytes)`);
     }
 
-    const trimMinId = `${Date.now() - retentionMs}-0`;
+    // Clamp: a retention larger than the current epoch produced a negative
+    // stream id, which Redis rejects — and the trim runs after the XADD in the
+    // same script, so the event was written but pub() threw and the caller's
+    // retry duplicated it. At 0 the trim is skipped entirely.
+    const trimFrom = Math.floor(Date.now() - retentionMs);
+    const trimMinId = trimFrom > 0 ? `${trimFrom}-0` : "";
 
     const rawId = await evalScript(
       PUB_SCRIPT,

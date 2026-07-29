@@ -626,3 +626,20 @@ test("latestCursor does not consume reader messages", async () => {
   expect(message?.data.value).toBe(42);
   expect(await message?.commit()).toBe(true);
 });
+
+test("a topic retention longer than the epoch does not break pub", async () => {
+  const t = topic<{ v: number }>({
+    id: `retention-clamp-${Date.now()}`,
+    prefix: "test:topic",
+    retentionMs: 100 * 365 * 24 * 60 * 60 * 1000, // ~100 years
+  });
+
+  // XTRIM ran after the XADD in the same script, so a negative MINID meant the
+  // event was written and pub() still threw — and the caller's retry duplicated it.
+  const { eventId } = await t.pub({ data: { v: 1 } });
+  expect(eventId).toBeTruthy();
+
+  const reader = t.reader("clamp");
+  const message = await reader.recv({ wait: false });
+  expect(message?.data).toEqual({ v: 1 });
+});

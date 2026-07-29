@@ -18,7 +18,8 @@ const textEncoder = new TextEncoder();
 
 const UPSERT_SCRIPT = `
   local now = tonumber(ARGV[1])
-  local ttlMs = tonumber(ARGV[2])
+  local ttlMsRaw = ARGV[2]
+  local ttlMs = tonumber(ttlMsRaw)
   local dataRaw = ARGV[3]
   local logicalKey = ARGV[4]
   local maxEntries = tonumber(ARGV[5])
@@ -35,7 +36,12 @@ const UPSERT_SCRIPT = `
     end
   end
 
-  local decodeOk, data = pcall(cjson.decode, dataRaw)
+  -- Validate only. The decoded value is deliberately discarded: cjson turns an
+  -- empty array into an empty object and loses precision past 14 significant
+  -- digits, so the caller's bytes are stored verbatim as dataJson instead.
+  -- That also makes the snapshot path agree with the change stream, which has
+  -- always carried the pristine string.
+  local decodeOk = pcall(cjson.decode, dataRaw)
   if not decodeOk then
     return "__ERR_PAYLOAD__"
   end
@@ -54,8 +60,9 @@ const UPSERT_SCRIPT = `
   local expiresAt = now + ttlMs
 
   local entry = {
+    v = 2,
     key = logicalKey,
-    data = data,
+    dataJson = dataRaw,
     version = version,
     createdAt = createdAt,
     updatedAt = updatedAt,
@@ -65,7 +72,7 @@ const UPSERT_SCRIPT = `
   local encoded = cjson.encode(entry)
   redis.call("HSET", KEYS[2], logicalKey, encoded)
   redis.call("ZADD", KEYS[3], tostring(expiresAt), logicalKey)
-  redis.call("SET", ttlKey, "1", "PX", tostring(ttlMs))
+  redis.call("SET", ttlKey, "1", "PX", ttlMsRaw)
 
   redis.call(
     "XADD",
@@ -99,7 +106,8 @@ const UPSERT_SCRIPT = `
 
 const TOUCH_SCRIPT = `
   local now = tonumber(ARGV[1])
-  local ttlMs = tonumber(ARGV[2])
+  local ttlMsRaw = ARGV[2]
+  local ttlMs = tonumber(ttlMsRaw)
   local logicalKey = ARGV[3]
   local trimMinId = ARGV[4]
   local maxEventLen = tonumber(ARGV[5])
@@ -122,13 +130,20 @@ const TOUCH_SCRIPT = `
   local version = tostring(redis.call("INCR", KEYS[1]))
   local expiresAt = now + ttlMs
 
+  -- Upgrade a <= 5.8.0 record (decoded data field) on first touch, then patch only
+  -- the metadata so the payload string is copied, never re-encoded.
+  if existing.dataJson == nil then
+    existing.dataJson = existing.data ~= nil and cjson.encode(existing.data) or nil
+    existing.data = nil
+    existing.v = 2
+  end
   existing.version = version
   existing.updatedAt = now
   existing.expiresAt = expiresAt
 
   redis.call("HSET", KEYS[2], logicalKey, cjson.encode(existing))
   redis.call("ZADD", KEYS[3], tostring(expiresAt), logicalKey)
-  redis.call("SET", ttlKey, "1", "PX", tostring(ttlMs))
+  redis.call("SET", ttlKey, "1", "PX", ttlMsRaw)
 
   redis.call(
     "XADD",
@@ -407,9 +422,16 @@ type EphemeralKeys = {
   events: string;
 };
 
+/**
+ * Stored entry, version 2. `dataJson` holds the caller's value as the opaque
+ * string they sent, so Lua never re-encodes it. Records written by <= 5.8.0
+ * carry a decoded `data` instead and are read through the same parser.
+ */
 type StoredEntry<T> = {
+  v?: 2;
   key: string;
-  data: T;
+  data?: T;
+  dataJson?: string;
   version: string;
   createdAt: number;
   updatedAt: number;
@@ -438,12 +460,21 @@ const assertLogicalKey = (value: string): void => {
   if (bytes > MAX_KEY_BYTES) throw new Error(`key exceeds max length (${MAX_KEY_BYTES} bytes)`);
 };
 
+/**
+ * Redis takes PX as an integer. A fractional value, or one large enough that a
+ * round-trip through Lua renders it in exponential form, is rejected at the
+ * command level and surfaces as an opaque argument error.
+ */
+const assertTtlMs = (ttlMs: number): void => {
+  if (!Number.isInteger(ttlMs) || ttlMs <= 0 || ttlMs > Number.MAX_SAFE_INTEGER) {
+    throw new Error("ttlMs must be a positive integer number of milliseconds");
+  }
+};
+
 export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
   type TData = T;
 
-  if (!Number.isFinite(config.ttlMs) || config.ttlMs <= 0) {
-    throw new Error("ttlMs must be > 0");
-  }
+  assertTtlMs(config.ttlMs);
   assertIdentifier(config.id, "config.id");
 
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
@@ -470,7 +501,13 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     };
   };
 
-  const trimMinId = (): string => `${Date.now() - eventRetentionMs}-0`;
+  // Clamped and floored: a retention larger than the current epoch yields a
+  // negative stream id that Redis rejects, and the trim runs after the XADD in
+  // the same script, so the event landed but the call threw. Empty skips it.
+  const trimMinId = (): string => {
+    const trimFrom = Math.floor(Date.now() - eventRetentionMs);
+    return trimFrom > 0 ? `${trimFrom}-0` : "";
+  };
 
   const parseStoredEntry = (raw: string): EphemeralEntry<TData> | null => {
     try {
@@ -480,7 +517,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       const createdAt = Number.isFinite(Number(parsed.createdAt)) ? Number(parsed.createdAt) : updatedAt;
       return {
         key: parsed.key,
-        value: parsed.data,
+        value: (parsed.dataJson !== undefined ? (JSON.parse(parsed.dataJson) as TData) : parsed.data) as TData,
         version: String(parsed.version),
         createdAt,
         updatedAt,
@@ -620,9 +657,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     await maybeRunReconcile(tenantId, keys);
 
     const ttlMs = cfg.ttlMs ?? config.ttlMs;
-    if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
-      throw new Error("ttlMs must be > 0");
-    }
+    assertTtlMs(ttlMs);
 
     const payloadRaw = JSON.stringify(cfg.value);
     const payloadBytes = textEncoder.encode(payloadRaw).byteLength;
@@ -656,9 +691,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     await maybeRunReconcile(tenantId, keys);
 
     const ttlMs = cfg.ttlMs ?? config.ttlMs;
-    if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
-      throw new Error("ttlMs must be > 0");
-    }
+    assertTtlMs(ttlMs);
 
     const raw = await evalScript(
       TOUCH_SCRIPT,

@@ -447,3 +447,91 @@ test("createdAt flows through reader upsert event", async () => {
     expect(ev.entry.createdAt).toBe(entry.createdAt);
   }
 });
+
+// ==========================
+// Payload fidelity and argument validity
+// ==========================
+
+test("ephemeral values round-trip byte-equivalent JSON", async () => {
+  const value = {
+    endpoints: [] as string[],
+    emptyObj: {},
+    unicode: "日本😀",
+    big: 9007199254740991,
+    nested: [[], {}] as unknown[],
+  };
+  const store = ephemeral<typeof value>({ id: testId("opaque"), ttlMs: 60_000 });
+
+  const created = await store.upsert({ key: "apps/backend", value });
+  expect(created.value).toEqual(value);
+
+  // touch() rewrites the record, so a lossy encode would compound here.
+  await store.touch({ key: "apps/backend" });
+  const touched = (await store.snapshot({})).entries.find((e) => e.key === "apps/backend");
+  expect(touched?.value).toEqual(value);
+  expect(Array.isArray(touched?.value.endpoints)).toBe(true);
+});
+
+test("the snapshot and the change stream agree on the same value", async () => {
+  const value = { tags: [] as string[], n: 9007199254740991 };
+  const store = ephemeral<typeof value>({ id: testId("opaque-stream"), ttlMs: 60_000 });
+
+  // Seed first so the snapshot cursor is a real stream id, not "0-0".
+  await store.upsert({ key: "svc/seed", value: { tags: [], n: 1 } });
+  const anchor = await store.snapshot({});
+  const reader = store.reader({ after: anchor.cursor });
+  await store.upsert({ key: "svc/a", value });
+
+  const event = await reader.recv({ timeoutMs: 2_000 });
+  expect(event?.type).toBe("upsert");
+  const fromStream = event?.type === "upsert" ? event.entry.value : null;
+  const fromSnapshot = (await store.snapshot({})).entries.find((e) => e.key === "svc/a")?.value;
+
+  // These two paths used to apply different serialization to the same write.
+  expect(fromStream).toEqual(fromSnapshot);
+  expect(fromSnapshot).toEqual(value);
+});
+
+test("entries written in the 5.8.0 record format are still readable", async () => {
+  const id = testId("opaque-legacy");
+  const store = ephemeral<{ endpoints: string[] }>({ id, ttlMs: 60_000 });
+  const stateKey = `sync:e:default:${id}:state`;
+
+  await redis.send("HSET", [
+    stateKey,
+    "apps/legacy",
+    JSON.stringify({
+      key: "apps/legacy",
+      data: { endpoints: ["a"] },
+      version: "1",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    }),
+  ]);
+
+  const snap = await store.snapshot({});
+  expect(snap.entries.find((e) => e.key === "apps/legacy")?.value).toEqual({ endpoints: ["a"] });
+});
+
+test("a retention longer than the epoch does not break writes", async () => {
+  const store = ephemeral<{ v: number }>({
+    id: testId("huge-retention"),
+    ttlMs: 60_000,
+    limits: { eventRetentionMs: 100 * 365 * 24 * 60 * 60 * 1000 }, // ~100 years
+  });
+
+  // The trim ran after the XADD in the same script, so a negative MINID meant
+  // the event was written and the call still threw.
+  const written = await store.upsert({ key: "k", value: { v: 1 } });
+  expect(written.value).toEqual({ v: 1 });
+});
+
+test("a ttlMs Redis cannot express is rejected at the call site", async () => {
+  const store = ephemeral<{ v: number }>({ id: testId("ttl-validation"), ttlMs: 60_000 });
+
+  await expect(store.upsert({ key: "k", value: { v: 1 }, ttlMs: 100.5 })).rejects.toThrow(/positive integer/);
+  expect(() => ephemeral({ id: testId("ttl-bad"), ttlMs: 0.5 })).toThrow(/positive integer/);
+  // A large but expressible TTL still works.
+  await store.upsert({ key: "ok", value: { v: 1 }, ttlMs: 1_000_000_000_000 });
+});
