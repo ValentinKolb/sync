@@ -156,6 +156,32 @@ test("empty pages without cursor progress fail after maxAttempts", async () => {
   });
 });
 
+test("object cursors with different property order still count as stalled", async () => {
+  let pulls = 0;
+  const worker = track(pump<Input, { page: number; shard: number }, Item>({
+    id: uid("canonical-cursor"),
+    prefix: PUMP_PREFIX,
+    retry: { maxAttempts: 1, baseMs: 10, maxMs: 10, jitter: 0 },
+    pull: ({ cursor }) => {
+      pulls += 1;
+      return cursor === null
+        ? { items: [], nextCursor: { page: 1, shard: 2 } }
+        : { items: [], nextCursor: { shard: 2, page: 1 } };
+    },
+    dispatch: () => {},
+  }));
+
+  await worker.start({ key: "canonical", input: { source: "messages" } });
+  await waitFor(async () => (await worker.get({ key: "canonical" }))?.state === "failed");
+
+  expect(pulls).toBe(2);
+  expect(await worker.get({ key: "canonical" })).toMatchObject({
+    state: "failed",
+    failureCount: 1,
+    lastError: "pull returned a page without advancing the cursor",
+  });
+});
+
 test("failed dispatch retries the persisted page without pulling again", async () => {
   let pulls = 0;
   let failedOnce = false;
@@ -533,12 +559,24 @@ test("a non-empty page with an unchanged cursor dispatches at least once and fai
   });
 });
 
-test("malformed persisted state is ignored and removed from the due index", async () => {
+test("malformed persisted states are removed and their keys are reusable", async () => {
   const id = uid("malformed");
-  const key = "broken";
-  const member = encodeURIComponent(key);
-  const stateKey = `${PUMP_PREFIX}:${id}:run:${member}`;
   const dueKey = `${PUMP_PREFIX}:${id}:due`;
+  const malformed = [
+    { key: "invalid-json", raw: "{not-json" },
+    { key: "invalid-shape", raw: "{}" },
+    { key: "primitive-string", raw: JSON.stringify("broken") },
+    { key: "primitive-number", raw: JSON.stringify(42) },
+    { key: "primitive-boolean", raw: JSON.stringify(true) },
+    { key: "primitive-null", raw: "null" },
+  ];
+  const now = Date.now();
+  for (const [index, entry] of malformed.entries()) {
+    const member = encodeURIComponent(entry.key);
+    await redis.set(`${PUMP_PREFIX}:${id}:run:${member}`, entry.raw);
+    await redis.send("ZADD", [dueKey, String(now - malformed.length + index), member]);
+  }
+
   let pulls = 0;
   const worker = track(pump<Input, Cursor, Item>({
     id,
@@ -550,12 +588,25 @@ test("malformed persisted state is ignored and removed from the due index", asyn
     dispatch: () => {},
   }));
 
-  await redis.set(stateKey, "{not-json");
-  await redis.send("ZADD", [dueKey, String(Date.now()), member]);
-  await waitFor(async () => (await redis.send("ZSCORE", [dueKey, member])) === null);
+  await worker.start({ key: "healthy", input: { source: "messages" } });
+  await waitFor(async () => (await worker.get({ key: "healthy" }))?.state === "completed");
 
-  expect(pulls).toBe(0);
-  expect(await worker.get({ key })).toBeNull();
+  await waitFor(async () => {
+    for (const entry of malformed) {
+      const member = encodeURIComponent(entry.key);
+      if (await redis.get(`${PUMP_PREFIX}:${id}:run:${member}`)) return false;
+      if (await redis.send("ZSCORE", [dueKey, member])) return false;
+    }
+    return true;
+  });
+
+  expect(pulls).toBe(1);
+  for (const entry of malformed) {
+    expect(await worker.get({ key: entry.key })).toBeNull();
+    await worker.start({ key: entry.key, input: { source: "messages" } });
+    await waitFor(async () => (await worker.get({ key: entry.key }))?.state === "completed");
+  }
+  expect(pulls).toBe(malformed.length + 1);
 });
 
 test("a stale worker cannot checkpoint after its lease token is replaced", async () => {

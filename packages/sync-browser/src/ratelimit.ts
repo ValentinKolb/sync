@@ -66,7 +66,11 @@ export const ratelimit = (config: RateLimitConfig): RateLimiter => {
   const { limit } = config;
   const store = resolveStore(config.store);
 
-  if (!Number.isInteger(windowSecs) || windowSecs <= 0) {
+  if (
+    !Number.isSafeInteger(windowSecs)
+    || windowSecs <= 0
+    || windowSecs > Math.floor(Number.MAX_SAFE_INTEGER / 2_000)
+  ) {
     throw new Error("windowSecs must be a positive integer number of seconds");
   }
   if (!Number.isFinite(limit) || limit <= 0) {
@@ -82,18 +86,35 @@ export const ratelimit = (config: RateLimitConfig): RateLimiter => {
     const elapsedInWindow = now % windowMs;
     const elapsedRatio = elapsedInWindow / windowMs;
 
-    const currentKey = `${prefix}:${config.id}:${safeIdentifier}:${currentWindow}`;
-    const previousKey = `${prefix}:${config.id}:${safeIdentifier}:${previousWindow}`;
+    const keyForWindow = (window: number): string =>
+      `sync:ratelimit:browser:v2:${encodeURIComponent(
+        JSON.stringify([prefix, config.id, safeIdentifier, window]),
+      )}`;
+    const legacyKeyForWindow = (window: number): string =>
+      `${prefix}:${config.id}:${safeIdentifier}:${window}`;
+    const currentKey = keyForWindow(currentWindow);
+    const previousKey = keyForWindow(previousWindow);
+    const currentLegacyKey = legacyKeyForWindow(currentWindow);
+    const previousLegacyKey = legacyKeyForWindow(previousWindow);
 
-    const previousCount = readCounter(store.get(previousKey));
-    const currentStoredCount = readCounter(store.get(currentKey));
+    const previousCounts = [
+      readCounter(store.get(previousKey)),
+      readCounter(store.get(previousLegacyKey)),
+    ];
+    const currentCounts = [
+      readCounter(store.get(currentKey)),
+      readCounter(store.get(currentLegacyKey)),
+    ];
     const resetIn = windowMs - elapsedInWindow;
 
-    if (previousCount === null || currentStoredCount === null) {
+    if (previousCounts.includes(null) || currentCounts.includes(null)) {
       return { limited: true, remaining: 0, resetIn };
     }
 
+    const previousCount = Math.max(...previousCounts as number[]);
+    const currentStoredCount = Math.max(...currentCounts as number[]);
     const currentCount = currentStoredCount + 1;
+    store.set(currentLegacyKey, currentCount, windowSecs * 2000);
     store.set(currentKey, currentCount, windowSecs * 2000);
 
     const weightedCount = previousCount * (1 - elapsedRatio) + currentCount;

@@ -20,6 +20,18 @@ const assertTtl = (ttl: number, label = "ttl"): void => {
   }
 };
 
+const assertRetryCount = (value: number): void => {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError("retryCount must be a non-negative safe integer");
+  }
+};
+
+const assertRetryDelay = (value: number): void => {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError("retryDelay must be a non-negative safe integer");
+  }
+};
+
 // ==========================
 // Types
 // ==========================
@@ -73,25 +85,37 @@ export const mutex = (config: MutexConfig): Mutex => {
   const retryDelay = config.retryDelay ?? DEFAULT_RETRY_DELAY;
   const defaultTtl = config.defaultTtl ?? DEFAULT_TTL;
   const store = resolveStore(config.store);
+  assertRetryCount(retryCount);
+  assertRetryDelay(retryDelay);
   assertTtl(defaultTtl, "defaultTtl");
 
   const acquire = async (resource: string, ttl: number = defaultTtl): Promise<Lock | null> => {
     assertTtl(ttl);
     const safeResource = normalizeResource(resource);
-    const key = `${prefix}:${config.id}:${safeResource}`;
+    const key =
+      `sync:mutex:browser:v2:${encodeURIComponent(JSON.stringify([prefix, config.id, safeResource]))}`;
+    const legacyKey = `${prefix}:${config.id}:${safeResource}`;
     const value = randomHex(16);
 
     for (let attempt = 0; attempt <= retryCount; attempt++) {
       // SET NX equivalent: only set if key does not exist
       const existing = store.get(key);
-      if (existing === undefined) {
-        store.set(key, value, ttl);
+      const legacyExisting = store.get(legacyKey);
+      if (existing === undefined && legacyExisting === undefined) {
+        store.set(legacyKey, value, ttl);
+        try {
+          store.set(key, value, ttl);
+        } catch (error) {
+          if (store.get(legacyKey) === value) store.del(legacyKey);
+          throw error;
+        }
         return {
           resource: key,
           value,
           ttl,
           expiration: Date.now() + ttl,
-        };
+          legacyResource: legacyKey,
+        } as Lock & { legacyResource: string };
       }
 
       if (attempt < retryCount) {
@@ -108,13 +132,20 @@ export const mutex = (config: MutexConfig): Mutex => {
     if (current === lock.value) {
       store.del(lock.resource);
     }
+    const legacyResource = (lock as Lock & { legacyResource?: string }).legacyResource;
+    if (legacyResource && store.get(legacyResource) === lock.value) {
+      store.del(legacyResource);
+    }
   };
 
   const extend = async (lock: Lock, ttl: number = defaultTtl): Promise<boolean> => {
     assertTtl(ttl);
     // Compare-and-extend (safe in single-threaded JS)
     const current = store.get(lock.resource);
-    if (current === lock.value) {
+    const legacyResource = (lock as Lock & { legacyResource?: string }).legacyResource;
+    const legacyCurrent = legacyResource ? store.get(legacyResource) : lock.value;
+    if (current === lock.value && legacyCurrent === lock.value) {
+      if (legacyResource) store.set(legacyResource, lock.value, ttl);
       store.set(lock.resource, lock.value, ttl);
       lock.ttl = ttl;
       lock.expiration = Date.now() + ttl;

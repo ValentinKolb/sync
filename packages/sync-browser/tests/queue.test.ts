@@ -43,6 +43,30 @@ test("send and recv basic flow", async () => {
   await received!.ack();
 });
 
+test("colon-rich queue prefix, id, and tenant tuples do not share state", async () => {
+  const base = `queue-identity-${Date.now()}-${++counter}`;
+  const first = queue<{ source: string }>({
+    id: "a:c",
+    prefix: base,
+    tenantId: "a",
+  });
+  const second = queue<{ source: string }>({
+    id: "c",
+    prefix: `${base}:a`,
+    tenantId: "a",
+  });
+
+  await first.send({ data: { source: "first" } });
+  await second.send({ data: { source: "second" } });
+
+  const firstMessage = await first.recv({ wait: false });
+  const secondMessage = await second.recv({ wait: false });
+  expect(firstMessage?.data).toEqual({ source: "first" });
+  expect(secondMessage?.data).toEqual({ source: "second" });
+  await firstMessage?.ack();
+  await secondMessage?.ack();
+});
+
 // ==========================
 // 2. FIFO ordering
 // ==========================

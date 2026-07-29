@@ -1,7 +1,12 @@
 import { beforeEach, afterEach, expect, test } from "bun:test";
 import { redis } from "bun";
 import { scheduler, type Scheduler } from "../index";
-import { schedulerScheduleKey } from "../src/scheduler-control";
+import {
+  legacySchedulerScheduleKey,
+  schedulerDueKey,
+  schedulerScheduleKey,
+  schedulerV2ScheduleKey,
+} from "../src/scheduler-control";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 
@@ -201,7 +206,11 @@ test("broken (unparseable) schedule record is cleaned up by the dispatch loop", 
 
   const keyPrefix = `sync:scheduler:${schedId}`;
   const recordKey = schedulerScheduleKey("sync:scheduler", schedId, "b");
-  await redis.set(recordKey, "not valid json");
+  await Promise.all([
+    redis.set(recordKey, "not valid json"),
+    redis.set(schedulerV2ScheduleKey("sync:scheduler", schedId, "b"), "not valid json"),
+    redis.set(legacySchedulerScheduleKey("sync:scheduler", schedId, "b"), "not valid json"),
+  ]);
   await redis.send("ZADD", [`${keyPrefix}:due`, String(Date.now() - 1000), "b"]);
 
   s.start();
@@ -758,6 +767,45 @@ test("stop fences a cron run suspended while reading the due index", async () =>
     releaseRead();
     await stopped;
     expect(runs).toBe(0);
+  } finally {
+    releaseRead();
+    redis.send = originalSend as typeof redis.send;
+  }
+}, 20_000);
+
+test("start during stop waits for the previous scheduler generation to exit", async () => {
+  const schedId = uid("stop-start-generation");
+  const s = makeScheduler(schedId, { dispatch: { tickMs: 50 } });
+  await s.create({ id: "future", cron: "0 3 * * *", process: async () => {} });
+
+  const dueKey = schedulerDueKey("sync:scheduler", schedId);
+  const originalSend = redis.send.bind(redis);
+  let releaseRead = (): void => {};
+  const readGate = new Promise<void>((resolve) => {
+    releaseRead = resolve;
+  });
+  let reads = 0;
+  redis.send = (async (command, args) => {
+    const result = await originalSend(command, args);
+    if (command === "ZRANGEBYSCORE" && args[0] === dueKey) {
+      reads += 1;
+      if (reads === 1) await readGate;
+    }
+    return result;
+  }) as typeof redis.send;
+
+  try {
+    s.start();
+    await waitFor(() => reads === 1);
+    const stopping = s.stop();
+    s.start();
+
+    await Bun.sleep(150);
+    expect(reads).toBe(1);
+
+    releaseRead();
+    await stopping;
+    await waitFor(() => reads >= 2);
   } finally {
     releaseRead();
     redis.send = originalSend as typeof redis.send;

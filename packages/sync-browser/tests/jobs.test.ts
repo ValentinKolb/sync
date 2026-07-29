@@ -85,6 +85,35 @@ test("ctx.duration is non-negative in after", async () => {
   worker.stop();
 });
 
+test("colon-rich job prefix and id tuples do not share worker state", async () => {
+  const base = uid("identity-collision");
+  let firstRuns = 0;
+  let secondRuns = 0;
+  const first = job({
+    id: "b",
+    prefix: `${base}:a`,
+    process: async () => {
+      firstRuns += 1;
+    },
+  });
+  const second = job({
+    id: "a:b",
+    prefix: base,
+    process: async () => {
+      secondRuns += 1;
+    },
+  });
+
+  await first.submit({ key: "same-key" });
+  await second.submit({ key: "same-key" });
+  await waitFor(() => firstRuns === 1 && secondRuns === 1);
+
+  expect(firstRuns).toBe(1);
+  expect(secondRuns).toBe(1);
+  first.stop();
+  second.stop();
+});
+
 // ==========================
 // Typed input
 // ==========================
@@ -203,6 +232,61 @@ test("concurrent submit with same key returns same jobId and runs once", async (
   expect(runs).toBe(1);
 
   worker.stop();
+});
+
+test("concurrent submit waits for a pending enqueue and recovers from serialization failure", async () => {
+  type Input = { value: string; self?: Input };
+  const processed: string[] = [];
+  const worker = job<Input>({
+    id: uid("pending-enqueue-failure"),
+    process: async ({ ctx }) => {
+      processed.push(ctx.input.value);
+    },
+  });
+  const invalid: Input = { value: "invalid" };
+  invalid.self = invalid;
+
+  try {
+    const failed = worker.submit({ key: "same", input: invalid });
+    const recovered = worker.submit({ key: "same", input: { value: "valid" } });
+
+    await expect(failed).rejects.toThrow();
+    expect(await recovered).toBe("2");
+    await waitFor(() => processed.length === 1);
+    expect(processed).toEqual(["valid"]);
+  } finally {
+    worker.stop();
+  }
+});
+
+test("an already waiting same-id worker does not discard a pending enqueue", async () => {
+  const id = uid("pending-worker-race");
+  const processed: string[] = [];
+  const waitingWorker = job<{ value: string }>({
+    id,
+    process: async ({ ctx }) => {
+      processed.push(ctx.input.value);
+    },
+  });
+  const submittingWorker = job<{ value: string }>({
+    id,
+    process: async ({ ctx }) => {
+      processed.push(ctx.input.value);
+    },
+  });
+
+  try {
+    await waitingWorker.submit({ key: "seed", input: { value: "seed" } });
+    await waitFor(() => processed.includes("seed"));
+
+    const jobId = await submittingWorker.submit({ key: "next", input: { value: "next" } });
+    await waitFor(() => processed.includes("next"));
+    expect(jobId).toBe("2");
+    expect(processed.filter((value) => value === "next")).toHaveLength(1);
+  } finally {
+    waitingWorker.stop();
+    submittingWorker.stop();
+  }
 });
 
 test("key released after terminal success; resubmit gets new jobId", async () => {
@@ -826,6 +910,35 @@ test("heartbeat renews the idempotency claim", async () => {
   worker.stop();
 });
 
+test("active claim outlives a short key TTL until its delivery lease ends", async () => {
+  const attempts: number[] = [];
+  const worker = job({
+    id: uid("active-claim-lease"),
+    defaults: { leaseMs: 3_000, keyTtlMs: 1_000 },
+    process: async ({ ctx }) => {
+      attempts.push(ctx.failureCount);
+      if (ctx.failureCount === 0) {
+        await Bun.sleep(1_100);
+        throw new Error("retry");
+      }
+    },
+    after: ({ ctx }) => {
+      if (ctx.error) ctx.reschedule();
+    },
+  });
+
+  try {
+    await worker.submit({ key: "slow" });
+    await waitFor(() => attempts.length === 2, 8_000);
+    await waitFor(() => worker.metric().dispatches === 1);
+    expect(attempts).toEqual([0, 1]);
+    expect(worker.metric().reschedules).toBe(1);
+    expect(worker.metric().dispatches).toBe(1);
+  } finally {
+    worker.stop();
+  }
+});
+
 test("reschedule holds the idempotency claim across a delay longer than its TTL", async () => {
   let firstAttemptFinished = false;
 
@@ -846,45 +959,92 @@ test("reschedule holds the idempotency claim across a delay longer than its TTL"
   worker.stop();
 });
 
-test("terminal release cannot delete a newer idempotency claim", async () => {
-  let run = 0;
+test("claim loss fences a stale browser attempt before after and completion", async () => {
+  const runs: string[] = [];
   let firstStarted = false;
-  let secondStarted = false;
+  let afterCalls = 0;
   let releaseFirst: (() => void) | undefined;
-  let releaseSecond: (() => void) | undefined;
   const firstGate = new Promise<void>((resolve) => {
     releaseFirst = resolve;
   });
-  const secondGate = new Promise<void>((resolve) => {
-    releaseSecond = resolve;
-  });
-
   const worker = job({
-    id: uid("fenced-claim-release"),
-    process: async () => {
-      run += 1;
-      if (run === 1) {
+    id: uid("claim-loss-fence"),
+    defaults: { leaseMs: 5_000 },
+    process: async ({ ctx }) => {
+      runs.push(ctx.jobId);
+      if (ctx.jobId === "1") {
         firstStarted = true;
         await firstGate;
-        return;
       }
-      secondStarted = true;
-      await secondGate;
+    },
+    after: async () => {
+      afterCalls += 1;
     },
   });
+  const originalNow = Date.now;
 
-  await worker.submit({ key: "same", keyTtlMs: 1_000 });
-  await waitFor(() => firstStarted);
-  await Bun.sleep(1_050);
-  const second = await worker.submit({ key: "same", keyTtlMs: 1_000 });
+  try {
+    await worker.submit({ key: "same", keyTtlMs: 1_000 });
+    await waitFor(() => firstStarted);
 
-  releaseFirst?.();
-  await waitFor(() => secondStarted);
-  expect(await worker.submit({ key: "same", keyTtlMs: 1_000 })).toBe(second);
+    const shiftedNow = originalNow() + 6_000;
+    Date.now = () => shiftedNow;
+    const second = await worker.submit({ key: "same", keyTtlMs: 1_000 });
+    expect(second).toBe("2");
+    Date.now = originalNow;
 
-  releaseSecond?.();
-  await waitFor(() => worker.metric().dispatches === 2);
-  worker.stop();
+    releaseFirst?.();
+    await waitFor(() => worker.metric().dispatches === 1);
+    expect(runs).toEqual(["1", "2"]);
+    expect(afterCalls).toBe(1);
+  } finally {
+    Date.now = originalNow;
+    releaseFirst?.();
+    worker.stop();
+  }
+});
+
+test("heartbeat after stop does not extend browser ownership", async () => {
+  let firstStarted = false;
+  let heartbeatDone = false;
+  const processed: string[] = [];
+  let releaseFirst: (() => void) | undefined;
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const worker = job({
+    id: uid("stopped-heartbeat"),
+    defaults: { leaseMs: 1_000, keyTtlMs: 1_000 },
+    process: async ({ ctx }) => {
+      processed.push(ctx.jobId);
+      if (ctx.jobId !== "1") return;
+      firstStarted = true;
+      await firstGate;
+      await ctx.heartbeat({ leaseMs: 5_000 });
+      heartbeatDone = true;
+    },
+  });
+  const originalNow = Date.now;
+
+  try {
+    const first = await worker.submit({ key: "same" });
+    await waitFor(() => firstStarted);
+    worker.stop();
+    releaseFirst?.();
+    await waitFor(() => heartbeatDone);
+
+    const shiftedNow = originalNow() + 2_000;
+    Date.now = () => shiftedNow;
+    const second = await worker.submit({ key: "same" });
+    Date.now = originalNow;
+
+    expect(second).not.toBe(first);
+    await waitFor(() => processed.includes(second));
+  } finally {
+    Date.now = originalNow;
+    releaseFirst?.();
+    worker.stop();
+  }
 });
 
 // ==========================

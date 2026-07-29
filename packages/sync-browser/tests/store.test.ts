@@ -515,3 +515,79 @@ test("a rejected localStorage write keeps its own classification", () => {
     globalThis.localStorage = originalLocalStorage;
   }
 });
+
+test("MemoryStore preserves structured values while returning snapshots", () => {
+  const memory = new MemoryStore();
+  const value = {
+    date: new Date("2026-01-02T03:04:05.000Z"),
+    map: new Map([["key", "value"]]),
+    bigint: 1n,
+  };
+
+  memory.set("value", value);
+  const stored = memory.get("value") as typeof value;
+  expect(stored).toEqual(value);
+  expect(stored).not.toBe(value);
+  expect(stored.date).not.toBe(value.date);
+  expect(stored.map).not.toBe(value.map);
+});
+
+test("LocalStorageStore retains its JSON value semantics", () => {
+  const mock = createLocalStorageMock();
+  globalThis.localStorage = mock;
+  try {
+    const local = new LocalStorageStore("json-domain");
+    const value = {
+      date: new Date("2026-01-02T03:04:05.000Z"),
+      map: new Map([["key", "value"]]),
+      nan: Number.NaN,
+      nested: { missing: undefined },
+    };
+
+    local.set("value", value);
+    expect(local.get("value")).toEqual({
+      date: "2026-01-02T03:04:05.000Z",
+      map: {},
+      nan: null,
+      nested: {},
+    });
+    expect(() => local.set("bigint", 1n)).toThrow(StoreWriteError);
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("failed MemoryStore replacement preserves the previous TTL", async () => {
+  const memory = new MemoryStore();
+  memory.set("key", "old", 50);
+
+  expect(() => memory.set("key", () => {})).toThrow(StoreWriteError);
+  expect(memory.get("key")).toBe("old");
+  await Bun.sleep(80);
+  expect(memory.get("key")).toBeUndefined();
+});
+
+test("failed LocalStorageStore replacement preserves the previous TTL", async () => {
+  const mock = createLocalStorageMock();
+  globalThis.localStorage = mock;
+  try {
+    const local = new LocalStorageStore("failed-replacement");
+    local.set("key", "old", 50);
+    const setItem = mock.setItem.bind(mock);
+    let fail = true;
+    mock.setItem = ((key: string, value: string): void => {
+      if (fail) {
+        fail = false;
+        throw new Error("quota");
+      }
+      setItem(key, value);
+    }) as typeof mock.setItem;
+
+    expect(() => local.set("key", "new", 500)).toThrow(StoreWriteError);
+    expect(local.get("key")).toBe("old");
+    await Bun.sleep(80);
+    expect(local.get("key")).toBeUndefined();
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});

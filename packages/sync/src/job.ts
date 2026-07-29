@@ -121,6 +121,47 @@ const REFRESH_KEY_SCRIPT = `
   return 1
 `;
 
+// Settle the queue delivery and release its matching idempotency claim in one
+// Redis transition. A transport failure after this script commits may hide the
+// result, but it cannot leave an acknowledged job claimed without work.
+const TERMINAL_ACK_SCRIPT = `
+  local deliveryId = ARGV[1]
+  local jobId = ARGV[2]
+
+  local deliveryRaw = redis.call("HGET", KEYS[1], deliveryId)
+  if not deliveryRaw then
+    return 0
+  end
+
+  local ok, delivery = pcall(cjson.decode, deliveryRaw)
+  if not ok then
+    redis.call("HDEL", KEYS[1], deliveryId)
+    redis.call("ZREM", KEYS[2], deliveryId)
+    return 0
+  end
+
+  redis.call("HDEL", KEYS[1], deliveryId)
+  redis.call("ZREM", KEYS[2], deliveryId)
+  redis.call("LREM", KEYS[4], 1, delivery.messageId)
+  redis.call("HDEL", KEYS[3], delivery.messageId)
+  if redis.call("HGET", KEYS[5], delivery.messageId) == deliveryId then
+    redis.call("HDEL", KEYS[5], delivery.messageId)
+  end
+  redis.call("HDEL", KEYS[6], delivery.messageId)
+
+  local existing = redis.call("GET", KEYS[7])
+  if existing then
+    local claimOk, record = pcall(cjson.decode, existing)
+    if claimOk and type(record) == "table" and record.jobId then
+      if record.jobId == jobId then redis.call("DEL", KEYS[7]) end
+    elseif existing == jobId then
+      redis.call("DEL", KEYS[7])
+    end
+  end
+
+  return 1
+`;
+
 // ==========================
 // Types
 // ==========================
@@ -244,8 +285,26 @@ export const job = <Input = void, Result = unknown>(
     seq: `${prefix}:${config.id}:seq`,
     idempotencyPrefix: `${prefix}:${config.id}:idempotency`,
   };
-
-  const idempotencyKey = (key: string): string => `${keys.idempotencyPrefix}:${key}`;
+  const workQueueId = `${config.id}:work`;
+  const resolveIdempotencyKey = async (key: string): Promise<string> => {
+    const legacyKey = `${keys.idempotencyPrefix}:${key}`;
+    const encodedKey =
+      `sync:job:claim:v2:${encodeURIComponent(JSON.stringify([prefix, config.id, key]))}`;
+    if (await redis.get(legacyKey)) {
+      throw new Error(
+        "job claim migration required; drain old workers and remove or migrate the legacy claim",
+      );
+    }
+    return encodedKey;
+  };
+  const resolveWorkQueueBase = async (): Promise<string> => {
+    const queuePrefix = `${prefix}:queue`;
+    return `sync:queue:namespace:v2:${encodeURIComponent(JSON.stringify([
+      queuePrefix,
+      "default",
+      workQueueId,
+    ]))}`;
+  };
 
   const workQueue = queue<WorkPayload>({
     id: `${config.id}:work`,
@@ -267,7 +326,7 @@ export const job = <Input = void, Result = unknown>(
   };
 
   const evalKeyScript = async (script: string, key: string, args: string[]): Promise<unknown> =>
-    await redis.send("EVAL", [script, "1", idempotencyKey(key), ...args]);
+    await redis.send("EVAL", [script, "1", await resolveIdempotencyKey(key), ...args]);
 
   const releaseKey = async (key: string, jobId: JobId): Promise<void> => {
     try {
@@ -279,6 +338,24 @@ export const job = <Input = void, Result = unknown>(
 
   const extendKey = async (key: string, jobId: JobId, keyTtlMs: number): Promise<boolean> => {
     const result = await evalKeyScript(REFRESH_KEY_SCRIPT, key, [jobId, String(keyTtlMs)]);
+    return Number(result) > 0;
+  };
+
+  const terminalAck = async (key: string, jobId: JobId, deliveryId: string): Promise<boolean> => {
+    const base = await resolveWorkQueueBase();
+    const result = await redis.send("EVAL", [
+      TERMINAL_ACK_SCRIPT,
+      "7",
+      `${base}:deliveries`,
+      `${base}:leases`,
+      `${base}:messages`,
+      `${base}:active`,
+      `${base}:delivery-owners`,
+      `${base}:orphan-candidates`,
+      await resolveIdempotencyKey(key),
+      deliveryId,
+      jobId,
+    ]);
     return Number(result) > 0;
   };
 
@@ -301,7 +378,7 @@ export const job = <Input = void, Result = unknown>(
     const result = await redis.send("EVAL", [
       CLAIM_KEY_SCRIPT,
       "2",
-      idempotencyKey(key),
+      await resolveIdempotencyKey(key),
       keys.seq,
       String(keyTtlMs),
       String(Date.now()),
@@ -381,7 +458,11 @@ export const job = <Input = void, Result = unknown>(
                 // means a newer submit owns the key and this delivery is stale.
                 let ownsClaim: boolean;
                 try {
-                  ownsClaim = await extendKey(payload.key, payload.jobId, payload.keyTtlMs);
+                  ownsClaim = await extendKey(
+                    payload.key,
+                    payload.jobId,
+                    Math.max(payload.keyTtlMs, leaseMs),
+                  );
                 } catch (error) {
                   leaseLost = true;
                   jobAc.abort();
@@ -407,6 +488,7 @@ export const job = <Input = void, Result = unknown>(
                 failureCount,
                 signal: jobAc.signal,
                 heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
+                  if (canceled()) return;
                   await keepLease(cfg?.leaseMs);
                 },
               } as JobCtx<Input>;
@@ -483,10 +565,11 @@ export const job = <Input = void, Result = unknown>(
 
               if (rescheduleRequested) {
                 const delayMs = (rescheduleRequested as { delayMs: number }).delayMs;
+                const retryKeyTtlMs = Math.min(MAX_KEY_TTL_MS, delayMs + payload.keyTtlMs);
                 const extended = await extendKey(
                   payload.key,
                   payload.jobId,
-                  Math.min(MAX_KEY_TTL_MS, delayMs + payload.keyTtlMs),
+                  Math.max(payload.leaseMs, retryKeyTtlMs),
                 );
                 if (!extended || canceled()) continue;
                 const nacked = await message.nack({
@@ -498,6 +581,7 @@ export const job = <Input = void, Result = unknown>(
                   // Lease expired; message will be redelivered. Key stays claimed.
                   continue;
                 }
+                await extendKey(payload.key, payload.jobId, retryKeyTtlMs);
                 metrics.reschedules += 1;
                 await emitTrace(config.trace, {
                   type: "rescheduled",
@@ -509,13 +593,12 @@ export const job = <Input = void, Result = unknown>(
                 continue;
               }
 
-              // Terminal: ack + release key
-              const acked = await message.ack();
+              // Terminal queue settlement and claim release are one transition.
+              const acked = await terminalAck(payload.key, payload.jobId, message.deliveryId);
               if (!acked) {
                 // Lease expired; message will be redelivered. Key stays claimed.
                 continue;
               }
-              await releaseKey(payload.key, payload.jobId);
 
               if (error) {
                 metrics.failures += 1;

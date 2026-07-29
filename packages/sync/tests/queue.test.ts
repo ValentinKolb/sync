@@ -2,8 +2,18 @@ import { beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
 import { queue } from "../index";
 
+const queueBase = (id: string, tenantId = "default", prefix = "test:q"): string =>
+  `sync:queue:namespace:v2:${encodeURIComponent(JSON.stringify([prefix, tenantId, id]))}`;
+
 beforeEach(async () => {
-  const keys = await redis.send("KEYS", ["test:q:*"]);
+  const [legacyKeys, versionedKeys] = await Promise.all([
+    redis.send("KEYS", ["test:q:*"]),
+    redis.send("KEYS", ["sync:queue:namespace:v2:*"]),
+  ]);
+  const keys = [
+    ...(Array.isArray(legacyKeys) ? legacyKeys : []),
+    ...(Array.isArray(versionedKeys) ? versionedKeys : []),
+  ];
   if (Array.isArray(keys) && keys.length > 0) {
     await redis.send("DEL", keys as string[]);
   }
@@ -131,6 +141,17 @@ test("idempotency key deduplicates send", async () => {
   expect(await q.recv({ wait: false })).toBeNull();
 });
 
+test("idempotency keys use the full queue identity", async () => {
+  const q = queue({
+    id: "idempotency-legacy",
+    prefix: "test:q",
+  });
+
+  const sent = await q.send({ data: { k: "x" }, idempotencyKey: "scope:key" });
+
+  expect(await redis.get(`${queueBase("idempotency-legacy")}:idempotency:scope:key`)).toBe(sent.messageId);
+});
+
 test("reader exposes recv/stream as read-only handle", async () => {
   const q = queue({
     id: "reader",
@@ -189,7 +210,7 @@ test("queue timings reject unsafe values before mutating Redis", async () => {
   await expect(q.send({ data: { v: 1 }, idempotencyTtlMs: 0 })).rejects.toThrow(
     "send.idempotencyTtlMs must be a safe integer",
   );
-  expect(await redis.send("GET", ["test:q:default:invalid-timings:seq"])).toBeNull();
+  expect(await redis.send("GET", [`${queueBase("invalid-timings")}:seq`])).toBeNull();
 
   await q.send({ data: { v: 1 } });
   await expect(q.recv({ wait: false, timeoutMs: Number.NaN })).rejects.toThrow(
@@ -452,7 +473,7 @@ test("message moves to dlq after max deliveries", async () => {
 
   expect(await q.recv({ wait: false })).toBeNull();
 
-  const dlqKey = "test:q:default:dlq:dlq";
+  const dlqKey = `${queueBase("dlq")}:dlq`;
   const dlqRaw = await redis.hget(dlqKey, first!.messageId);
   expect(typeof dlqRaw).toBe("string");
 });
@@ -509,7 +530,7 @@ test("nack delay exceeding maxMessageAgeMs sends message to DLQ", async () => {
   expect(result).toBeNull();
 
   // Verify message landed in DLQ
-  const dlqKey = "test:q:default:nack-age-dlq:dlq";
+  const dlqKey = `${queueBase("nack-age-dlq")}:dlq`;
   const dlqRaw = await redis.hget(dlqKey, msg!.messageId);
   expect(dlqRaw).not.toBeNull();
   const dlqEntry = JSON.parse(dlqRaw!);
@@ -529,8 +550,8 @@ test("an expired ready message moves to the DLQ instead of being claimed", async
   expect(await q.recv({ wait: false })).toBeNull();
   const entries = await q.dlq();
   expect(entries.map((entry) => entry.reason)).toEqual(["expired"]);
-  expect(await redis.send("LLEN", ["test:q:default:ready-age-dlq:active"])).toBe(0);
-  expect(await redis.send("HLEN", ["test:q:default:ready-age-dlq:messages"])).toBe(0);
+  expect(await redis.send("LLEN", [`${queueBase("ready-age-dlq")}:active`])).toBe(0);
+  expect(await redis.send("HLEN", [`${queueBase("ready-age-dlq")}:messages`])).toBe(0);
 });
 
 test("recv drains more than one expired claim batch before returning a valid message", async () => {
@@ -655,7 +676,7 @@ test("dead-lettered payload keeps the original JSON shape", async () => {
   expect(await message?.nack()).toBe(true); // settled by moving it to the DLQ
   expect(await q.recv({ wait: false })).toBeNull(); // not requeued
 
-  const raw = await redis.send("HGETALL", ["test:q:default:opaque-dlq:dlq"]);
+  const raw = await redis.send("HGETALL", [`${queueBase("opaque-dlq")}:dlq`]);
   const entries = Object.values(raw as Record<string, string>);
   expect(entries.length).toBe(1);
   const dlq = JSON.parse(entries[0]!) as { dataJson: string; reason: string };
@@ -676,8 +697,8 @@ test("messages written in the 5.8.0 record format are still delivered", async ()
     meta: { source: "legacy" },
     enqueuedAt: Date.now(),
   });
-  await redis.send("HSET", ["test:q:default:legacy-record:messages", "9001", legacy]);
-  await redis.send("LPUSH", ["test:q:default:legacy-record:ready", "9001"]);
+  await redis.send("HSET", [`${queueBase("legacy-record")}:messages`, "9001", legacy]);
+  await redis.send("LPUSH", [`${queueBase("legacy-record")}:ready`, "9001"]);
 
   const message = await q.recv({ wait: false });
   expect(message?.messageId).toBe("9001");
@@ -709,7 +730,7 @@ test("recv records the consumerId on the delivery record", async () => {
   const message = await q.recv({ wait: false, consumerId: "worker-7" });
   expect(message).not.toBeNull();
 
-  const raw = await redis.send("HGET", ["test:q:default:consumer-id:deliveries", message!.deliveryId]);
+  const raw = await redis.send("HGET", [`${queueBase("consumer-id")}:deliveries`, message!.deliveryId]);
   expect(JSON.parse(raw as string).consumerId).toBe("worker-7");
 
   expect(await message?.ack()).toBe(true);
@@ -739,7 +760,7 @@ test("dlq entries are readable, drainable and bounded per entry", async () => {
   expect(entries[0]?.attempts).toBe(1);
 
   expect(await q.dlqRemove({ messageId: entries[0]!.messageId })).toBe(true);
-  expect(await redis.send("ZSCORE", ["test:q:default:dlq-api:dlq:index", entries[0]!.messageId])).toBeNull();
+  expect(await redis.send("ZSCORE", [`${queueBase("dlq-api")}:dlq:index`, entries[0]!.messageId])).toBeNull();
   expect(await q.dlqRemove({ messageId: entries[0]!.messageId })).toBe(false);
   expect((await q.dlq()).length).toBe(1);
 });
@@ -759,8 +780,8 @@ test("dlq reads purge expired hash and index entries without a later failure", a
   await Bun.sleep(120);
 
   expect(await q.dlq()).toEqual([]);
-  expect(await redis.send("HLEN", ["test:q:default:dlq-read-retention:dlq"])).toBe(0);
-  expect(await redis.send("ZCARD", ["test:q:default:dlq-read-retention:dlq:index"])).toBe(0);
+  expect(await redis.send("HLEN", [`${queueBase("dlq-read-retention")}:dlq`])).toBe(0);
+  expect(await redis.send("ZCARD", [`${queueBase("dlq-read-retention")}:dlq:index`])).toBe(0);
 });
 
 test("dlq retention drops entries older than the window without dropping fresh ones", async () => {
@@ -790,7 +811,7 @@ test("dead letters written in the 5.8.0 format are still listed", async () => {
   const q = queue<{ tag: string }>({ id: "dlq-legacy", prefix: "test:q" });
 
   await redis.send("HSET", [
-    "test:q:default:dlq-legacy:dlq",
+    `${queueBase("dlq-legacy")}:dlq`,
     "4242",
     JSON.stringify({
       messageId: "4242",
@@ -811,7 +832,7 @@ test("dead letters written in the 5.8.0 format are still listed", async () => {
 
 test("dlq reads reconcile a stale index without hiding an unindexed legacy entry", async () => {
   const q = queue<{ tag: string }>({ id: "dlq-stale-index", prefix: "test:q" });
-  const dlqKey = "test:q:default:dlq-stale-index:dlq";
+  const dlqKey = `${queueBase("dlq-stale-index")}:dlq`;
   const indexKey = `${dlqKey}:index`;
 
   await redis.send("HSET", [
@@ -831,4 +852,61 @@ test("dlq reads reconcile a stale index without hiding an unindexed legacy entry
   expect(entries.map((entry) => entry.messageId)).toEqual(["valid"]);
   expect(await redis.send("ZSCORE", [indexKey, "missing"])).toBeNull();
   expect(await redis.send("ZSCORE", [indexKey, "valid"])).not.toBeNull();
+});
+
+test("tenant and queue id delimiter combinations cannot share state", async () => {
+  const first = queue<{ source: string }>({ id: "c", prefix: "test:q" });
+  const second = queue<{ source: string }>({ id: "b:c", prefix: "test:q" });
+
+  await first.send({ tenantId: "a:b", data: { source: "first" } });
+  expect(await second.recv({ tenantId: "a", wait: false })).toBeNull();
+
+  await second.send({ tenantId: "a", data: { source: "second" } });
+  const firstMessage = await first.recv({ tenantId: "a:b", wait: false });
+  const secondMessage = await second.recv({ tenantId: "a", wait: false });
+
+  expect(firstMessage?.data.source).toBe("first");
+  expect(secondMessage?.data.source).toBe("second");
+  expect(await firstMessage?.ack()).toBe(true);
+  expect(await secondMessage?.ack()).toBe(true);
+});
+
+test("delimiter-rich queues fail closed when legacy state already exists", async () => {
+  await redis.send("LPUSH", ["test:q:a:b:c:ready", "legacy-message"]);
+  const q = queue({ id: "c", prefix: "test:q" });
+
+  await expect(q.send({ tenantId: "a:b", data: { value: 1 } })).rejects.toThrow(
+    /queue namespace migration required/,
+  );
+});
+
+test("delimiter-safe queues cannot claim an ambiguous legacy namespace", async () => {
+  await redis.send("LPUSH", ["test:q:scope:a:b:ready", "foreign-message"]);
+  const q = queue({ id: "b", prefix: "test:q:scope" });
+
+  await expect(q.send({ tenantId: "a", data: { value: 1 } })).rejects.toThrow(
+    /queue namespace migration required/,
+  );
+});
+
+test("legacy namespace checks escape Redis glob characters", async () => {
+  await redis.send("LPUSH", ["test:q:a:bee:ready", "unrelated"]);
+  const q = queue({ id: "b*", prefix: "test:q" });
+
+  await expect(q.send({ tenantId: "a", data: { value: 1 } })).resolves.toHaveProperty("messageId");
+});
+
+test("prefix and tenant delimiter combinations cannot share state", async () => {
+  const first = queue<{ source: string }>({ id: "b", prefix: "test:q:scope" });
+  const second = queue<{ source: string }>({ id: "b", prefix: "test:q" });
+
+  await first.send({ tenantId: "a", data: { source: "first" } });
+  await second.send({ tenantId: "scope:a", data: { source: "second" } });
+
+  const firstMessage = await first.recv({ tenantId: "a", wait: false });
+  const secondMessage = await second.recv({ tenantId: "scope:a", wait: false });
+  expect(firstMessage?.data.source).toBe("first");
+  expect(secondMessage?.data.source).toBe("second");
+  expect(await firstMessage?.ack()).toBe(true);
+  expect(await secondMessage?.ack()).toBe(true);
 });

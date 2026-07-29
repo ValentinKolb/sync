@@ -63,6 +63,42 @@ test("upsert + snapshot returns current state", async () => {
   expect(typeof snap.cursor).toBe("string");
 });
 
+test("snapshot cursor never skips a write concurrent with the state read", async () => {
+  const store = ephemeral<{ value: number }>({
+    id: testId("snapshot-cut"),
+    ttlMs: 2_000,
+  });
+  await store.upsert({ key: "before", value: { value: 1 } });
+
+  const redisWithHvals = redis as typeof redis & {
+    hvals(key: string): Promise<string[]>;
+  };
+  const originalHvals = redisWithHvals.hvals;
+  let interleaved = false;
+  redisWithHvals.hvals = async (key: string): Promise<string[]> => {
+    const entries = await originalHvals.call(redis, key);
+    if (!interleaved) {
+      interleaved = true;
+      await store.upsert({ key: "between", value: { value: 2 } });
+    }
+    return entries;
+  };
+
+  try {
+    const snap = await store.snapshot();
+    expect(snap.entries.map((entry) => entry.key)).toEqual(["before"]);
+
+    const reader = trackReader(store.reader({ after: snap.cursor }));
+    const event = await reader.recv({ wait: false });
+    expect(event).toMatchObject({
+      type: "upsert",
+      entry: { key: "between", value: { value: 2 } },
+    });
+  } finally {
+    redisWithHvals.hvals = originalHvals;
+  }
+});
+
 test("touch extends ttl and key survives until new expiry", async () => {
   const store = ephemeral({
     id: testId("touch"),
@@ -402,23 +438,26 @@ test("reader close can interrupt a read while its connection is starting", async
   await expect(pending).resolves.toBeNull();
 });
 
-test("concurrent streams from one reader use independent connections", async () => {
+test("concurrent streams from one reader advance its cursor in order", async () => {
   const store = ephemeral<{ value: number }>({
     id: testId("concurrent-streams"),
     ttlMs: 2_000,
   });
-  const reader = trackReader(store.reader());
-  const clientsBefore = await connectedClients();
-  const first = reader.stream({ wait: true, timeoutMs: 10_000 })[Symbol.asyncIterator]();
-  const second = reader.stream({ wait: true, timeoutMs: 10_000 })[Symbol.asyncIterator]();
+  const anchor = await store.snapshot();
+  const orderedReader = trackReader(store.reader({ after: anchor.cursor }));
+  const first = orderedReader.stream({ wait: true, timeoutMs: 1_000 })[Symbol.asyncIterator]();
+  const second = orderedReader.stream({ wait: true, timeoutMs: 1_000 })[Symbol.asyncIterator]();
   const firstPending = first.next();
   const secondPending = second.next();
 
-  await waitFor(async () => (await connectedClients()) >= clientsBefore + 2);
+  await store.upsert({ key: "first", value: { value: 1 } });
+  const firstResult = await firstPending;
+  await store.upsert({ key: "second", value: { value: 2 } });
+  const secondResult = await secondPending;
 
-  await reader.close();
-  expect(await firstPending).toEqual({ value: undefined, done: true });
-  expect(await secondPending).toEqual({ value: undefined, done: true });
+  expect(firstResult.value).toMatchObject({ type: "upsert", entry: { key: "first" } });
+  expect(secondResult.value).toMatchObject({ type: "upsert", entry: { key: "second" } });
+  await orderedReader.close();
 });
 
 test("reader close during signal registration aborts the pending read", async () => {
@@ -715,6 +754,30 @@ test("a ttlMs Redis cannot express is rejected at the call site", async () => {
   expect(() => ephemeral({ id: testId("ttl-bad"), ttlMs: 0.5 })).toThrow(/positive integer/);
   // A large but expressible TTL still works.
   await store.upsert({ key: "ok", value: { v: 1 }, ttlMs: 1_000_000_000_000 });
+});
+
+test("ephemeral limits must be positive safe integers", () => {
+  const create = (limits: {
+    maxEntries?: number;
+    maxPayloadBytes?: number;
+    eventRetentionMs?: number;
+    eventMaxLen?: number;
+  }) => ephemeral({ id: testId("limit-validation"), ttlMs: 60_000, limits });
+
+  expect(() => create({ maxEntries: Number.POSITIVE_INFINITY })).toThrow(/limits\.maxEntries.*positive safe integer/);
+  expect(() => create({ maxEntries: 1.5 })).toThrow(/limits\.maxEntries.*positive safe integer/);
+  expect(() => create({ maxPayloadBytes: Number.POSITIVE_INFINITY })).toThrow(
+    /limits\.maxPayloadBytes.*positive safe integer/,
+  );
+  expect(() => create({ maxPayloadBytes: 1.5 })).toThrow(/limits\.maxPayloadBytes.*positive safe integer/);
+  expect(() => create({ eventRetentionMs: Number.POSITIVE_INFINITY })).toThrow(
+    /limits\.eventRetentionMs.*positive safe integer/,
+  );
+  expect(() => create({ eventRetentionMs: 1.5 })).toThrow(/limits\.eventRetentionMs.*positive safe integer/);
+  expect(() => create({ eventMaxLen: Number.POSITIVE_INFINITY })).toThrow(
+    /limits\.eventMaxLen.*positive safe integer/,
+  );
+  expect(() => create({ eventMaxLen: 1.5 })).toThrow(/limits\.eventMaxLen.*positive safe integer/);
 });
 
 test("a reader that falls behind after a healthy start gets an overflow", async () => {

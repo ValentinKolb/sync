@@ -3,6 +3,15 @@ import { redis } from "bun";
 import { job, queue } from "../index";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+const jobQueueBase = (id: string): string =>
+  `sync:queue:namespace:v2:${encodeURIComponent(JSON.stringify(["sync:job:queue", "default", `${id}:work`]))}`;
+const jobClaimKey = (id: string, key: string): string =>
+  `sync:job:claim:v2:${encodeURIComponent(JSON.stringify(["sync:job", id, key]))}`;
+const internalJobQueue = <T>(id: string) =>
+  queue<T>({
+    id: `${id}:work`,
+    prefix: "sync:job:queue",
+  });
 
 const waitFor = async (pred: () => boolean, timeoutMs = 10_000, pollMs = 20): Promise<void> => {
   const start = Date.now();
@@ -229,7 +238,7 @@ test("stop cancels the in-flight callback via ctx.signal", async () => {
   expect(worker.metric()).toEqual({ dispatches: 0, failures: 0, reschedules: 0 });
   expect(events).toEqual(["submitted", "started"]);
 
-  const competitor = queue({ id: `${id}:work`, prefix: "sync:job:queue" }).reader();
+  const competitor = internalJobQueue(id).reader();
   let redelivered = null;
   while (!redelivered) {
     redelivered = await competitor.recv({ wait: false });
@@ -270,7 +279,7 @@ test("losing the lease during a heartbeat aborts the running callback", async ()
 
   // A second consumer on the same internal work queue: its non-waiting recv
   // forces maintenance, which reaps the expired lease and hands the message on.
-  const competitor = queue({ id: `${id}:work`, prefix: "sync:job:queue" }).reader();
+  const competitor = internalJobQueue(id).reader();
   await Bun.sleep(100);
   let stolen = null;
   while (!stolen && observed.length === 0) {
@@ -363,7 +372,7 @@ test("a claim stranded by a crash before enqueue is re-enqueued, not silently dr
 
   // Exactly the state a pod leaves behind when it dies after claimKey and
   // before workQueue.send: a claim with no queue message, past the grace window.
-  const idemKey = `sync:job:${id}:idempotency:orders/1`;
+  const idemKey = jobClaimKey(id, "orders/1");
   await redis.send("SET", [
     idemKey,
     JSON.stringify({ jobId: "77", enqueued: false, claimedAt: Date.now() - 120_000 }),
@@ -381,12 +390,12 @@ test("a claim still inside the grace window is not enqueued twice", async () => 
   const id = uid("grace-claim");
   const j = job<{ v: number }>({ id, process: async () => {} });
 
-  const idemKey = `sync:job:${id}:idempotency:orders/2`;
+  const idemKey = jobClaimKey(id, "orders/2");
   await redis.send("SET", [idemKey, JSON.stringify({ jobId: "88", enqueued: false, claimedAt: Date.now() })]);
 
   expect(await j.submit({ key: "orders/2", input: { v: 1 } })).toBe("88");
   // Nothing was enqueued: a concurrent submit still owns that window.
-  expect(await redis.send("LLEN", [`sync:job:queue:default:${id}:work:ready`])).toBe(0);
+  expect(await redis.send("LLEN", [`${jobQueueBase(id)}:ready`])).toBe(0);
   j.stop();
 });
 
@@ -399,18 +408,15 @@ test("recovery after a successful enqueue does not duplicate the queued job", as
       runs.push(ctx.key);
     },
   });
-  const workQueue = queue<{
+  const workQueue = internalJobQueue<{
     jobId: string;
     key: string;
     input: { v: number };
     keyTtlMs: number;
     leaseMs: number;
-  }>({
-    id: `${id}:work`,
-    prefix: "sync:job:queue",
-  });
+  }>(id);
 
-  const idemKey = `sync:job:${id}:idempotency:orders/ambiguous`;
+  const idemKey = jobClaimKey(id, "orders/ambiguous");
   await redis.send("SET", [
     idemKey,
     JSON.stringify({ jobId: "77", enqueued: false, claimedAt: Date.now() - 120_000 }),
@@ -439,7 +445,7 @@ test("recovery after a successful enqueue does not duplicate the queued job", as
 test("a deterministic queue send error releases the pending claim", async () => {
   const id = uid("send-error-claim");
   const key = "orders/oversized";
-  const idemKey = `sync:job:${id}:idempotency:${key}`;
+  const idemKey = jobClaimKey(id, key);
   const runs: string[] = [];
   const j = job<{ body: string }>({
     id,
@@ -461,7 +467,7 @@ test("a deterministic queue send error releases the pending claim", async () => 
 
 test("an ambiguous successful queue send starts the worker and keeps one job", async () => {
   const id = uid("ambiguous-send-worker");
-  const targetSeqKey = `sync:job:queue:default:${id}:work:seq`;
+  const targetSeqKey = `${jobQueueBase(id)}:seq`;
   const runs: string[] = [];
   const j = job({
     id,
@@ -498,7 +504,7 @@ test("an ambiguous successful queue send starts the worker and keeps one job", a
 
 test("an immediate retry re-enqueues a transport failure that happened before the queue write", async () => {
   const id = uid("prewrite-send-retry");
-  const targetSeqKey = `sync:job:queue:default:${id}:work:seq`;
+  const targetSeqKey = `${jobQueueBase(id)}:seq`;
   const seen: number[] = [];
   const j = job<{ value: number }>({
     id,
@@ -536,7 +542,7 @@ test("an immediate retry re-enqueues a transport failure that happened before th
 
 test("a retry near claim expiry cannot accept stale work under a newer claim", async () => {
   const id = uid("expiring-send-retry");
-  const targetSeqKey = `sync:job:queue:default:${id}:work:seq`;
+  const targetSeqKey = `${jobQueueBase(id)}:seq`;
   const seen: number[] = [];
   const j = job<{ value: number }>({
     id,
@@ -587,7 +593,7 @@ test("a retry near claim expiry cannot accept stale work under a newer claim", a
     });
     expect(currentJobId).toBe("2");
     await waitFor(() => j.metric().dispatches === 1);
-    expect(await redis.get(`sync:job:${id}:idempotency:orders/expiring`)).toBeNull();
+    expect(await redis.get(jobClaimKey(id, "orders/expiring"))).toBeNull();
     releaseSend();
     await expect(staleRetry).rejects.toThrow("lost idempotency claim");
   } finally {
@@ -616,7 +622,7 @@ test("a stale attempt cannot delete a claim a later submit took over", async () 
     },
   });
 
-  const idemKey = `sync:job:${id}:idempotency:orders/3`;
+  const idemKey = jobClaimKey(id, "orders/3");
   await j.submit({ key: "orders/3", input: { v: 1 } });
   await waitFor(() => started);
 
@@ -637,7 +643,7 @@ test("a stale attempt cannot delete a claim a later submit took over", async () 
 test("reschedule does not nack after the idempotency claim changes owner", async () => {
   const id = uid("reschedule-fence");
   const key = "orders/fenced";
-  const idemKey = `sync:job:${id}:idempotency:${key}`;
+  const idemKey = jobClaimKey(id, key);
   let afterDone = false;
   const j = job({
     id,
@@ -654,14 +660,14 @@ test("reschedule does not nack after the idempotency claim changes owner", async
   await Bun.sleep(100);
 
   expect(j.metric().reschedules).toBe(0);
-  expect(await redis.send("ZSCORE", [`sync:job:queue:default:${id}:work:delayed`, "1"])).toBeNull();
+  expect(await redis.send("ZSCORE", [`${jobQueueBase(id)}:delayed`, "1"])).toBeNull();
   expect(await redis.send("GET", [idemKey])).toBe("999");
   j.stop();
 });
 
 test("a reschedule chain keeps the idempotency claim alive past keyTtlMs", async () => {
   const id = uid("ttl-refresh");
-  const idemKey = `sync:job:${id}:idempotency:orders/4`;
+  const idemKey = jobClaimKey(id, "orders/4");
   // Whether the dedup claim was still held at the start of each attempt.
   const claimHeld: boolean[] = [];
 
@@ -685,4 +691,120 @@ test("a reschedule chain keeps the idempotency claim alive past keyTtlMs", async
   // Without a refresh the claim expires mid-chain, and a fanout submit would
   // then enqueue a second concurrent job for the same key.
   expect(claimHeld.slice(0, 4)).toEqual([true, true, true, true]);
+});
+
+test("terminal settlement atomically acknowledges work and releases its claim", async () => {
+  const id = uid("atomic-terminal");
+  const key = "orders/atomic";
+  const idemKey = jobClaimKey(id, key);
+  const queueBase = jobQueueBase(id);
+  let runs = 0;
+  let terminalCommitted = false;
+  const j = job({
+    id,
+    process: async () => {
+      runs += 1;
+    },
+  });
+  const originalSend = redis.send.bind(redis);
+
+  redis.send = (async (command, args) => {
+    if (!terminalCommitted && command === "EVAL" && args[1] === "7" && args.includes(idemKey)) {
+      const result = await originalSend(command, args);
+      if (Number(result) > 0) {
+        terminalCommitted = true;
+        const error = new Error("connection reset after terminal commit") as Error & { code: string };
+        error.code = "ECONNRESET";
+        throw error;
+      }
+      return result;
+    }
+    return await originalSend(command, args);
+  }) as typeof redis.send;
+
+  try {
+    const first = await j.submit({ key });
+    await waitFor(() => terminalCommitted);
+    redis.send = originalSend as typeof redis.send;
+
+    expect(await redis.send("GET", [idemKey])).toBeNull();
+    expect(await redis.send("HGET", [`${queueBase}:messages`, first])).toBeNull();
+    expect(await redis.send("HLEN", [`${queueBase}:deliveries`])).toBe(0);
+
+    const second = await j.submit({ key });
+    expect(second).not.toBe(first);
+    await waitFor(() => runs === 2);
+  } finally {
+    redis.send = originalSend as typeof redis.send;
+    j.stop();
+  }
+});
+
+test("active claim outlives a short key TTL until its delivery lease ends", async () => {
+  const attempts: number[] = [];
+  const j = job({
+    id: uid("active-claim-lease"),
+    defaults: { leaseMs: 3_000, keyTtlMs: 1_000 },
+    process: async ({ ctx }) => {
+      attempts.push(ctx.failureCount);
+      if (ctx.failureCount === 0) {
+        await Bun.sleep(1_100);
+        throw new Error("retry");
+      }
+    },
+    after: ({ ctx }) => {
+      if (ctx.error) ctx.reschedule();
+    },
+  });
+
+  try {
+    await j.submit({ key: "orders/slow" });
+    await waitFor(() => attempts.length === 2, 8_000);
+    await waitFor(() => j.metric().dispatches === 1);
+    expect(attempts).toEqual([0, 1]);
+    expect(j.metric().reschedules).toBe(1);
+    expect(j.metric().dispatches).toBe(1);
+  } finally {
+    j.stop();
+  }
+});
+
+test("heartbeat after stop does not extend the delivery or claim", async () => {
+  const id = uid("stopped-heartbeat");
+  const key = "orders/stopped";
+  const queueBase = jobQueueBase(id);
+  const idemKey = jobClaimKey(id, key);
+  let started = false;
+  let heartbeatDone = false;
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const j = job({
+    id,
+    defaults: { leaseMs: 1_000, keyTtlMs: 1_000 },
+    process: async ({ ctx }) => {
+      started = true;
+      await gate;
+      await ctx.heartbeat({ leaseMs: 5_000 });
+      heartbeatDone = true;
+    },
+  });
+
+  try {
+    await j.submit({ key });
+    await waitFor(() => started);
+    const deliveryId = String(await redis.send("HGET", [`${queueBase}:delivery-owners`, "1"]));
+    const leaseBefore = await redis.send("ZSCORE", [`${queueBase}:leases`, deliveryId]);
+
+    j.stop();
+    release?.();
+    await waitFor(() => heartbeatDone);
+
+    expect(await redis.send("ZSCORE", [`${queueBase}:leases`, deliveryId])).toBe(leaseBefore);
+    expect(Number(await redis.send("PTTL", [idemKey]))).toBeLessThanOrEqual(1_000);
+  } finally {
+    release?.();
+    j.stop();
+  }
 });

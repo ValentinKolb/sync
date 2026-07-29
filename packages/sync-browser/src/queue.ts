@@ -209,9 +209,13 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
 
   // Per-tenant state, shared by every handle with this id: on the server two
   // queue() calls with one id always meet through Redis.
-  const states = sharedState(`queue:${prefix}:${config.id}`, undefined, () => new Map<string, QueueState>());
+  const states = sharedState(
+    JSON.stringify(["queue", prefix, config.id]),
+    undefined,
+    () => new Map<string, QueueState>(),
+  );
   const getState = (tenantId: string): QueueState => {
-    const key = `${prefix}:${tenantId}:${config.id}`;
+    const key = JSON.stringify([prefix, tenantId, config.id]);
     let state = states.get(key);
     if (!state) {
       state = {

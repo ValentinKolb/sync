@@ -8,6 +8,7 @@ const DEFAULT_TENANT = "default";
 const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_IDEMPOTENCY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_PAYLOAD_BYTES = 128 * 1024;
+const DEFAULT_MAX_LOG_ENTRIES = 256;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 const textEncoder = new TextEncoder();
@@ -15,6 +16,18 @@ const textEncoder = new TextEncoder();
 const assertTtlMs = (ttlMs: number): void => {
   if (!Number.isInteger(ttlMs) || ttlMs <= 0 || ttlMs > Number.MAX_SAFE_INTEGER) {
     throw new Error("idempotencyTtlMs must be a positive integer number of milliseconds");
+  }
+};
+
+const assertPositiveSafeInteger = (name: string, value: number): void => {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive safe integer`);
+  }
+};
+
+const assertNonNegativeSafeInteger = (name: string, value: number): void => {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative safe integer`);
   }
 };
 
@@ -160,6 +173,11 @@ type StoredEvent<T> = {
   publishedAt: number;
 };
 
+type IdempotencyFence = {
+  eventId: string;
+  payloadHash?: string;
+};
+
 type GroupState = {
   committed: string;
   delivered: string;
@@ -192,6 +210,27 @@ const persistedEntries = (value: unknown): EventLogEntry[] => {
   });
 };
 
+const parseIdempotencyFence = (value: unknown): IdempotencyFence | null => {
+  if (typeof value === "string") return { eventId: value };
+  if (
+    !value
+    || typeof value !== "object"
+    || typeof (value as { eventId?: unknown }).eventId !== "string"
+  ) {
+    return null;
+  }
+  const candidate = value as { eventId: string; payloadHash?: unknown };
+  return {
+    eventId: candidate.eventId,
+    ...(typeof candidate.payloadHash === "string" ? { payloadHash: candidate.payloadHash } : {}),
+  };
+};
+
+const sha256 = async (value: string): Promise<string> => {
+  const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+};
+
 const persistedGroup = (value: unknown): GroupState | null => {
   if (!value || typeof value !== "object") return null;
   const candidate = value as Partial<PersistedGroupState>;
@@ -202,10 +241,28 @@ const persistedGroup = (value: unknown): GroupState | null => {
   ) {
     return null;
   }
+  const validCursor = (cursor: string, allowZero: boolean): boolean =>
+    (allowZero && cursor === "0")
+    || (/^[1-9]\d*$/.test(cursor) && Number.isSafeInteger(Number(cursor)));
+  if (
+    !validCursor(candidate.committed, true)
+    || !validCursor(candidate.delivered, true)
+    || Number(candidate.committed) > Number(candidate.delivered)
+  ) {
+    return null;
+  }
 
   const inFlight = new Map<string, { at: number; consumerId: string }>();
   for (const item of candidate.inFlight) {
-    if (!Array.isArray(item) || item.length !== 2 || typeof item[0] !== "string") continue;
+    if (
+      !Array.isArray(item)
+      || item.length !== 2
+      || typeof item[0] !== "string"
+      || !validCursor(item[0], false)
+      || Number(item[0]) > Number(candidate.delivered)
+    ) {
+      continue;
+    }
     const held = item[1];
     if (
       !held
@@ -232,23 +289,35 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
   const retentionMs = config.retentionMs ?? DEFAULT_RETENTION_MS;
   const maxPayloadBytes = config.limits?.payloadBytes ?? DEFAULT_PAYLOAD_BYTES;
+  assertPositiveSafeInteger("retentionMs", retentionMs);
+  assertPositiveSafeInteger("limits.payloadBytes", maxPayloadBytes);
   const store = resolveStore(config.store);
 
   const resolveTenant = (tenantId?: string): string => tenantId ?? defaultTenant;
-  const eventLogMapKey = (tenantId: string): string => `${prefix}:${tenantId}:${config.id}`;
-  const eventLogStoreKey = (tenantId: string): string =>
-    `${prefix}:${encodeURIComponent(tenantId)}:${config.id}:browser:event-log`;
-  const groupStoreKey = (tenantId: string, group: string): string =>
-    `${prefix}:${encodeURIComponent(tenantId)}:${config.id}:browser:group:${encodeURIComponent(group)}`;
+  const encodedKey = (kind: string, ...segments: string[]): string =>
+    `sync:topic:browser:v2:${encodeURIComponent(JSON.stringify([prefix, config.id, kind, ...segments]))}`;
+  const eventLogMapKey = (tenantId: string): string =>
+    JSON.stringify([prefix, config.id, tenantId]);
+  const eventLogStoreKey = (tenantId: string): string => encodedKey("event-log", tenantId);
+  const highWaterStoreKey = (tenantId: string): string => encodedKey("high-water", tenantId);
+  const groupStoreKey = (tenantId: string, group: string): string => encodedKey("group", tenantId, group);
 
   // One EventLog per tenant, shared by every handle in this scope.
-  const eventLogs = sharedState(`topic:logs:${prefix}:${config.id}`, config.store, () => new Map<string, EventLog>());
+  const eventLogs = sharedState(
+    JSON.stringify(["topic:logs", prefix, config.id]),
+    config.store,
+    () => new Map<string, EventLog>(),
+  );
   const getEventLog = (tenantId: string): EventLog => {
     const key = eventLogMapKey(tenantId);
     let log = eventLogs.get(key);
     if (!log) {
-      const initialEntries = config.store ? persistedEntries(store.get(eventLogStoreKey(tenantId))) : [];
-      log = new EventLog({ retentionMs, initialEntries });
+      const initialEntries = config.store
+        ? persistedEntries(store.get(eventLogStoreKey(tenantId)))
+        : [];
+      log = new EventLog({ retentionMs, maxLen: DEFAULT_MAX_LOG_ENTRIES, initialEntries });
+      const highWater = store.get(highWaterStoreKey(tenantId));
+      if (typeof highWater === "string") log.advanceTo(highWater);
       eventLogs.set(key, log);
     }
     return log;
@@ -256,10 +325,17 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
   const persistEventLog = (tenantId: string, log: EventLog): void => {
     if (config.store) store.set(eventLogStoreKey(tenantId), { entries: log.snapshot() });
   };
+  const persistHighWater = (tenantId: string, eventId: string): void => {
+    if (config.store) store.set(highWaterStoreKey(tenantId), eventId);
+  };
+  const restorePersistedEventLog = (tenantId: string, eventId: string): EventLog | null => {
+    if (!config.store) return null;
+    const log = getEventLog(tenantId);
+    log.restore(persistedEntries(store.get(eventLogStoreKey(tenantId))));
+    return log.has(eventId) ? log : null;
+  };
 
-  const idempotencyKey = (tenantId: string, key: string): string =>
-    `${prefix}:${tenantId}:${config.id}:idempotency:${key}`;
-
+  const idempotencyKey = (tenantId: string, key: string): string => encodedKey("idempotency", tenantId, key);
   const parsePayload = (entry: EventLogEntry): StoredEvent<unknown> | null => {
     const rawPayload = entry.fields.payload;
     if (typeof rawPayload !== "string") return null;
@@ -281,7 +357,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     if (pubCfg.idempotencyKey || pubCfg.idempotencyTtlMs !== undefined) {
       assertTtlMs(idempotencyTtlMs);
     }
-    const log = getEventLog(tenantId);
+    let log = getEventLog(tenantId);
 
     const payload: StoredEvent<TData> = {
       data: pubCfg.data,
@@ -299,21 +375,38 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     // Idempotency check
     if (pubCfg.idempotencyKey) {
       const idemKey = idempotencyKey(tenantId, pubCfg.idempotencyKey);
-      const existing = store.get(idemKey) as string | undefined;
-      if (existing && log.has(existing)) {
-        return { eventId: existing, cursor: existing };
+      const payloadHash = await sha256(payloadRaw);
+      const existing = parseIdempotencyFence(store.get(idemKey));
+      if (existing && !log.has(existing.eventId)) {
+        log = restorePersistedEventLog(tenantId, existing.eventId) ?? log;
       }
-      if (existing) store.del(idemKey);
+      if (existing) {
+        const storedPayload = log.get(existing.eventId)?.fields.payload;
+        const matches = typeof storedPayload === "string"
+          && (existing.payloadHash === undefined || await sha256(storedPayload) === existing.payloadHash);
+        if (matches) {
+          return { eventId: existing.eventId, cursor: existing.eventId };
+        }
+        log.advanceTo(existing.eventId);
+        store.del(idemKey);
+      }
 
       const eventId = log.append(
         { payload: payloadRaw },
         {
           beforeEmit: (entry) => {
+            persistHighWater(tenantId, entry.id);
+            store.set(idemKey, { eventId: entry.id, payloadHash }, idempotencyTtlMs);
             persistEventLog(tenantId, log);
-            store.set(idemKey, entry.id, idempotencyTtlMs);
           },
           rollback: () => {
-            persistEventLog(tenantId, log);
+            try {
+              persistEventLog(tenantId, log);
+            } catch {
+              // The persisted snapshot is uncertain, so the event ID must
+              // remain fenced until a later handle can resolve it.
+              return;
+            }
             store.del(idemKey);
           },
         },
@@ -323,7 +416,13 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
 
     const eventId = log.append(
       { payload: payloadRaw },
-      { beforeEmit: () => persistEventLog(tenantId, log) },
+      {
+        beforeEmit: (entry) => {
+          persistHighWater(tenantId, entry.id);
+          persistEventLog(tenantId, log);
+        },
+        rollback: () => persistEventLog(tenantId, log),
+      },
     );
     return { eventId, cursor: eventId };
   };
@@ -334,10 +433,11 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     const cursor = existing
       ? existing.latest()
       : config.store
-        ? new EventLog({
-            retentionMs,
-            initialEntries: persistedEntries(store.get(eventLogStoreKey(tenantId))),
-          }).latest()
+          ? new EventLog({
+              retentionMs,
+              maxLen: DEFAULT_MAX_LOG_ENTRIES,
+              initialEntries: persistedEntries(store.get(eventLogStoreKey(tenantId))),
+            }).latest()
         : "0";
     return cursor === "0" ? null : cursor;
   };
@@ -355,10 +455,17 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
    * retained log.
    */
   const groupState = (tenantId: string, group: string): GroupState =>
-    sharedState(`topic:group:${prefix}:${tenantId}:${config.id}:${group}`, config.store, () => {
-      const restored = config.store ? persistedGroup(store.get(groupStoreKey(tenantId, group))) : null;
+    sharedState(JSON.stringify(["topic:group", prefix, config.id, tenantId, group]), config.store, () => {
+      const restored = config.store
+        ? persistedGroup(store.get(groupStoreKey(tenantId, group)))
+        : null;
       return restored ?? { committed: "0", delivered: "0", inFlight: new Map() };
     });
+  const cloneGroup = (state: GroupState): GroupState => ({
+    committed: state.committed,
+    delivered: state.delivered,
+    inFlight: new Map(state.inFlight),
+  });
   const persistGroup = (tenantId: string, group: string, state: GroupState): void => {
     if (!config.store) return;
     const persisted: PersistedGroupState = {
@@ -367,6 +474,12 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       inFlight: [...state.inFlight.entries()],
     };
     store.set(groupStoreKey(tenantId, group), persisted);
+  };
+  const publishGroup = (tenantId: string, group: string, current: GroupState, next: GroupState): void => {
+    persistGroup(tenantId, group, next);
+    current.committed = next.committed;
+    current.delivered = next.delivered;
+    current.inFlight = next.inFlight;
   };
 
   const reader = (group = "default", readerCfg: TopicReaderConfig = {}): RecoverableTopicReader<TData> => {
@@ -397,23 +510,26 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
             typeof raw === "string" ? raw : null,
           );
         }
-        state.committed = entry.id;
-        state.delivered = entry.id;
-        persistGroup(tenantId, group, state);
+        const next = cloneGroup(state);
+        next.committed = entry.id;
+        next.delivered = entry.id;
+        publishGroup(tenantId, group, state, next);
         return null;
       }
 
-      state.delivered = entry.id;
-      state.inFlight.set(entry.id, { at: Date.now(), consumerId });
-      persistGroup(tenantId, group, state);
+      const next = cloneGroup(state);
+      next.delivered = entry.id;
+      next.inFlight.set(entry.id, { at: Date.now(), consumerId });
+      publishGroup(tenantId, group, state, next);
 
       const commit = async (): Promise<boolean> => {
         const held = state.inFlight.get(entry.id);
         // Mirror the server's fenced XACK: only the current owner may commit.
         if (!held || held.consumerId !== consumerId) return false;
-        state.inFlight.delete(entry.id);
-        if (Number(entry.id) > Number(state.committed)) state.committed = entry.id;
-        persistGroup(tenantId, group, state);
+        const committed = cloneGroup(state);
+        committed.inFlight.delete(entry.id);
+        if (Number(entry.id) > Number(committed.committed)) committed.committed = entry.id;
+        publishGroup(tenantId, group, state, committed);
         return true;
       };
 
@@ -447,11 +563,12 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     const recv = async (recvCfg: TopicRecvConfig = {}): Promise<TopicDelivery<TData> | null> => {
       assertOpen();
       if (recvCfg.signal?.aborted) return null;
+      const timeoutMs = recvCfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+      assertNonNegativeSafeInteger("timeoutMs", timeoutMs);
       const tenantId = resolveTenant(recvCfg.tenantId);
       const log = getEventLog(tenantId);
       const state = groupState(tenantId, group);
       const wait = recvCfg.wait ?? true;
-      const timeoutMs = recvCfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
       const immediate = nextFromLog(log, tenantId, state, recvCfg.invalidPayload);
       if (immediate) return immediate;
@@ -502,7 +619,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     const reclaim = async (reclaimCfg: TopicReclaimConfig = {}): Promise<TopicReclaimResult<TData>> => {
       assertOpen();
       const minIdleMs = reclaimCfg.minIdleMs ?? 60_000;
-      if (!Number.isFinite(minIdleMs) || minIdleMs < 0) throw new Error("minIdleMs must be a non-negative number");
+      assertNonNegativeSafeInteger("minIdleMs", minIdleMs);
       const count = reclaimCfg.count ?? 25;
       if (!Number.isInteger(count) || count < 1 || count > 1_000) {
         throw new Error("count must be an integer between 1 and 1000");
@@ -511,6 +628,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       const tenantId = resolveTenant(reclaimCfg.tenantId);
       const log = getEventLog(tenantId);
       const state = groupState(tenantId, group);
+      const nextState = cloneGroup(state);
       const now = Date.now();
       const cursor = Number(reclaimCfg.cursor ?? "0-0") || 0;
 
@@ -526,19 +644,20 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
         lastId = eventId;
         const found = log.range(String(Number(eventId) - 1), 1).find((e) => e.id === eventId);
         if (!found) {
-          state.inFlight.delete(eventId);
+          nextState.inFlight.delete(eventId);
           groupChanged = true;
           continue;
         }
         // Take ownership, then hand it out again.
-        state.inFlight.set(eventId, { at: now, consumerId });
+        nextState.inFlight.set(eventId, { at: now, consumerId });
         groupChanged = true;
         const commit = async (): Promise<boolean> => {
           const held = state.inFlight.get(found.id);
           if (!held || held.consumerId !== consumerId) return false;
-          state.inFlight.delete(found.id);
-          if (Number(found.id) > Number(state.committed)) state.committed = found.id;
-          persistGroup(tenantId, group, state);
+          const committed = cloneGroup(state);
+          committed.inFlight.delete(found.id);
+          if (Number(found.id) > Number(committed.committed)) committed.committed = found.id;
+          publishGroup(tenantId, group, state, committed);
           return true;
         };
 
@@ -571,7 +690,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
           },
         });
       }
-      if (groupChanged) persistGroup(tenantId, group, state);
+      if (groupChanged) publishGroup(tenantId, group, state, nextState);
 
       return { nextCursor: candidates.length > stale.length ? lastId : "0-0", entries };
     };
@@ -590,6 +709,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
   // ==========================
 
   const live = async function* (liveCfg: TopicLiveConfig = {}): AsyncIterable<TopicLiveEvent<TData>> {
+    if (liveCfg.timeoutMs !== undefined) assertNonNegativeSafeInteger("timeoutMs", liveCfg.timeoutMs);
     const tenantId = resolveTenant(liveCfg.tenantId);
     const log = getEventLog(tenantId);
 

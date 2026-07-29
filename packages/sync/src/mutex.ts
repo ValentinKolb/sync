@@ -35,6 +35,18 @@ const assertTtl = (ttl: number, label = "ttl"): void => {
   }
 };
 
+const assertRetryCount = (value: number): void => {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError("retryCount must be a non-negative safe integer");
+  }
+};
+
+const assertRetryDelay = (value: number): void => {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError("retryDelay must be a non-negative safe integer");
+  }
+};
+
 // ==========================
 // Types
 // ==========================
@@ -86,6 +98,8 @@ export const mutex = (config: MutexConfig): Mutex => {
   const retryCount = config.retryCount ?? DEFAULT_RETRY_COUNT;
   const retryDelay = config.retryDelay ?? DEFAULT_RETRY_DELAY;
   const defaultTtl = config.defaultTtl ?? DEFAULT_TTL;
+  assertRetryCount(retryCount);
+  assertRetryDelay(retryDelay);
   assertTtl(defaultTtl, "defaultTtl");
 
   const acquire = async (resource: string, ttl: number = defaultTtl): Promise<Lock | null> => {

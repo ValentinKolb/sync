@@ -20,6 +20,9 @@ const trackStore = (store = createMemoryStore()): MemoryStore => {
   return store;
 };
 
+const pumpStateKey = (prefix: string, id: string, key: string): string =>
+  `sync:pump:browser:v2:${encodeURIComponent(JSON.stringify([prefix, id]))}:run:${encodeURIComponent(key)}`;
+
 const waitFor = async (
   predicate: () => boolean | Promise<boolean>,
   timeoutMs = 5_000,
@@ -114,6 +117,31 @@ test("start is idempotent for a persisted key", async () => {
 
   await waitFor(async () => (await worker.get({ key: "same" }))?.state === "completed");
   expect(pulls).toBe(1);
+});
+
+test("colon-rich pump identities keep persisted runs isolated", async () => {
+  const store = trackStore();
+  const base = uid("identity");
+  const first = track(pump<Input, Cursor, Item>({
+    id: "b",
+    prefix: `${base}:a`,
+    store,
+    pull: () => ({ items: [], nextCursor: null }),
+    dispatch: () => {},
+  }));
+  const second = track(pump<Input, Cursor, Item>({
+    id: "a:b",
+    prefix: base,
+    store,
+    pull: () => ({ items: [], nextCursor: null }),
+    dispatch: () => {},
+  }));
+
+  const firstState = await first.start({ key: "run", input: { source: "first" } });
+  const secondState = await second.start({ key: "run", input: { source: "second" } });
+
+  expect(firstState.input).toEqual({ source: "first" });
+  expect(secondState.input).toEqual({ source: "second" });
 });
 
 test("default same-id handles share persisted runs", async () => {
@@ -482,13 +510,18 @@ test("a non-empty page with an unchanged cursor dispatches at least once and fai
   });
 });
 
-test("malformed persisted state is ignored without invoking callbacks", async () => {
+test("malformed persisted states are removed before pull and their keys are reusable", async () => {
   const store = trackStore();
   const id = uid("malformed");
-  const key = "broken";
-  let pulls = 0;
-  store.set(`sync:pump:${id}:run:${encodeURIComponent(key)}`, "not-a-pump-state");
+  const malformed = [
+    { key: "invalid-string", value: "not-a-pump-state" },
+    { key: "invalid-shape", value: {} },
+  ];
+  for (const entry of malformed) {
+    store.set(pumpStateKey("sync:pump", id, entry.key), entry.value);
+  }
 
+  let pulls = 0;
   const worker = track(pump<Input, Cursor, Item>({
     id,
     store,
@@ -501,14 +534,20 @@ test("malformed persisted state is ignored without invoking callbacks", async ()
 
   await Bun.sleep(300);
   expect(pulls).toBe(0);
-  expect(await worker.get({ key })).toBeNull();
+  for (const entry of malformed) {
+    expect(await worker.get({ key: entry.key })).toBeNull();
+    expect(store.get(pumpStateKey("sync:pump", id, entry.key))).toBeUndefined();
+    await worker.start({ key: entry.key, input: { source: "messages" } });
+    await waitFor(async () => (await worker.get({ key: entry.key }))?.state === "completed");
+  }
+  expect(pulls).toBe(2);
 });
 
 test("a stale worker cannot checkpoint after its lease token is replaced", async () => {
   const store = trackStore();
   const id = uid("stale-commit");
   const key = "run";
-  const stateKey = `sync:pump:${id}:run:${encodeURIComponent(key)}`;
+  const stateKey = pumpStateKey("sync:pump", id, key);
   let dispatchStarted = false;
   let releaseDispatch!: () => void;
   let dispatchFinished = false;

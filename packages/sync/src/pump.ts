@@ -20,6 +20,23 @@ const STALLED_PAGE_ERROR = "pull returned a page without advancing the cursor";
 
 const textEncoder = new TextEncoder();
 
+const canonicalJson = (value: unknown): string => {
+  const normalize = (current: unknown): unknown => {
+    if (Array.isArray(current)) return current.map(normalize);
+    if (current && typeof current === "object") {
+      return Object.fromEntries(
+        Object.entries(current as Record<string, unknown>)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, entry]) => [key, normalize(entry)]),
+      );
+    }
+    return current;
+  };
+  const encoded = JSON.stringify(normalize(value));
+  if (encoded === undefined) throw new Error("value is not JSON-serializable");
+  return encoded;
+};
+
 const START_SCRIPT = `
   local existing = redis.call("GET", KEYS[1])
   if existing then
@@ -39,7 +56,8 @@ const CLAIM_SCRIPT = `
   end
 
   local ok, state = pcall(cjson.decode, raw)
-  if not ok then
+  if not ok or type(state) ~= "table" then
+    redis.call("DEL", KEYS[1])
     redis.call("ZREM", KEYS[2], ARGV[1])
     return nil
   end
@@ -72,6 +90,15 @@ const CLAIM_SCRIPT = `
   return encoded
 `;
 
+const DELETE_INVALID_SCRIPT = `
+  local raw = redis.call("GET", KEYS[1])
+  if raw ~= ARGV[2] then return 0 end
+
+  redis.call("DEL", KEYS[1])
+  redis.call("ZREM", KEYS[2], ARGV[1])
+  return 1
+`;
+
 const HEARTBEAT_SCRIPT = `
   local raw = redis.call("GET", KEYS[1])
   if not raw then return 0 end
@@ -101,7 +128,7 @@ const STORE_PAGE_SCRIPT = `
   state.pageNextCursorJson = ARGV[4]
   state.pageNextIndex = 0
   state.pageItemCount = tonumber(ARGV[5])
-  local stalled = ARGV[4] ~= "null" and ARGV[4] == state.cursorJson
+  local stalled = ARGV[7] == "1"
   if not stalled then
     state.failureCount = 0
     state.lastError = nil
@@ -127,8 +154,7 @@ const CHECKPOINT_SCRIPT = `
 
   state.pageNextIndex = tonumber(ARGV[2]) + 1
   state.dispatched = (tonumber(state.dispatched) or 0) + 1
-  local stalled = state.pageNextCursorJson ~= "null"
-    and state.pageNextCursorJson == state.cursorJson
+  local stalled = ARGV[4] == "1"
   if not stalled then
     state.failureCount = 0
     state.lastError = nil
@@ -160,8 +186,7 @@ const COMMIT_PAGE_SCRIPT = `
   -- empty page with a nextPageToken hammer Redis and the upstream forever, with
   -- no terminal state and no trace signal. Such a round now counts as a failure
   -- so the configured backoff and maxAttempts apply.
-  local stalled = nextCursorJson ~= "null"
-    and nextCursorJson == state.cursorJson
+  local stalled = ARGV[8] == "1"
   state.cursorJson = nextCursorJson
   state.pageItemsJson = nil
   state.pageNextCursorJson = nil
@@ -489,12 +514,66 @@ const assertJsonValue = (value: unknown, label: string, seen = new WeakSet<objec
   seen.delete(value);
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+const isPumpStatus = (value: unknown): value is PumpStatus =>
+  value === "queued" ||
+  value === "running" ||
+  value === "waiting" ||
+  value === "completed" ||
+  value === "failed" ||
+  value === "canceled";
+
+const isNonNegativeSafeInteger = (value: unknown): value is number =>
+  Number.isSafeInteger(value) && (value as number) >= 0;
+
+const isFiniteTimestamp = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0;
+
+const isJsonValue = (value: unknown): boolean => {
+  try {
+    assertJsonValue(value, "persisted pump state");
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const parseState = <Input, Cursor, Item extends PumpItem>(
   raw: unknown,
 ): StoredPumpState<Input, Cursor, Item> | null => {
   if (typeof raw !== "string") return null;
   try {
-    const record = JSON.parse(raw) as StoredPumpRecord;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) return null;
+    const record = parsed as StoredPumpRecord;
+    if (
+      record.version !== 1 ||
+      typeof record.key !== "string" ||
+      record.key.length === 0 ||
+      textEncoder.encode(record.key).byteLength > MAX_KEY_BYTES ||
+      typeof record.cursorJson !== "string" ||
+      !isPumpStatus(record.state) ||
+      !isNonNegativeSafeInteger(record.dispatched) ||
+      !isNonNegativeSafeInteger(record.failureCount) ||
+      !isFiniteTimestamp(record.createdAt) ||
+      !isFiniteTimestamp(record.updatedAt) ||
+      (record.inputJson !== undefined && typeof record.inputJson !== "string") ||
+      (record.metaJson !== undefined && typeof record.metaJson !== "string") ||
+      (record.lastError !== undefined && typeof record.lastError !== "string") ||
+      (record.nextRunAt !== undefined && !isFiniteTimestamp(record.nextRunAt)) ||
+      (record.leaseToken !== undefined && (typeof record.leaseToken !== "string" || record.leaseToken.length === 0)) ||
+      (record.leaseUntil !== undefined && !isFiniteTimestamp(record.leaseUntil))
+    ) {
+      return null;
+    }
+
+    const hasLeaseToken = record.leaseToken !== undefined;
+    const hasLeaseUntil = record.leaseUntil !== undefined;
+    if (hasLeaseToken !== hasLeaseUntil || (record.state === "running") !== hasLeaseToken) return null;
+    if ((record.state === "queued" || record.state === "waiting") && record.nextRunAt === undefined) return null;
+
     const input = record.inputJson === undefined
       ? undefined as Input
       : JSON.parse(record.inputJson) as Input;
@@ -502,13 +581,51 @@ const parseState = <Input, Cursor, Item extends PumpItem>(
     const meta = record.metaJson === undefined
       ? undefined
       : JSON.parse(record.metaJson) as Record<string, unknown>;
-    const activePage = record.pageItemsJson === undefined
-      ? undefined
-      : {
-          items: JSON.parse(record.pageItemsJson) as Item[],
-          nextCursor: JSON.parse(record.pageNextCursorJson!) as Cursor | null,
-          nextIndex: record.pageNextIndex ?? 0,
-        };
+    if (
+      (input !== undefined && !isJsonValue(input)) ||
+      !isJsonValue(cursor) ||
+      (meta !== undefined && (!isRecord(meta) || !isJsonValue(meta)))
+    ) {
+      return null;
+    }
+
+    const pageFields = [
+      record.pageItemsJson,
+      record.pageNextCursorJson,
+      record.pageNextIndex,
+      record.pageItemCount,
+    ];
+    const hasActivePage = pageFields.every((value) => value !== undefined);
+    if (!hasActivePage && pageFields.some((value) => value !== undefined)) return null;
+
+    let activePage: ActivePage<Cursor, Item> | undefined;
+    if (hasActivePage) {
+      if (
+        typeof record.pageItemsJson !== "string" ||
+        typeof record.pageNextCursorJson !== "string" ||
+        !isNonNegativeSafeInteger(record.pageNextIndex) ||
+        !isNonNegativeSafeInteger(record.pageItemCount)
+      ) {
+        return null;
+      }
+      const items = JSON.parse(record.pageItemsJson) as unknown;
+      const nextCursor = JSON.parse(record.pageNextCursorJson) as Cursor | null;
+      if (
+        !Array.isArray(items) ||
+        items.length !== record.pageItemCount ||
+        record.pageNextIndex > items.length ||
+        !isJsonValue(items) ||
+        !isJsonValue(nextCursor) ||
+        !items.every((item) => isRecord(item) && typeof item.key === "string" && item.key.length > 0)
+      ) {
+        return null;
+      }
+      activePage = {
+        items: items as Item[],
+        nextCursor,
+        nextIndex: record.pageNextIndex,
+      };
+    }
 
     return {
       version: 1,
@@ -588,8 +705,24 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   const stateKeyForMember = (member: string): string => `${baseKey}:run:${member}`;
   const stateKeyFor = (key: string): string => stateKeyForMember(memberFor(key));
 
-  const readState = async (key: string): Promise<StoredPumpState<Input, Cursor, Item> | null> =>
-    parseState<Input, Cursor, Item>(await redis.get(stateKeyFor(key)));
+  const removeInvalidState = async (member: string, raw: string): Promise<void> => {
+    await evalScript(
+      DELETE_INVALID_SCRIPT,
+      [stateKeyForMember(member), dueKey],
+      [member, raw],
+    );
+  };
+
+  const readState = async (key: string): Promise<StoredPumpState<Input, Cursor, Item> | null> => {
+    const member = memberFor(key);
+    const raw = await redis.get(stateKeyForMember(member));
+    const state = parseState<Input, Cursor, Item>(raw);
+    if ((!state || state.key !== key) && typeof raw === "string") {
+      await removeInvalidState(member, raw);
+      return null;
+    }
+    return state;
+  };
 
   const heartbeat = async (member: string, token: string): Promise<boolean> => {
     const now = Date.now();
@@ -671,7 +804,9 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
           nextIndex: 0,
         };
         const itemsJson = JSON.stringify(activePage.items);
-        const nextCursorJson = JSON.stringify(activePage.nextCursor);
+        const nextCursorJson = canonicalJson(activePage.nextCursor);
+        const stalled = activePage.nextCursor !== null
+          && canonicalJson(activePage.nextCursor) === canonicalJson(state.cursor);
         const pageRaw = JSON.stringify({
           items: activePage.items,
           nextCursor: activePage.nextCursor,
@@ -685,7 +820,7 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
           await evalScript(
             STORE_PAGE_SCRIPT,
             [stateKeyForMember(member)],
-            [member, token, itemsJson, nextCursorJson, activePage.items.length, Date.now()],
+            [member, token, itemsJson, nextCursorJson, activePage.items.length, Date.now(), stalled ? "1" : "0"],
           ),
         );
         if (!stored) throw new LeaseLostError();
@@ -705,6 +840,8 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
 
         const index = state.activePage.nextIndex;
         const item = state.activePage.items[index]!;
+        const stalled = state.activePage.nextCursor !== null
+          && canonicalJson(state.activePage.nextCursor) === canonicalJson(state.cursor);
         const dispatchStartedAt = Date.now();
         await Promise.resolve(
           config.dispatch({
@@ -719,7 +856,7 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
           await evalScript(
             CHECKPOINT_SCRIPT,
             [stateKeyForMember(member)],
-            [token, index, Date.now()],
+            [token, index, Date.now(), stalled ? "1" : "0"],
           ),
         );
         if (!checkpointed) throw new LeaseLostError();
@@ -737,11 +874,14 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
       const nextRunAt = Date.now() + delayMs;
       const stalledRunAt =
         Date.now() + Math.max(delayMs, expBackoff((state.failureCount ?? 0) + 1, retryBackoff));
+      const stalled = state.activePage !== undefined
+        && state.activePage.nextCursor !== null
+        && canonicalJson(state.activePage.nextCursor) === canonicalJson(state.cursor);
       const committed = parseState<Input, Cursor, Item>(
         await evalScript(
           COMMIT_PAGE_SCRIPT,
           [stateKeyForMember(member), dueKey],
-          [member, token, Date.now(), nextRunAt, terminalRetentionMs, stalledRunAt, maxAttempts],
+          [member, token, Date.now(), nextRunAt, terminalRetentionMs, stalledRunAt, maxAttempts, stalled ? "1" : "0"],
         ),
       );
       if (!committed) throw new LeaseLostError();
@@ -852,14 +992,14 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
 
             const token = randomUUID();
             const now = Date.now();
-            const claimed = parseState<Input, Cursor, Item>(
-              await evalScript(
-                CLAIM_SCRIPT,
-                [stateKeyForMember(member), dueKey],
-                [member, token, now, now + leaseMs],
-              ),
+            const claimedRaw = await evalScript(
+              CLAIM_SCRIPT,
+              [stateKeyForMember(member), dueKey],
+              [member, token, now, now + leaseMs],
             );
-            if (!claimed) {
+            const claimed = parseState<Input, Cursor, Item>(claimedRaw);
+            if (!claimed || memberFor(claimed.key) !== member) {
+              if (typeof claimedRaw === "string") await removeInvalidState(member, claimedRaw);
               await sleep(10);
               continue;
             }
@@ -897,16 +1037,24 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
     };
     const stateRaw = JSON.stringify(state);
     const member = memberFor(cfg.key);
-    const result = await evalScript(
-      START_SCRIPT,
-      [stateKeyForMember(member), dueKey],
-      [member, stateRaw, now],
-    );
-    if (!Array.isArray(result)) throw new Error("pump start failed");
+    let stored: StoredPumpState<Input, Cursor, Item> | null = null;
+    let created = false;
+    for (let attempt = 0; attempt < 3 && !stored; attempt += 1) {
+      const result = await evalScript(
+        START_SCRIPT,
+        [stateKeyForMember(member), dueKey],
+        [member, stateRaw, now],
+      );
+      if (!Array.isArray(result)) throw new Error("pump start failed");
 
-    const stored = parseState<Input, Cursor, Item>(result[0]);
+      const parsed = parseState<Input, Cursor, Item>(result[0]);
+      stored = parsed?.key === cfg.key ? parsed : null;
+      created = Number(result[1]) > 0;
+      if (!stored && typeof result[0] === "string") {
+        await removeInvalidState(member, result[0]);
+      }
+    }
     if (!stored) throw new Error("pump state is invalid");
-    const created = Number(result[1]) > 0;
     startWorker();
 
     if (created) {

@@ -2,6 +2,9 @@ import { test, expect } from "bun:test";
 import { mutex, LockError } from "../src/mutex";
 import { createMemoryStore } from "../src/store";
 
+const mutexKey = (prefix: string, id: string, resource: string): string =>
+  `sync:mutex:browser:v2:${encodeURIComponent(JSON.stringify([prefix, id, resource]))}`;
+
 // ==========================
 // Basic acquire / release
 // ==========================
@@ -14,7 +17,7 @@ test("acquires lock successfully", async () => {
 
   const lock = await m.acquire("resource:1");
   expect(lock).not.toBeNull();
-  expect(lock!.resource).toBe("test:mx:basic:resource:1");
+  expect(lock!.resource).toBe(mutexKey("test:mx", "basic", "resource:1"));
   expect(lock!.value).toHaveLength(32); // 16 bytes hex
   expect(lock!.ttl).toBe(10_000); // default TTL
   expect(lock!.expiration).toBeGreaterThan(Date.now() - 100);
@@ -93,7 +96,7 @@ test("withLock executes function and releases", async () => {
 
   const result = await m.withLock("resource:5", async (lock) => {
     expect(lock).not.toBeNull();
-    expect(lock.resource).toBe("test:mx:withlock:resource:5");
+    expect(lock.resource).toBe(mutexKey("test:mx", "withlock", "resource:5"));
     return 42;
   });
 
@@ -103,6 +106,30 @@ test("withLock executes function and releases", async () => {
   const lock = await m.acquire("resource:5");
   expect(lock).not.toBeNull();
   await m.release(lock!);
+});
+
+test("legacy mutex fencing conservatively serializes colliding identities", async () => {
+  const store = createMemoryStore();
+  const base = `mutex-identity-${Date.now()}`;
+  const first = mutex({ id: "b", prefix: `${base}:a`, retryCount: 0, store });
+  const second = mutex({ id: "a:b", prefix: base, retryCount: 0, store });
+
+  const firstLock = await first.acquire("resource");
+  const secondLock = await second.acquire("resource");
+  expect(firstLock).not.toBeNull();
+  expect(secondLock).toBeNull();
+  await first.release(firstLock!);
+  const retried = await second.acquire("resource");
+  expect(retried).not.toBeNull();
+  await second.release(retried!);
+});
+
+test("an active legacy mutex blocks the versioned mutex", async () => {
+  const store = createMemoryStore();
+  store.set("test:mx:rolling:resource", "old-owner", 1_000);
+  const current = mutex({ id: "rolling", prefix: "test:mx", retryCount: 0, store });
+
+  expect(await current.acquire("resource")).toBeNull();
 });
 
 test("withLock returns null when lock unavailable", async () => {
@@ -225,7 +252,7 @@ test("long resource names are hashed", async () => {
 
   // The resource key should contain a hash, not the full name
   expect(lock!.resource.length).toBeLessThan(longName.length);
-  expect(lock!.resource).toContain("hash:");
+  expect(decodeURIComponent(lock!.resource)).toContain("hash:");
 
   await m.release(lock!);
 
@@ -399,4 +426,16 @@ test("rejects invalid lock TTLs without changing store state", async () => {
   }
   expect(await m.acquire("resource")).toBeNull();
   await m.release(lock!);
+});
+
+test("rejects invalid retry configuration before acquiring", () => {
+  const invalidCounts = [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1];
+  for (const retryCount of invalidCounts) {
+    expect(() => mutex({ id: "invalid-retry-count", retryCount })).toThrow(/retryCount/);
+  }
+
+  const invalidDelays = [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1];
+  for (const retryDelay of invalidDelays) {
+    expect(() => mutex({ id: "invalid-retry-delay", retryDelay })).toThrow(/retryDelay/);
+  }
 });

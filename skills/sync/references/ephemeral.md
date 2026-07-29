@@ -10,7 +10,6 @@ import { ephemeral, EphemeralCapacityError, EphemeralPayloadTooLargeError } from
 const presence = ephemeral<{ userId: string; displayName: string }>({
   id: "notebook.presence",
   ttlMs: 30_000,
-  // prefix?: string,                                     // default: "sync:e"
   // tenantId?: string,                                   // default: "default"
   // limits?: { maxEntries, maxPayloadBytes, eventRetentionMs, eventMaxLen },
 });

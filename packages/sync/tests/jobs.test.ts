@@ -19,6 +19,12 @@ const waitFor = async (pred: () => boolean, timeoutMs = 5_000, pollMs = 20): Pro
   }
 };
 
+const internalJobQueueReader = (id: string) =>
+  queue({
+    id: `${id}:work`,
+    prefix: "sync:job:queue",
+  }).reader();
+
 // ==========================
 // Happy path
 // ==========================
@@ -47,6 +53,75 @@ test("submit + process + after (success path)", async () => {
   expect(afterSignalAborted).toBe(false);
 
   worker.stop();
+});
+
+test("job id and submission key delimiter combinations do not share claims", async () => {
+  let firstRuns = 0;
+  let secondRuns = 0;
+  const first = job({
+    id: "a:idempotency:b",
+    process: async () => {
+      firstRuns += 1;
+    },
+  });
+  const second = job({
+    id: "a",
+    process: async () => {
+      secondRuns += 1;
+    },
+  });
+
+  try {
+    await Promise.all([
+      first.submit({ key: "c" }),
+      second.submit({ key: "b:idempotency:c" }),
+    ]);
+    await waitFor(() => firstRuns === 1 && secondRuns === 1);
+  } finally {
+    first.stop();
+    second.stop();
+  }
+});
+
+test("jobs fail closed when a legacy claim already exists", async () => {
+  const id = "legacy-job";
+  const key = "scope-key";
+  await redis.set(`sync:job:${id}:idempotency:${key}`, "old-worker-claim");
+  const worker = job({ id, process: async () => {} });
+
+  try {
+    await expect(worker.submit({ key })).rejects.toThrow(/job claim migration required/);
+  } finally {
+    worker.stop();
+  }
+});
+
+test("ordinary job claims use the full identity tuple", async () => {
+  const id = uid("legacy-claim");
+  let started = false;
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const worker = job({
+    id,
+    process: async () => {
+      started = true;
+      await gate;
+    },
+  });
+
+  try {
+    const jobId = await worker.submit({ key: "simple" });
+    await waitFor(() => started);
+    const claimKey =
+      `sync:job:claim:v2:${encodeURIComponent(JSON.stringify(["sync:job", id, "simple"]))}`;
+    expect(await redis.get(claimKey)).toContain(jobId);
+    expect(await redis.get(`sync:job:${id}:idempotency:simple`)).toBeNull();
+  } finally {
+    release();
+    worker.stop();
+  }
 });
 
 test("ctx.key and ctx.jobId flow through process and after", async () => {
@@ -595,7 +670,7 @@ const raceHeartbeat = async (
   // forces maintenance, so an expired lease is actually reaped — without one,
   // a single busy worker means nothing ever reaps and the lease lapsing has no
   // observable effect at all.
-  const competitor = queue({ id: `${id}:work`, prefix: "sync:job:queue" }).reader();
+  const competitor = internalJobQueueReader(id);
   let stolen = false;
   while (!finished && !stolen) {
     const taken = await competitor.recv({ wait: false });
@@ -648,7 +723,7 @@ test("a per-submit lease overrides a longer handle default on first delivery", a
   await worker.submit({ key: "short", leaseMs: 100 });
   await waitFor(() => running);
 
-  const competitor = queue({ id: `${id}:work`, prefix: "sync:job:queue" }).reader();
+  const competitor = internalJobQueueReader(id);
   let stolen = false;
   const deadline = Date.now() + 3_000;
   while (!stolen && Date.now() < deadline) {
@@ -685,7 +760,7 @@ test("a slow started trace cannot hand expired work to process", async () => {
   await worker.submit({ key: "trace" });
   await waitFor(() => traceStarted);
 
-  const competitor = queue({ id: `${id}:work`, prefix: "sync:job:queue" }).reader();
+  const competitor = internalJobQueueReader(id);
   let stolen = false;
   const deadline = Date.now() + 3_000;
   while (!stolen && Date.now() < deadline) {

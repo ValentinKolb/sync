@@ -2,6 +2,9 @@ import { test, expect } from "bun:test";
 import { ratelimit, RateLimitError } from "../src/ratelimit";
 import { createMemoryStore, type Store } from "../src/store";
 
+const rateLimitKey = (prefix: string, id: string, identifier: string, window: number): string =>
+  `sync:ratelimit:browser:v2:${encodeURIComponent(JSON.stringify([prefix, id, identifier, window]))}`;
+
 // ==========================
 // Allows requests within limit
 // ==========================
@@ -21,6 +24,31 @@ test("allows requests within limit", async () => {
     const result = await limiter.check("user:1");
     expect(result.limited).toBe(false);
   }
+});
+
+test("legacy rate-limit fencing conservatively shares colliding counters", async () => {
+  const store = createMemoryStore();
+  const base = `ratelimit-identity-${Date.now()}`;
+  const first = ratelimit({ id: "b", prefix: `${base}:a`, limit: 1, windowSecs: 60, store });
+  const second = ratelimit({ id: "a:b", prefix: base, limit: 1, windowSecs: 60, store });
+
+  expect((await first.check("user")).limited).toBe(false);
+  expect((await second.check("user")).limited).toBe(true);
+});
+
+test("versioned rate limiting continues an active legacy counter", async () => {
+  const store = createMemoryStore();
+  const nowWindow = Math.floor(Date.now() / 60_000);
+  store.set(`test:rl:rolling:user:${nowWindow}`, 2, 120_000);
+  const limiter = ratelimit({
+    id: "rolling",
+    prefix: "test:rl",
+    limit: 2,
+    windowSecs: 60,
+    store,
+  });
+
+  expect((await limiter.check("user")).limited).toBe(true);
 });
 
 // ==========================
@@ -181,7 +209,7 @@ test("sliding window applies the weighted previous-window count", async () => {
   }
 
   const previousWindow = Math.floor(now / windowMs) - 1;
-  store.set(`sync:ratelimit:${id}:${identifier}:${previousWindow}`, 100);
+  store.set(rateLimitKey("sync:ratelimit", id, identifier, previousWindow), 100);
 
   const result = await limiter.check(identifier);
   expect(result).toMatchObject({ limited: true, remaining: 0 });
@@ -392,7 +420,8 @@ test("windowSecs must be a positive integer", () => {
   expect(() => ratelimit({ id: "safe-window", limit: 1, windowSecs: 1 })).not.toThrow();
   expect(() =>
     ratelimit({ id: "large-integer-window", limit: 1, windowSecs: Number.MAX_SAFE_INTEGER + 1 }),
-  ).not.toThrow();
+  ).toThrow(/positive integer/);
+  expect(() => ratelimit({ id: "huge-window", limit: 1, windowSecs: 1e308 })).toThrow(/positive integer/);
 });
 
 test("malformed persisted counters fail closed", async () => {
@@ -401,16 +430,16 @@ test("malformed persisted counters fail closed", async () => {
   const identifier = "user";
   const windowSecs = 86_400;
   const currentWindow = Math.floor(Date.now() / (windowSecs * 1000));
-  const key = (window: number): string => `sync:ratelimit:${id}:${identifier}:${window}`;
+  const key = (window: number): string => rateLimitKey("sync:ratelimit", id, identifier, window);
   const limiter = ratelimit({ id, limit: 5, windowSecs, store });
 
   store.set(key(currentWindow - 1), "corrupt");
   expect(await limiter.check(identifier)).toMatchObject({ limited: true, remaining: 0 });
 
   store.del(key(currentWindow - 1));
-  store.set(key(currentWindow), Number.NaN);
+  store.set(key(currentWindow), "not-a-counter");
   await expect(limiter.checkOrThrow(identifier)).rejects.toBeInstanceOf(RateLimitError);
-  expect(Number.isNaN(store.get(key(currentWindow)) as number)).toBe(true);
+  expect(store.get(key(currentWindow))).toBe("not-a-counter");
 });
 
 test("large windows retain their counter beyond the native timer clamp", async () => {

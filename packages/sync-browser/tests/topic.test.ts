@@ -32,6 +32,9 @@ const jsonStore = (backing: Map<string, string>): Store => ({
   },
 });
 
+const topicKeyKind = (key: string, kind: string): boolean =>
+  key.startsWith("sync:topic:browser:v2:") && decodeURIComponent(key).includes(`"${kind}"`);
+
 // ==========================
 // pub + recv basics
 // ==========================
@@ -94,7 +97,7 @@ test("reader reclaim is empty when the group has no pending deliveries", async (
     nextCursor: "0-0",
     entries: [],
   });
-  await expect(reader.reclaim({ minIdleMs: -1 })).rejects.toThrow("minIdleMs must be a non-negative number");
+  await expect(reader.reclaim({ minIdleMs: -1 })).rejects.toThrow("minIdleMs must be a non-negative safe integer");
   await expect(reader.reclaim({ count: 0 })).rejects.toThrow("count must be an integer between 1 and 1000");
 });
 
@@ -391,7 +394,7 @@ test("failed event persistence is rolled back before readers can observe it", as
   const store: Store = {
     ...base,
     set(key, value, ttlMs) {
-      if (key.endsWith(":browser:event-log") && failWrite) {
+      if (topicKeyKind(key, "event-log") && failWrite) {
         failWrite = false;
         throw new Error("storage full");
       }
@@ -407,7 +410,7 @@ test("failed event persistence is rolled back before readers can observe it", as
   await expect(
     t.pub({ data: { value: 1 }, idempotencyKey: "same" }),
   ).rejects.toThrow("storage full");
-  expect([...backing.keys()].some((key) => key.includes(":idempotency:"))).toBe(false);
+  expect([...backing.keys()].some((key) => topicKeyKind(key, "idempotency"))).toBe(false);
   expect(await t.latestCursor()).toBeNull();
   expect(await t.reader("check").recv({ wait: false })).toBeNull();
 
@@ -423,7 +426,7 @@ test("failed idempotency persistence rolls the event snapshot back", async () =>
   const store: Store = {
     ...base,
     set(key, value, ttlMs) {
-      if (key.includes(":idempotency:") && failKeyWrite) {
+      if (topicKeyKind(key, "idempotency") && failKeyWrite) {
         failKeyWrite = false;
         throw new Error("key write failed");
       }
@@ -445,6 +448,299 @@ test("failed idempotency persistence rolls the event snapshot back", async () =>
   const reader = t.reader("check");
   expect((await reader.recv({ wait: false }))?.eventId).toBe(published.eventId);
   expect(await reader.recv({ wait: false })).toBeNull();
+});
+
+test("write-then-throw event persistence is rolled back and remains retryable", async () => {
+  const backing = new Map<string, string>();
+  const base = jsonStore(backing);
+  let eventWrites = 0;
+  const store: Store = {
+    ...base,
+    set(key, value, ttlMs) {
+      base.set(key, value, ttlMs);
+      if (topicKeyKind(key, "event-log") && ++eventWrites === 1) {
+        throw new Error("ambiguous event write");
+      }
+    },
+  };
+  const t = topic<{ value: number }>({
+    id: `ambiguous-event-${Date.now()}`,
+    prefix: "test:bt",
+    store,
+  });
+
+  await expect(t.pub({ data: { value: 1 }, idempotencyKey: "same" })).rejects.toThrow(
+    "ambiguous event write",
+  );
+  expect(await t.latestCursor()).toBeNull();
+  expect([...backing.keys()].some((key) => topicKeyKind(key, "idempotency"))).toBe(false);
+
+  const retried = await t.pub({ data: { value: 1 }, idempotencyKey: "same" });
+  expect((await t.reader("check").recv({ wait: false }))?.eventId).toBe(retried.eventId);
+  expect(await t.reader("check").recv({ wait: false })).toBeNull();
+});
+
+test("uncertain event rollback preserves the idempotency fence", async () => {
+  const backing = new Map<string, string>();
+  const base = jsonStore(backing);
+  let eventWrites = 0;
+  const faultyStore: Store = {
+    ...base,
+    set(key, value, ttlMs) {
+      if (topicKeyKind(key, "event-log")) {
+        eventWrites += 1;
+        if (eventWrites === 1) {
+          base.set(key, value, ttlMs);
+          throw new Error("ambiguous event write");
+        }
+        if (eventWrites === 2) throw new Error("rollback write failed");
+      }
+      base.set(key, value, ttlMs);
+    },
+  };
+  const id = `uncertain-event-${Date.now()}`;
+  const failed = topic<{ value: number }>({ id, prefix: "test:bt", store: faultyStore });
+
+  await expect(failed.pub({ data: { value: 1 }, idempotencyKey: "same" })).rejects.toThrow(
+    "ambiguous event write",
+  );
+  expect([...backing.keys()].some((key) => topicKeyKind(key, "idempotency"))).toBe(true);
+  expect(await failed.pub({ data: { value: 2 }, idempotencyKey: "same" })).toEqual({
+    eventId: "1",
+    cursor: "1",
+  });
+  expect(await failed.latestCursor()).toBe("1");
+
+  const recovered = topic<{ value: number }>({ id, prefix: "test:bt", store: jsonStore(backing) });
+  const existing = await recovered.pub({ data: { value: 2 }, idempotencyKey: "same" });
+  expect(existing.eventId).toBe("1");
+  expect((await recovered.reader("check").recv({ wait: false }))?.data.value).toBe(1);
+  expect(await recovered.reader("check").recv({ wait: false })).toBeNull();
+});
+
+test("uncertain event recovery keeps active live subscribers attached", async () => {
+  const backing = new Map<string, string>();
+  const base = jsonStore(backing);
+  let eventWrites = 0;
+  const store: Store = {
+    ...base,
+    set(key, value, ttlMs) {
+      if (topicKeyKind(key, "event-log")) {
+        eventWrites += 1;
+        if (eventWrites === 1) {
+          base.set(key, value, ttlMs);
+          throw new Error("ambiguous event write");
+        }
+        if (eventWrites === 2) throw new Error("rollback write failed");
+      }
+      base.set(key, value, ttlMs);
+    },
+  };
+  const t = topic<{ value: number }>({
+    id: `live-recovery-${Date.now()}`,
+    prefix: "test:bt",
+    store,
+  });
+  const ac = new AbortController();
+  const next = t.live({ after: "0", signal: ac.signal })[Symbol.asyncIterator]().next();
+  await Bun.sleep(0);
+
+  await expect(t.pub({ data: { value: 1 }, idempotencyKey: "same" })).rejects.toThrow(
+    "ambiguous event write",
+  );
+  await t.pub({ data: { value: 2 }, idempotencyKey: "same" });
+  expect(await next).toMatchObject({ done: false, value: { data: { value: 1 }, eventId: "1" } });
+  ac.abort();
+});
+
+test("a persisted high-water mark prevents cursor reuse when only the fence was written", async () => {
+  const backing = new Map<string, string>();
+  const base = jsonStore(backing);
+  const faultyStore: Store = {
+    ...base,
+    set(key, value, ttlMs) {
+      if (topicKeyKind(key, "event-log")) throw new Error("event snapshot unavailable");
+      base.set(key, value, ttlMs);
+    },
+  };
+  const id = `high-water-${Date.now()}`;
+  const failed = topic<{ value: number }>({ id, prefix: "test:bt", store: faultyStore });
+  await expect(failed.pub({ data: { value: 1 }, idempotencyKey: "first" })).rejects.toThrow(
+    "event snapshot unavailable",
+  );
+
+  const recovered = topic<{ value: number }>({
+    id,
+    prefix: "test:bt",
+    store: jsonStore(backing),
+  });
+  const published = await recovered.pub({ data: { value: 2 }, idempotencyKey: "second" });
+  expect(published.eventId).toBe("2");
+  expect((await recovered.reader("check").recv({ wait: false }))?.data).toEqual({ value: 2 });
+});
+
+test("topic validates numeric configuration and operation timings", async () => {
+  for (const retentionMs of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+    expect(() => topic({ id: `invalid-retention-${retentionMs}`, retentionMs })).toThrow(
+      "retentionMs must be a positive safe integer",
+    );
+  }
+  for (const payloadBytes of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+    expect(() => topic({ id: `invalid-payload-${payloadBytes}`, limits: { payloadBytes } })).toThrow(
+      "limits.payloadBytes must be a positive safe integer",
+    );
+  }
+
+  const t = topic<{ value: number }>({ id: `numeric-operations-${Date.now()}` });
+  const reader = t.reader("validation");
+  for (const timeoutMs of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+    await expect(reader.recv({ wait: false, timeoutMs })).rejects.toThrow(
+      "timeoutMs must be a non-negative safe integer",
+    );
+    await expect(t.live({ timeoutMs })[Symbol.asyncIterator]().next()).rejects.toThrow(
+      "timeoutMs must be a non-negative safe integer",
+    );
+  }
+  for (const minIdleMs of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+    await expect(reader.reclaim({ minIdleMs })).rejects.toThrow(
+      "minIdleMs must be a non-negative safe integer",
+    );
+  }
+  expect(await reader.recv({ wait: false, timeoutMs: 0 })).toBeNull();
+  expect((await reader.reclaim({ minIdleMs: 0 })).entries).toEqual([]);
+  await reader.close();
+});
+
+test("topic persistence keys are injective across prefix, id, tenant, group, and idempotency segments", async () => {
+  const backing = new Map<string, string>();
+  const first = topic<{ source: string }>({
+    prefix: "collision",
+    id: "topic:tail",
+    tenantId: "tenant",
+    store: jsonStore(backing),
+  });
+  const second = topic<{ source: string }>({
+    prefix: "collision:tenant",
+    id: "tail",
+    tenantId: "topic",
+    store: jsonStore(backing),
+  });
+
+  await first.pub({ data: { source: "first" }, idempotencyKey: "same:key" });
+  expect(await second.latestCursor()).toBeNull();
+  expect(await second.reader("workers").recv({ wait: false })).toBeNull();
+  await second.pub({ data: { source: "second" }, idempotencyKey: "same:key" });
+
+  expect((await first.reader("workers").recv({ wait: false }))?.data.source).toBe("first");
+  expect((await second.reader("workers").recv({ wait: false }))?.data.source).toBe("second");
+});
+
+test("topic does not import legacy state without identity proof", async () => {
+  const backing = new Map<string, string>();
+  const store = jsonStore(backing);
+  const prefix = `legacy-topic-${Date.now()}`;
+  const id = "events";
+  const tenantId = "tenant";
+  const group = "workers";
+  const publishedAt = Date.now();
+  const legacyEventKey = `${prefix}:${encodeURIComponent(tenantId)}:${id}:browser:event-log`;
+  const legacyGroupKey = `${prefix}:${encodeURIComponent(tenantId)}:${id}:browser:group:${encodeURIComponent(group)}`;
+  const legacyIdempotencyKey = `${prefix}:${tenantId}:${id}:idempotency:first`;
+  store.set(legacyEventKey, {
+    entries: [{
+      id: "7",
+      ts: publishedAt,
+      fields: { payload: JSON.stringify({ data: { value: 1 }, publishedAt }) },
+    }],
+  });
+  store.set(legacyGroupKey, {
+    committed: "0",
+    delivered: "7",
+    inFlight: [["7", { at: publishedAt, consumerId: "old" }]],
+  });
+  store.set(legacyIdempotencyKey, "7", 60_000);
+
+  const t = topic<{ value: number }>({ prefix, id, tenantId, store });
+  expect(await t.latestCursor()).toBeNull();
+  expect(await t.pub({ data: { value: 999 }, idempotencyKey: "first" })).toEqual({
+    eventId: "1",
+    cursor: "1",
+  });
+  const reclaimed = await t.reader(group, { consumerId: "new" }).reclaim({ minIdleMs: 0 });
+  expect(reclaimed.entries).toHaveLength(0);
+
+  expect(backing.has(legacyEventKey)).toBe(true);
+  expect(backing.has(legacyGroupKey)).toBe(true);
+  expect(backing.has(legacyIdempotencyKey)).toBe(true);
+  expect([...backing.keys()].filter((key) => key.startsWith("sync:topic:browser:v2:"))).toHaveLength(3);
+});
+
+test("colliding topic identities both ignore an ambiguous legacy event log", async () => {
+  const backing = new Map<string, string>();
+  const store = jsonStore(backing);
+  const publishedAt = Date.now();
+  const legacyEventKey = "legacy-collision:tenant:topic:tail:browser:event-log";
+  store.set(legacyEventKey, {
+    entries: [{
+      id: "1",
+      ts: publishedAt,
+      fields: { payload: JSON.stringify({ data: { source: "legacy" }, publishedAt }) },
+    }],
+  });
+
+  const owner = topic<{ source: string }>({
+    prefix: "legacy-collision",
+    id: "topic:tail",
+    tenantId: "tenant",
+    store,
+  });
+  const nonOwner = topic<{ source: string }>({
+    prefix: "legacy-collision:tenant",
+    id: "tail",
+    tenantId: "topic",
+    store,
+  });
+
+  expect(await owner.latestCursor()).toBeNull();
+  expect(await nonOwner.latestCursor()).toBeNull();
+  expect(backing.has(legacyEventKey)).toBe(true);
+  expect([...backing.keys()].filter((key) => key.startsWith("sync:topic:browser:v2:"))).toHaveLength(0);
+});
+
+test("failed group persistence never advances delivery, commit, or reclaim state", async () => {
+  const backing = createMemoryStore();
+  let failGroupWrite = false;
+  const store: Store = {
+    get: (key) => backing.get(key),
+    set: (key, value, ttlMs) => {
+      if (topicKeyKind(key, "group") && failGroupWrite) throw new Error("group write failed");
+      backing.set(key, value, ttlMs);
+    },
+    del: (key) => backing.del(key),
+    keys: (prefix) => backing.keys(prefix),
+  };
+  const t = topic<{ value: number }>({ id: `group-faults-${Date.now()}`, store });
+  await t.pub({ data: { value: 1 } });
+  const owner = t.reader("workers", { consumerId: "owner" });
+
+  failGroupWrite = true;
+  await expect(owner.recv({ wait: false })).rejects.toThrow("group write failed");
+  failGroupWrite = false;
+  const delivery = await owner.recv({ wait: false });
+  expect(delivery?.data.value).toBe(1);
+
+  failGroupWrite = true;
+  await expect(delivery!.commit()).rejects.toThrow("group write failed");
+  failGroupWrite = false;
+  expect(await delivery!.commit()).toBe(true);
+
+  await t.pub({ data: { value: 2 } });
+  const pending = await owner.recv({ wait: false });
+  const recovering = t.reader("workers", { consumerId: "recovering" });
+  failGroupWrite = true;
+  await expect(recovering.reclaim({ minIdleMs: 0 })).rejects.toThrow("group write failed");
+  failGroupWrite = false;
+  expect(await pending!.commit()).toBe(true);
 });
 
 // ==========================
@@ -722,14 +1018,34 @@ test("a recreated reader resumes at the group's committed position", async () =>
   expect(next?.data).toEqual({ v: 2 });
 });
 
+test("browser topic logs retain at most 256 events", async () => {
+  const id = `bounded-log-${Date.now()}`;
+  const t = topic<{ v: number }>({ id, retentionMs: 60_000 });
+  for (let v = 0; v < 300; v += 1) await t.pub({ data: { v } });
+
+  const logs = sharedState(
+    JSON.stringify(["topic:logs", "sync:topic", id]),
+    undefined,
+    () => new Map<string, EventLog>(),
+  );
+  const snapshot = logs.get(JSON.stringify(["sync:topic", id, "default"]))!.snapshot();
+  expect(snapshot).toHaveLength(256);
+  expect(snapshot[0]?.id).toBe("45");
+  expect(snapshot.at(-1)?.id).toBe("300");
+});
+
 test("invalidPayload: 'throw' raises TopicPayloadError on a malformed entry", async () => {
   const id = `invalid-throw-${Date.now()}`;
   const t = topic<{ v: number }>({ id });
   await t.pub({ data: { v: 1 } });
 
   // Inject a malformed envelope the way a foreign or older writer would.
-  const logs = sharedState(`topic:logs:sync:topic:${id}`, undefined, () => new Map<string, EventLog>());
-  logs.get(`sync:topic:default:${id}`)!.append({ payload: "not-json" });
+  const logs = sharedState(
+    JSON.stringify(["topic:logs", "sync:topic", id]),
+    undefined,
+    () => new Map<string, EventLog>(),
+  );
+  logs.get(JSON.stringify(["sync:topic", id, "default"]))!.append({ payload: "not-json" });
 
   const reader = t.reader("g");
   expect(await reader.recv({ wait: false }))?.data;

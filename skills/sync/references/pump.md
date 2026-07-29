@@ -210,3 +210,7 @@ default, so handles with the same `id` share runs. Pass the same explicit store
 to coordinate a separate scope, or `store: createLocalStorageStore()` to resume
 after reloads. Multi-tab ownership is best-effort because browser storage has
 no Redis-style atomic fencing.
+
+Browser pump persistence uses an encoded `(prefix, id)` identity. State written
+under the old concatenated key is not auto-imported because colliding old keys
+cannot prove which pump owned the run.

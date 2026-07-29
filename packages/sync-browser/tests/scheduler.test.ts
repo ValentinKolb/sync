@@ -13,6 +13,30 @@ import {
 
 let counter = 0;
 const uid = (label: string): string => `${label}-${++counter}-${Date.now()}`;
+const browserSchedulerStateKey = (
+  prefix: string,
+  schedulerId: string,
+  scheduleId: string,
+): string =>
+  `sync:scheduler:browser:v2:state:${encodeURIComponent(
+    JSON.stringify([prefix, schedulerId, scheduleId]),
+  )}`;
+const browserSchedulerDispatchLockKey = (
+  prefix: string,
+  schedulerId: string,
+  scheduleId: string,
+): string =>
+  `sync:mutex:browser:v2:${encodeURIComponent(
+    JSON.stringify([
+      "sync:scheduler:browser:v2:dispatch",
+      encodeURIComponent(JSON.stringify([prefix, schedulerId, scheduleId])),
+      "active",
+    ]),
+  )}`;
+
+const isSchedulerDispatchLockKey = (key: string): boolean =>
+  key.startsWith("sync:mutex:browser:v2:")
+  && decodeURIComponent(key).includes('"sync:scheduler:browser:v2:dispatch"');
 
 const waitFor = async (pred: () => boolean | Promise<boolean>, timeoutMs = 5_000, pollMs = 20): Promise<void> => {
   const start = Date.now();
@@ -73,6 +97,19 @@ test("create is idempotent; second call updates", async () => {
   expect(second.updated).toBe(true);
 
   expect((await s.list()).length).toBe(1);
+});
+
+test("colon-rich scheduler identities do not share schedule maps", async () => {
+  const base = uid("shared-state-collision");
+  const store = createMemoryStore();
+  const first = makeScheduler("b", { prefix: `${base}:a`, store });
+  const second = makeScheduler("a:b", { prefix: base, store });
+
+  await first.create({ id: "first", cron: "0 3 * * *", process: async () => {} });
+  await second.create({ id: "second", cron: "0 4 * * *", process: async () => {} });
+
+  expect((await first.list()).map((schedule) => schedule.id)).toEqual(["first"]);
+  expect((await second.list()).map((schedule) => schedule.id)).toEqual(["second"]);
 });
 
 test("create with invalid cron throws", async () => {
@@ -950,7 +987,7 @@ test("schedulerControl request identities include the full prefix", async () => 
   }
 });
 
-test("schedulerControl retains an accepted request until its run settles", async () => {
+test("schedulerControl expires an accepted request even when its run never settles", async () => {
   const prefix = uid("request-lifetime");
   const schedulerId = uid("request-lifetime-scheduler");
   const instanceId = uid("request-lifetime-instance");
@@ -992,7 +1029,7 @@ test("schedulerControl retains an accepted request until its run settles", async
     await control.runNow(request);
     now += 6 * 60_000;
     await control.runNow(request);
-    expect(runs).toBe(1);
+    expect(runs).toBe(2);
   } finally {
     Date.now = originalNow;
     release();
@@ -1027,9 +1064,63 @@ const seedPersistedState = async (
   state: Record<string, unknown>,
 ): Promise<ReturnType<typeof createMemoryStore>> => {
   const store = createMemoryStore();
-  store.set(`${prefix}:${schedulerId}:state:${scheduleId}`, state);
+  store.set(browserSchedulerStateKey(prefix, schedulerId, scheduleId), state);
   return store;
 };
+
+test("colon-rich scheduler identities persist state independently", async () => {
+  const base = uid("persist-collision");
+  const store = createMemoryStore();
+  const firstPrefix = `${base}:a`;
+  const firstId = "b";
+  const secondPrefix = base;
+  const secondId = "a:b";
+  const first = makeScheduler(firstId, { prefix: firstPrefix, store });
+  const second = makeScheduler(secondId, { prefix: secondPrefix, store });
+
+  await first.create({ id: "report", cron: "0 3 * * *", process: async () => {} });
+  await second.create({ id: "report", cron: "0 4 * * *", process: async () => {} });
+  await first.runNow({ id: "report" });
+  await second.runNow({ id: "report" });
+  await second.runNow({ id: "report" });
+
+  expect(
+    (store.get(browserSchedulerStateKey(firstPrefix, firstId, "report")) as { runNumber: number })
+      .runNumber,
+  ).toBe(1);
+  expect(
+    (store.get(browserSchedulerStateKey(secondPrefix, secondId, "report")) as { runNumber: number })
+      .runNumber,
+  ).toBe(2);
+});
+
+test("colliding scheduler identities do not import ambiguous legacy state", async () => {
+  const base = uid("legacy-collision");
+  const store = createMemoryStore();
+  const firstPrefix = `${base}:a`;
+  const firstId = "b";
+  const secondPrefix = base;
+  const secondId = "a:b";
+  const legacyKey = `${firstPrefix}:${firstId}:state:report`;
+  store.set(legacyKey, {
+    version: 1,
+    runNumber: 7,
+    nextRunAt: Date.now() + 60_000,
+    failureCount: 0,
+    updatedAt: Date.now(),
+    cron: "0 3 * * *",
+    tz: "UTC",
+  });
+
+  const first = makeScheduler(firstId, { prefix: firstPrefix, store });
+  const second = makeScheduler(secondId, { prefix: secondPrefix, store });
+  await first.create({ id: "report", cron: "0 3 * * *", process: async () => {} });
+  await second.create({ id: "report", cron: "0 3 * * *", process: async () => {} });
+
+  expect((await first.get({ id: "report" }))?.runNumber).toBe(0);
+  expect((await second.get({ id: "report" }))?.runNumber).toBe(0);
+  expect(store.get(legacyKey)).not.toBeUndefined();
+});
 
 test("a failed create persistence write does not publish schedule state or control registration", async () => {
   const prefix = uid("persist-create-failure");
@@ -1054,6 +1145,108 @@ test("a failed create persistence write does not publish schedule state or contr
 
   expect(await s.get({ id: "report" })).toBeNull();
   expect(await schedulerControl({ prefix }).list()).toEqual([]);
+});
+
+test("a failed dispatch persistence write does not advance in-memory state", async () => {
+  const prefix = uid("persist-dispatch-failure");
+  const schedulerId = uid("persist-dispatch-failure-scheduler");
+  const backing = createMemoryStore();
+  const stateKey = browserSchedulerStateKey(prefix, schedulerId, "report");
+  let failStateWrite = false;
+  const store: Store = {
+    get: (key) => backing.get(key),
+    set: (key, value, ttlMs) => {
+      if (key === stateKey && failStateWrite) throw new Error("state write failed");
+      backing.set(key, value, ttlMs);
+    },
+    del: (key) => backing.del(key),
+    keys: (keyPrefix) => backing.keys(keyPrefix),
+  };
+  const s = makeScheduler(schedulerId, { prefix, store });
+  await s.create({ id: "report", cron: "0 3 * * *", process: async () => {} });
+  const before = await s.get({ id: "report" });
+
+  failStateWrite = true;
+  await expect(s.runNow({ id: "report" })).rejects.toThrow("state write failed");
+  expect(await s.get({ id: "report" })).toEqual(before);
+  expect((backing.get(stateKey) as { runNumber: number }).runNumber).toBe(0);
+});
+
+test("a failed delete persistence write keeps schedule state and control registration", async () => {
+  const prefix = uid("persist-delete-failure");
+  const schedulerId = uid("persist-delete-failure-scheduler");
+  const backing = createMemoryStore();
+  const stateKey = browserSchedulerStateKey(prefix, schedulerId, "report");
+  const store: Store = {
+    get: (key) => backing.get(key),
+    set: (key, value, ttlMs) => backing.set(key, value, ttlMs),
+    del: (key) => {
+      if (key === stateKey) throw new Error("state delete failed");
+      backing.del(key);
+    },
+    keys: (keyPrefix) => backing.keys(keyPrefix),
+  };
+  const s = makeScheduler(schedulerId, { prefix, store });
+  await s.create({ id: "report", cron: "0 3 * * *", process: async () => {} });
+
+  await expect(s.delete({ id: "report" })).rejects.toThrow("state delete failed");
+  expect(await s.get({ id: "report" })).not.toBeNull();
+  expect((await schedulerControl({ prefix }).list()).map((entry) => entry.scheduleId)).toContain("report");
+});
+
+test("an overdue persisted schedule resumes its missed slot", async () => {
+  const prefix = uid("persist-overdue");
+  const schedulerId = uid("persist-overdue-scheduler");
+  const overdueAt = Date.now() - 60_000;
+  const store = await seedPersistedState(prefix, schedulerId, "report", {
+    version: 1,
+    runNumber: 3,
+    nextRunAt: overdueAt,
+    failureCount: 0,
+    updatedAt: Date.now(),
+    cron: "0 3 * * *",
+    tz: "UTC",
+  });
+  const s = makeScheduler(schedulerId, {
+    prefix,
+    store,
+    dispatch: { tickMs: 20 },
+  });
+  const slots: number[] = [];
+  await s.create({
+    id: "report",
+    cron: "0 3 * * *",
+    tz: "UTC",
+    process: async ({ ctx }) => {
+      slots.push(ctx.slotTs);
+    },
+  });
+
+  expect((await s.get({ id: "report" }))?.nextRunAt).toBe(overdueAt);
+  s.start();
+  await waitFor(() => slots.length === 1);
+  await s.stop();
+  expect(slots).toEqual([overdueAt]);
+  expect((await s.get({ id: "report" }))?.runNumber).toBe(4);
+});
+
+test("scheduler metadata is isolated from callers and returned snapshots", async () => {
+  const prefix = uid("meta-snapshots");
+  const s = makeScheduler(uid("meta-snapshots-scheduler"), { prefix });
+  const meta = { nested: { label: "original" } };
+  await s.create({ id: "report", cron: "0 3 * * *", meta, process: async () => {} });
+  meta.nested.label = "caller-mutated";
+
+  const first = await s.get({ id: "report" });
+  expect((first?.meta?.nested as { label: string }).label).toBe("original");
+  (first!.meta!.nested as { label: string }).label = "result-mutated";
+  const listed = await s.list();
+  (listed[0]!.meta!.nested as { label: string }).label = "list-mutated";
+
+  expect((((await s.get({ id: "report" }))?.meta?.nested) as { label: string }).label).toBe("original");
+  const controlled = await schedulerControl({ prefix }).list();
+  (controlled[0]!.meta!.nested as { label: string }).label = "control-mutated";
+  expect((((await s.get({ id: "report" }))?.meta?.nested) as { label: string }).label).toBe("original");
 });
 
 test("a persisted schedule does not resume a stale nextRunAt after the cron changes", async () => {
@@ -1106,13 +1299,14 @@ test("a persisted schedule does resume when the cron is unchanged", async () => 
   expect(info.failureCount).toBe(2);
 });
 
-test("persisted state written by 5.8.0 is reset rather than resumed blindly", async () => {
+test("persisted state written by 5.8.0 is not imported without identity proof", async () => {
   const prefix = uid("persist-legacy");
   const schedulerId = uid("persist-legacy-id");
   const stale = Date.now() + 20 * 60 * 60_000;
 
-  // <= 5.8.0 recorded no cron/tz, so its cron cannot be verified.
-  const store = await seedPersistedState(prefix, schedulerId, "report", {
+  const store = createMemoryStore();
+  const legacyKey = `${prefix}:${schedulerId}:state:report`;
+  store.set(legacyKey, {
     version: 1,
     runNumber: 3,
     nextRunAt: stale,
@@ -1124,8 +1318,10 @@ test("persisted state written by 5.8.0 is reset rather than resumed blindly", as
   await s.create({ id: "report", cron: "*/5 * * * *", tz: "UTC", process: async () => {} });
 
   const info = (await s.get({ id: "report" }))!;
+  expect(info.runNumber).toBe(0);
   expect(info.nextRunAt).not.toBe(stale);
   expect(info.failureCount).toBe(0);
+  expect(store.get(legacyKey)).not.toBeUndefined();
 });
 
 test("handles sharing a store share one leader lock", async () => {
@@ -1145,6 +1341,45 @@ test("handles sharing a store share one leader lock", async () => {
   // Leader election used to always build its own MemoryStore, so two handles
   // sharing a store each held their own lock and both dispatched every slot.
   expect([a.metric().isLeader, b.metric().isLeader].filter(Boolean).length).toBe(1);
+});
+
+test("colon-rich scheduler identities have independent leader locks", async () => {
+  const base = uid("leader-collision");
+  const store = createMemoryStore();
+  const first = makeScheduler("b", { prefix: `${base}:a`, store });
+  const second = makeScheduler("a:b", { prefix: base, store });
+
+  first.start();
+  second.start();
+  await waitFor(() => first.metric().isLeader && second.metric().isLeader);
+
+  expect(first.metric().isLeader).toBe(true);
+  expect(second.metric().isLeader).toBe(true);
+});
+
+test("colon-rich scheduler and schedule identities have independent dispatch locks", async () => {
+  const base = uid("dispatch-collision");
+  const store = createMemoryStore();
+  const first = makeScheduler("a", { prefix: base, store });
+  const second = makeScheduler("b", { prefix: `${base}:dispatch:a`, store });
+  let starts = 0;
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const process = async (): Promise<void> => {
+    starts += 1;
+    await gate;
+  };
+
+  await first.create({ id: "b:dispatch:c", cron: "0 3 * * *", process });
+  await second.create({ id: "c", cron: "0 3 * * *", process });
+  const firstRun = first.runNow({ id: "b:dispatch:c" });
+  const secondRun = second.runNow({ id: "c" });
+
+  await waitFor(() => starts === 2);
+  release();
+  await Promise.all([firstRun, secondRun]);
 });
 
 test("handles with different explicit stores do not share a leader lock", async () => {
@@ -1378,7 +1613,7 @@ test("stop during final dispatch preparation prevents the callback", async () =>
     get: (key) => backing.get(key),
     set: (key, value, ttlMs) => {
       backing.set(key, value, ttlMs);
-      if (key.includes(":dispatch:") && ++dispatchWrites === 3) {
+      if (isSchedulerDispatchLockKey(key) && ++dispatchWrites === 3) {
         stopPromise = s.stop();
       }
     },
@@ -1448,7 +1683,7 @@ test("losing the dispatch lease aborts the callback and rejects the run", async 
 
   const run = s.runNow({ id: "report" });
   await waitFor(() => started);
-  store.del(`${prefix}:dispatch:${schedulerId}:dispatch:report`);
+  store.del(browserSchedulerDispatchLockKey(prefix, schedulerId, "report"));
 
   await expect(run).rejects.toThrow("scheduler dispatch lease lost");
   expect(sawAbort).toBe(true);

@@ -62,6 +62,10 @@ if (lock) {
 - **Extend during long work**: if your critical section might exceed `ttlMs`, periodically call `extend` to prevent premature takeover.
 - **`retryCount: 0`** disables retry entirely — useful for leader election loops (see scheduler).
 - `withLock` returns `null` on failure; `withLockOrThrow` throws `LockError`.
+- During browser rolling upgrades, the current lock also holds the legacy Store
+  key. This prevents an old bundle from entering the same critical section; two
+  identities that collided under the old layout may therefore serialize until
+  the legacy bundle is retired.
 
 ## Redis keys (server)
 

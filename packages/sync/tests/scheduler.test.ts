@@ -10,11 +10,15 @@ import {
   type SchedulerTraceEvent,
 } from "../index";
 import {
+  legacySchedulerScheduleKey,
   markSchedulerControlAccepted,
   markSchedulerControlPending,
   markSchedulerControlUnavailable,
   refreshSchedulerControlRequestBinding,
+  schedulerDueKey,
+  schedulerScheduleTombstoneKey,
   schedulerScheduleKey,
+  schedulerV2ScheduleKey,
   schedulerControlQueue,
   type SchedulerControlRequest,
 } from "../src/scheduler-control";
@@ -454,7 +458,7 @@ test("metric() reflects dispatches, failures, reschedules", async () => {
   await s.runNow({ id: "bad" });
   await s.runNow({ id: "retrying" });
 
-  await Bun.sleep(300);
+  await waitFor(() => s.metric().dispatches >= 2, 2_500);
 
   const m = s.metric();
   expect(m.dispatches).toBeGreaterThanOrEqual(2);
@@ -902,7 +906,9 @@ test("schedulerControl keeps handler availability alive during a long callback",
     await control.runNow({ schedulerId: schedId, scheduleId: "slow", timeoutMs: 2_000 });
     await waitFor(() => started);
 
-    const members = await redis.send("SMEMBERS", [`${prefix}:${schedId}:control:slow:handlers`]);
+    const members = await redis.send("SMEMBERS", [
+      `${prefix}:${encodedIdentity(schedId)}:control:${encodedIdentity("slow")}:handlers`,
+    ]);
     expect(Array.isArray(members)).toBe(true);
     expect((members as unknown[]).length).toBe(1);
     await redis.send("PEXPIRE", [String((members as unknown[])[0]), "100"]);
@@ -974,6 +980,26 @@ test("scheduler control queues keep colon-rich target identities distinct", asyn
   await secondMessage?.ack();
 });
 
+test("scheduler control queues use the collision-free namespace", async () => {
+  const prefix = `test:sched:${uid("control-v2")}`;
+  const schedulerId = "worker";
+  const scheduleId = "daily";
+  const queueId = `${encodedIdentity(schedulerId)}:${encodedIdentity(scheduleId)}:manual`;
+  const base =
+    `sync:queue:namespace:v2:${encodeURIComponent(JSON.stringify([`${prefix}:control`, "default", queueId]))}`;
+  await redis.set(`${prefix}:control:default:${queueId}:seq`, "99");
+  await redis.send("LPUSH", [`${prefix}:control:default:${queueId}:ready`, "legacy-request"]);
+  await redis.set(`${base}:seq`, "41");
+  const controlQueue = schedulerControlQueue(prefix, schedulerId, scheduleId);
+
+  const sent = await controlQueue.send({
+    data: { requestId: "request", schedulerId, scheduleId, requestedAt: Date.now() },
+  });
+  expect(sent.messageId).toBe("42");
+  expect((await controlQueue.recv({ wait: false }))?.data.scheduleId).toBe(scheduleId);
+  expect(await redis.send("LLEN", [`${prefix}:control:default:${queueId}:ready`])).toBe(1);
+});
+
 test("colon-rich scheduler and schedule ids keep durable records distinct", async () => {
   const prefix = `test:sched:${uid("record-identity")}`;
   const first = makeScheduler("a:schedule:b", { prefix });
@@ -993,6 +1019,78 @@ test("colon-rich scheduler and schedule ids keep durable records distinct", asyn
   const listed = await schedulerControl({ prefix }).list();
   expect(listed.find((entry) => entry.schedulerId === "a:schedule:b")?.scheduleId).toBe("c");
   expect(listed.find((entry) => entry.schedulerId === "a")?.scheduleId).toBe("b:schedule:c");
+});
+
+test("colon-rich schedules keep distinct state and serialize through the legacy upgrade fence", async () => {
+  const prefix = `test:sched:${uid("all-key-identities")}`;
+  const first = makeScheduler("a:dispatch:b", { prefix });
+  const second = makeScheduler("a", { prefix });
+  const started: string[] = [];
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await first.create({
+    id: "c",
+    cron: "0 1 * * *",
+    process: async () => {
+      started.push("first");
+      if (started.length === 1) await gate;
+    },
+  });
+  await second.create({
+    id: "b:dispatch:c",
+    cron: "0 2 * * *",
+    process: async () => {
+      started.push("second");
+      if (started.length === 1) await gate;
+    },
+  });
+
+  expect(schedulerScheduleKey(prefix, "a", "b:due")).not.toBe(schedulerDueKey(prefix, "a:schedule:b"));
+
+  const runs = Promise.all([
+    first.runNow({ id: "c" }),
+    second.runNow({ id: "b:dispatch:c" }),
+  ]);
+  try {
+    await waitFor(() => started.length === 1);
+    await Bun.sleep(100);
+    expect(started).toHaveLength(1);
+  } finally {
+    release();
+  }
+  await runs;
+  expect(started.sort()).toEqual(["first", "second"]);
+});
+
+test("a colon-rich schedule still coordinates with a legacy dispatch lock", async () => {
+  const prefix = `test:sched:${uid("legacy-dispatch-lock")}`;
+  const schedulerId = "rolling:worker";
+  const scheduleId = "daily:sync";
+  const sched = makeScheduler(schedulerId, { prefix, leader: { leaseMs: 500 } });
+  let started = false;
+  await sched.create({
+    id: scheduleId,
+    cron: "0 1 * * *",
+    process: async () => {
+      started = true;
+    },
+  });
+
+  const legacyLockKey = `${prefix}:dispatch:${schedulerId}:dispatch:${scheduleId}`;
+  await redis.send("SET", [legacyLockKey, "old-worker", "PX", "5000"]);
+  const running = sched.runNow({ id: scheduleId });
+
+  try {
+    await Bun.sleep(100);
+    expect(started).toBe(false);
+  } finally {
+    await redis.send("DEL", [legacyLockKey]);
+  }
+  await running;
+  expect(started).toBe(true);
 });
 
 test("a new colliding target cannot overwrite an unmigrated legacy schedule", async () => {
@@ -1020,13 +1118,311 @@ test("a new colliding target cannot overwrite an unmigrated legacy schedule", as
     meta: { owner: "current" },
     process: async () => {},
   });
-
   expect((await current.get({ id: "b:schedule:c" }))?.meta).toEqual({ owner: "current" });
   expect(JSON.parse((await redis.get(legacyKey)) as string).id).toBe("c");
 
+  await redis.send("SADD", [`${prefix}:index`, "a:schedule:b"]);
   const legacy = makeScheduler("a:schedule:b", { prefix });
   expect((await legacy.get({ id: "c" }))?.runNumber).toBe(9);
   expect((await legacy.get({ id: "c" }))?.meta).toEqual({ owner: "legacy" });
+});
+
+test("colliding scheduler identities with different schedules do not share due state", async () => {
+  const root = `test:sched:${uid("namespace-owner")}`;
+  const first = makeScheduler("b", { prefix: `${root}:a` });
+  const second = makeScheduler("a:b", { prefix: root });
+
+  await Promise.all([
+    first.create({ id: "first", cron: "0 1 * * *", process: async () => {} }),
+    second.create({ id: "second", cron: "0 2 * * *", process: async () => {} }),
+  ]);
+
+  expect((await first.list()).map((schedule) => schedule.id)).toEqual(["first"]);
+  expect((await second.list()).map((schedule) => schedule.id)).toEqual(["second"]);
+});
+
+test("a colliding scheduler delete cannot remove the legacy owner's schedule", async () => {
+  const root = `test:sched:${uid("namespace-delete")}`;
+  const owner = makeScheduler("b", { prefix: `${root}:a` });
+  const other = makeScheduler("a:b", { prefix: root });
+  await owner.create({ id: "shared", cron: "0 1 * * *", process: async () => {} });
+  await other.create({ id: "other", cron: "0 2 * * *", process: async () => {} });
+
+  await other.delete({ id: "shared" });
+
+  expect((await owner.get({ id: "shared" }))?.id).toBe("shared");
+  expect((await other.get({ id: "other" }))?.id).toBe("other");
+
+  await other.delete({ id: "other" });
+  expect(await other.list()).toEqual([]);
+  expect((await owner.get({ id: "shared" }))?.id).toBe("shared");
+});
+
+test("ambiguous legacy scheduler ownership fails closed across prefixes", async () => {
+  const root = `test:sched:${uid("legacy-owner")}`;
+  const firstPrefix = `${root}:a`;
+  const firstSchedulerId = "b";
+  const secondPrefix = root;
+  const secondSchedulerId = "a:b";
+  const scheduleId = "daily";
+  const legacyKey = legacySchedulerScheduleKey(firstPrefix, firstSchedulerId, scheduleId);
+  await redis.set(legacyKey, JSON.stringify({
+    id: scheduleId,
+    cron: "0 1 * * *",
+    tz: "UTC",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    nextRunAt: Date.now() + 60_000,
+    runNumber: 0,
+    failureCount: 0,
+  }));
+  await redis.send("SADD", [`${firstPrefix}:index`, firstSchedulerId]);
+  await redis.send("SADD", [`${secondPrefix}:index`, secondSchedulerId]);
+
+  const first = makeScheduler(firstSchedulerId, { prefix: firstPrefix });
+  const second = makeScheduler(secondSchedulerId, { prefix: secondPrefix });
+  await expect(first.get({ id: scheduleId })).rejects.toThrow(/scheduler namespace migration required/);
+  await expect(second.get({ id: scheduleId })).rejects.toThrow(/scheduler namespace migration required/);
+});
+
+test("a late conflicting legacy registration fences an existing namespace owner", async () => {
+  const root = `test:sched:${uid("late-legacy-owner")}`;
+  const prefix = `${root}:a`;
+  const schedulerId = "b";
+  const sched = makeScheduler(schedulerId, { prefix });
+  await sched.create({ id: "daily", cron: "0 1 * * *", process: async () => {} });
+
+  await redis.send("SADD", [`${root}:index`, "a:b"]);
+
+  await expect(sched.get({ id: "daily" })).rejects.toThrow(/scheduler namespace migration required/);
+  await expect(sched.delete({ id: "daily" })).rejects.toThrow(/scheduler namespace migration required/);
+  expect(await redis.get(schedulerScheduleKey(prefix, schedulerId, "daily"))).not.toBeNull();
+});
+
+test("revisionless workers cannot roll back revisioned config but can advance compatible runtime", async () => {
+  const prefix = `test:sched:${uid("rolling-records")}`;
+  const schedulerId = "rolling";
+  const scheduleId = "sync";
+  const sched = makeScheduler(schedulerId, { prefix });
+  await sched.create({
+    id: scheduleId,
+    cron: "0 2 * * *",
+    tz: "Europe/Berlin",
+    meta: { generation: "current" },
+    process: async () => {},
+  });
+
+  const currentKey = schedulerScheduleKey(prefix, schedulerId, scheduleId);
+  const v2Key = schedulerV2ScheduleKey(prefix, schedulerId, scheduleId);
+  const legacyKey = legacySchedulerScheduleKey(prefix, schedulerId, scheduleId);
+  const initial = JSON.parse((await redis.get(currentKey)) as string);
+
+  const staleConfigWrite = {
+    id: scheduleId,
+    cron: "0 1 * * *",
+    tz: "UTC",
+    meta: { generation: "legacy" },
+    createdAt: initial.createdAt - 1_000,
+    updatedAt: initial.updatedAt + 10_000,
+    nextRunAt: initial.nextRunAt + 10_000,
+    runNumber: 40,
+    failureCount: 3,
+    lastError: "stale failure",
+  };
+  await redis.set(legacyKey, JSON.stringify(staleConfigWrite));
+
+  await sched.create({
+    id: scheduleId,
+    cron: "0 2 * * *",
+    tz: "Europe/Berlin",
+    meta: { generation: "current" },
+    process: async () => {},
+  });
+  const afterUpdate = await sched.get({ id: scheduleId });
+  expect(afterUpdate?.cron).toBe("0 2 * * *");
+  expect(afterUpdate?.tz).toBe("Europe/Berlin");
+  expect(afterUpdate?.meta).toEqual({ generation: "current" });
+  expect(afterUpdate?.runNumber).toBe(0);
+
+  const revisioned = JSON.parse((await redis.get(currentKey)) as string);
+  expect(typeof revisioned.revision).toBe("string");
+  expect(revisioned.revision.length).toBeGreaterThan(0);
+
+  const compatibleRuntimeWrite = {
+    id: scheduleId,
+    cron: revisioned.cron,
+    tz: revisioned.tz,
+    meta: { generation: "legacy" },
+    createdAt: revisioned.createdAt - 1_000,
+    updatedAt: revisioned.updatedAt + 20_000,
+    nextRunAt: revisioned.nextRunAt + 20_000,
+    runNumber: 5,
+    failureCount: 2,
+    lastError: "retrying",
+  };
+  await redis.set(legacyKey, JSON.stringify(compatibleRuntimeWrite));
+
+  const merged = await sched.get({ id: scheduleId });
+  expect(merged?.cron).toBe("0 2 * * *");
+  expect(merged?.tz).toBe("Europe/Berlin");
+  expect(merged?.meta).toEqual({ generation: "current" });
+  expect(merged?.runNumber).toBe(5);
+  expect(merged?.nextRunAt).toBe(compatibleRuntimeWrite.nextRunAt);
+  expect(merged?.failureCount).toBe(2);
+  expect(merged?.lastError).toBe("retrying");
+
+  const controlInfo = (await schedulerControl({ prefix }).list()).find(
+    (entry) => entry.schedulerId === schedulerId && entry.scheduleId === scheduleId,
+  );
+  expect(controlInfo?.meta).toEqual({ generation: "current" });
+  expect(controlInfo?.runNumber).toBe(5);
+
+  await sched.runNow({ id: scheduleId });
+  for (const key of [currentKey, v2Key, legacyKey]) {
+    const stored = JSON.parse((await redis.get(key)) as string);
+    expect(stored.revision).toBe(revisioned.revision);
+    expect(stored.cron).toBe("0 2 * * *");
+    expect(stored.tz).toBe("Europe/Berlin");
+    expect(JSON.parse(stored.metaJson)).toEqual({ generation: "current" });
+    expect(stored.runNumber).toBe(6);
+  }
+});
+
+test("a revisionless post-delete write cannot resurrect a deleted schedule", async () => {
+  const prefix = `test:sched:${uid("delete-migration")}`;
+  const schedulerId = "migration";
+  const scheduleId = "daily";
+  const sched = makeScheduler(schedulerId, { prefix });
+  const legacyKey = legacySchedulerScheduleKey(prefix, schedulerId, scheduleId);
+  const v2Key = schedulerV2ScheduleKey(prefix, schedulerId, scheduleId);
+  const currentKey = schedulerScheduleKey(prefix, schedulerId, scheduleId);
+  await sched.create({ id: scheduleId, cron: "0 3 * * *", process: async () => {} });
+  await sched.delete({ id: scheduleId });
+
+  const tombstoneKey = schedulerScheduleTombstoneKey(prefix, schedulerId, scheduleId);
+  const tombstone = JSON.parse((await redis.get(tombstoneKey)) as string);
+  const postDeleteLegacyWrite = JSON.stringify({
+    id: scheduleId,
+    cron: "0 3 * * *",
+    tz: "UTC",
+    meta: { owner: "legacy" },
+    createdAt: tombstone.deletedAt - 1_000,
+    updatedAt: tombstone.deletedAt + 10_000,
+    nextRunAt: tombstone.deletedAt + 60_000,
+    runNumber: 7,
+    failureCount: 0,
+  });
+  await redis.set(legacyKey, postDeleteLegacyWrite);
+  await redis.set(v2Key, postDeleteLegacyWrite);
+
+  expect(await sched.get({ id: scheduleId })).toBeNull();
+  expect(await redis.get(currentKey)).toBeNull();
+  expect(await redis.get(v2Key)).toBeNull();
+  expect(await redis.get(legacyKey)).toBeNull();
+  expect(await redis.get(tombstoneKey)).not.toBeNull();
+  expect(
+    (await schedulerControl({ prefix }).list()).some(
+      (entry) => entry.schedulerId === schedulerId && entry.scheduleId === scheduleId,
+    ),
+  ).toBe(false);
+});
+
+test("a revisionless old worker cannot affect a recreated schedule", async () => {
+  const prefix = `test:sched:${uid("recreate-fence")}`;
+  const schedulerId = "migration";
+  const scheduleId = "daily";
+  const sched = makeScheduler(schedulerId, { prefix });
+  const legacyKey = legacySchedulerScheduleKey(prefix, schedulerId, scheduleId);
+
+  await sched.create({
+    id: scheduleId,
+    cron: "0 3 * * *",
+    meta: { generation: 1 },
+    process: async () => {},
+  });
+  await sched.delete({ id: scheduleId });
+  await sched.create({
+    id: scheduleId,
+    cron: "0 4 * * *",
+    meta: { generation: 2 },
+    process: async () => {},
+  });
+
+  const tombstone = JSON.parse(
+    (await redis.get(schedulerScheduleTombstoneKey(prefix, schedulerId, scheduleId))) as string,
+  );
+  await redis.set(legacyKey, JSON.stringify({
+    id: scheduleId,
+    cron: "0 4 * * *",
+    tz: "UTC",
+    createdAt: tombstone.deletedAt - 1_000,
+    updatedAt: tombstone.deletedAt + 10_000,
+    nextRunAt: tombstone.deletedAt + 60_000,
+    runNumber: 99,
+    failureCount: 8,
+  }));
+
+  expect(await sched.get({ id: scheduleId })).toMatchObject({
+    cron: "0 4 * * *",
+    runNumber: 0,
+    failureCount: 0,
+    meta: { generation: 2 },
+  });
+  expect(await redis.get(legacyKey)).toContain('"revision"');
+});
+
+test("a recreated revision survives a tombstone from the same millisecond", async () => {
+  const prefix = `test:sched:${uid("same-ms-recreate")}`;
+  const schedulerId = "worker";
+  const scheduleId = "daily";
+  const sched = makeScheduler(schedulerId, { prefix });
+  await sched.create({ id: scheduleId, cron: "0 3 * * *", process: async () => {} });
+  await sched.delete({ id: scheduleId });
+  await sched.create({ id: scheduleId, cron: "0 4 * * *", process: async () => {} });
+
+  const record = JSON.parse(
+    (await redis.get(schedulerScheduleKey(prefix, schedulerId, scheduleId))) as string,
+  );
+  const tombstoneKey = schedulerScheduleTombstoneKey(prefix, schedulerId, scheduleId);
+  const tombstone = JSON.parse((await redis.get(tombstoneKey)) as string);
+  tombstone.deletedAt = record.updatedAt;
+  await redis.set(tombstoneKey, JSON.stringify(tombstone));
+
+  expect(await sched.get({ id: scheduleId })).toMatchObject({ cron: "0 4 * * *", runNumber: 0 });
+});
+
+test("scheduler tombstones deduplicate mirrored revisions", async () => {
+  const prefix = `test:sched:${uid("tombstone-revisions")}`;
+  const schedulerId = "worker";
+  const scheduleId = "daily";
+  const sched = makeScheduler(schedulerId, { prefix });
+  await sched.create({ id: scheduleId, cron: "0 3 * * *", process: async () => {} });
+  await sched.delete({ id: scheduleId });
+
+  const tombstone = JSON.parse(
+    (await redis.get(schedulerScheduleTombstoneKey(prefix, schedulerId, scheduleId))) as string,
+  );
+  expect(tombstone.revisions).toHaveLength(1);
+});
+
+test("a failed first upsert cannot leave a schedule without its global index", async () => {
+  const prefix = `test:sched:${uid("atomic-index")}`;
+  const schedulerId = "worker";
+  const scheduleId = "daily";
+  const sched = makeScheduler(schedulerId, { prefix });
+  await redis.set(`${prefix}:index`, "wrong-type");
+
+  await expect(
+    sched.create({ id: scheduleId, cron: "0 3 * * *", process: async () => {} }),
+  ).rejects.toThrow(/global index key has wrong type/);
+  expect(await redis.get(schedulerScheduleKey(prefix, schedulerId, scheduleId))).toBeNull();
+  expect(await redis.get(legacySchedulerScheduleKey(prefix, schedulerId, scheduleId))).toBeNull();
+
+  await redis.del(`${prefix}:index`);
+  await expect(
+    sched.create({ id: scheduleId, cron: "0 3 * * *", process: async () => {} }),
+  ).resolves.toEqual({ created: true, updated: false });
+  expect(await redis.send("SISMEMBER", [`${prefix}:index`, schedulerId])).toBe(1);
 });
 
 test("scheduler control request identities include the full prefix", async () => {
@@ -1206,6 +1602,7 @@ test("schedules written in the 5.8.0 record format keep their meta", async () =>
     }),
   ]);
   await redis.send("SADD", [`test:sched:${id}:index`, "legacy"]);
+  await redis.send("SADD", ["test:sched:index", id]);
 
   const info = await sched.get({ id: "legacy" });
   expect(info?.meta).toEqual({ source: "5.8.0" });
@@ -1230,6 +1627,7 @@ test("a legacy record for a colon-rich scheduler id migrates without losing stat
     }),
   );
   await redis.send("SADD", [`test:sched:${id}:index`, "legacy"]);
+  await redis.send("SADD", ["test:sched:index", id]);
 
   expect((await sched.get({ id: "legacy" }))?.runNumber).toBe(7);
   await sched.create({ id: "legacy", cron: "0 3 * * *", process: async () => {} });
@@ -1273,26 +1671,29 @@ test("a repeatedly failing control dispatch is reported, not replayed forever", 
   });
   sched.start();
 
-  // Corrupt the due ZSET so the terminal write inside dispatchOne fails on every
-  // attempt. The schedule record itself stays readable, so the control loop
-  // accepts the request and then fails while persisting.
-  const dueKey = `test:sched:${schedId}:due`;
-  await redis.send("DEL", [dueKey]);
-  await redis.send("SET", [dueKey, "corrupt"]);
+  const originalSend = redis.send.bind(redis);
+  redis.send = (async (command, args) => {
+    if (command === "EVAL" && String(args[0]).includes("existing.runNumber = patch.runNumber")) {
+      throw new Error("injected terminal write failure");
+    }
+    return await originalSend(command, args);
+  }) as typeof redis.send;
 
-  const control = schedulerControl({ prefix: "test:sched" });
-  await control.runNow({ schedulerId: schedId, scheduleId: "boom", timeoutMs: 3_000 }).catch(() => {});
+  try {
+    const control = schedulerControl({ prefix: "test:sched" });
+    await control.runNow({ schedulerId: schedId, scheduleId: "boom", timeoutMs: 3_000 }).catch(() => {});
 
-  await Bun.sleep(2_500);
-  const settled = runs;
-  await Bun.sleep(2_000);
+    await Bun.sleep(2_500);
+    const settled = runs;
+    await Bun.sleep(2_000);
 
-  // The control queue allows effectively unlimited deliveries, so an
-  // unconditional nack replayed the user's callback about every 250ms for the
-  // full five-minute message-age window.
-  expect(settled).toBeGreaterThanOrEqual(2);
-  expect(settled).toBeLessThanOrEqual(3);
-  expect(runs).toBe(settled);
-
-  await redis.send("DEL", [dueKey]);
+    // The control queue allows effectively unlimited deliveries, so an
+    // unconditional nack replayed the user's callback about every 250ms for the
+    // full five-minute message-age window.
+    expect(settled).toBeGreaterThanOrEqual(2);
+    expect(settled).toBeLessThanOrEqual(3);
+    expect(runs).toBe(settled);
+  } finally {
+    redis.send = originalSend as typeof redis.send;
+  }
 }, 30_000);

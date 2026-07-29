@@ -43,15 +43,10 @@ export class StoreWriteError extends Error {
  * Values are snapshotted on the way in and out. Handing back the caller's own
  * object meant `send({ data: payload })` then `payload.x = 1` changed what the
  * consumer saw, and a consumer mutating a received value mutated the stored
- * copy across redelivery — neither of which happens on the server, and neither
- * of which happens with a LocalStorageStore, so swapping stores silently
- * changed behaviour.
+ * copy across redelivery. `structuredClone` preserves the public in-memory
+ * store's value domain while still preventing reference aliasing.
  */
-const snapshot = (value: unknown): unknown => {
-  if (value === undefined || value === null) return value;
-  if (typeof value !== "object") return value;
-  return structuredClone(value);
-};
+const snapshot = (value: unknown): unknown => structuredClone(value);
 
 export class MemoryStore implements Store {
   private data = new Map<string, Entry>();
@@ -89,7 +84,13 @@ export class MemoryStore implements Store {
   }
 
   set(key: string, value: unknown, ttlMs?: number): void {
-    // Clear any existing timer
+    let valueSnapshot: unknown;
+    try {
+      valueSnapshot = snapshot(value);
+    } catch (error) {
+      throw new StoreWriteError(key, error);
+    }
+
     const existingTimer = this.timers.get(key);
     if (existingTimer) {
       clearTimeout(existingTimer);
@@ -97,7 +98,7 @@ export class MemoryStore implements Store {
     }
 
     const expiresAt = ttlMs != null && ttlMs > 0 ? Date.now() + ttlMs : null;
-    this.data.set(key, { value: snapshot(value), expiresAt });
+    this.data.set(key, { value: valueSnapshot, expiresAt });
 
     if (expiresAt !== null) this.scheduleExpiry(key, expiresAt);
   }
@@ -245,13 +246,6 @@ export class LocalStorageStore implements Store {
 
   set(key: string, value: unknown, ttlMs?: number): void {
     this.ensureInitialized();
-    // Clear any existing timer
-    const existingTimer = this.timers.get(key);
-    if (existingTimer) {
-      clearTimeout(existingTimer);
-      this.timers.delete(key);
-    }
-
     const expiresAt = ttlMs != null && ttlMs > 0 ? Date.now() + ttlMs : null;
     try {
       localStorage.setItem(this.storageKey(key), JSON.stringify({ value, expiresAt }));
@@ -264,12 +258,21 @@ export class LocalStorageStore implements Store {
       throw new StoreWriteError(key, error);
     }
 
+    const existingTimer = this.timers.get(key);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      this.timers.delete(key);
+    }
     if (expiresAt !== null) this.scheduleExpiry(key, expiresAt);
   }
 
   del(key: string): void {
     this.ensureInitialized();
-    localStorage.removeItem(this.storageKey(key));
+    try {
+      localStorage.removeItem(this.storageKey(key));
+    } catch (error) {
+      throw new StoreWriteError(key, error);
+    }
     const timer = this.timers.get(key);
     if (timer) {
       clearTimeout(timer);

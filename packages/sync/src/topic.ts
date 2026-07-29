@@ -12,6 +12,7 @@ const DEFAULT_PAYLOAD_BYTES = 128 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_RECLAIM_COUNT = 25;
 const MAX_RECLAIM_COUNT = 1_000;
+const STREAM_KEY_CACHE_MAX = 1_024;
 
 const PUB_SCRIPT = `
   local payload = ARGV[1]
@@ -67,6 +68,12 @@ const ENSURED_GROUPS_MAX = 10_000;
 const textEncoder = new TextEncoder();
 
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
+const requireSafeInteger = (name: string, value: number, min: number, max = Number.MAX_SAFE_INTEGER): number => {
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new RangeError(`${name} must be a safe integer between ${min} and ${max}`);
+  }
+  return value;
+};
 
 const assertTtlMs = (ttlMs: number): void => {
   if (!Number.isInteger(ttlMs) || ttlMs <= 0 || ttlMs > Number.MAX_SAFE_INTEGER) {
@@ -317,13 +324,49 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
 
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
-  const retentionMs = config.retentionMs ?? DEFAULT_RETENTION_MS;
-  const maxPayloadBytes = config.limits?.payloadBytes ?? DEFAULT_PAYLOAD_BYTES;
+  const retentionMs = requireSafeInteger(
+    "retentionMs",
+    config.retentionMs ?? DEFAULT_RETENTION_MS,
+    1,
+  );
+  const maxPayloadBytes = requireSafeInteger(
+    "limits.payloadBytes",
+    config.limits?.payloadBytes ?? DEFAULT_PAYLOAD_BYTES,
+    1,
+  );
 
   const resolveTenant = (tenantId?: string): string => tenantId ?? defaultTenant;
+  const streamKeys = new Map<string, string>();
 
-  const streamKey = (tenantId: string): string => `${prefix}:${tenantId}:${config.id}:stream`;
-  const idempotencyKey = (tenantId: string, key: string): string => `${prefix}:${tenantId}:${config.id}:idempotency:${key}`;
+  const cacheStreamKey = (tenantId: string, key: string): string => {
+    if (!streamKeys.has(tenantId) && streamKeys.size >= STREAM_KEY_CACHE_MAX) {
+      const oldest = streamKeys.keys().next().value;
+      if (oldest !== undefined) streamKeys.delete(oldest);
+    }
+    streamKeys.set(tenantId, key);
+    return key;
+  };
+
+  const legacyNamespaceExists = async (base: string): Promise<boolean> => {
+    return Number(await redis.send("EXISTS", [`${base}:stream`])) > 0;
+  };
+
+  const streamKey = async (tenantId: string): Promise<string> => {
+    const cached = streamKeys.get(tenantId);
+    if (cached) return cached;
+
+    const legacyBase = `${prefix}:${tenantId}:${config.id}`;
+    const encodedBase =
+      `sync:topic:namespace:v2:${encodeURIComponent(JSON.stringify([prefix, tenantId, config.id]))}`;
+    if (await legacyNamespaceExists(legacyBase)) {
+      throw new Error(
+        "topic namespace migration required; drain old workers and migrate or remove legacy keys",
+      );
+    }
+    return cacheStreamKey(tenantId, `${encodedBase}:stream`);
+  };
+  const idempotencyKey = (stream: string, key: string): string =>
+    `${stream.slice(0, -":stream".length)}:idempotency:${key}`;
   const ensuredGroups = new Set<string>();
 
   const forgetGroup = (key: string, group: string): void => {
@@ -383,7 +426,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
 
   const pub = async (pubCfg: TopicPubConfig<TData>): Promise<{ eventId: string; cursor: string }> => {
     const tenantId = resolveTenant(pubCfg.tenantId);
-    const key = streamKey(tenantId);
+    const key = await streamKey(tenantId);
     const idempotencyTtlMs = pubCfg.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS;
     if (pubCfg.idempotencyKey || pubCfg.idempotencyTtlMs !== undefined) {
       assertTtlMs(idempotencyTtlMs);
@@ -412,7 +455,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     const rawId = await evalScript(
       PUB_SCRIPT,
       [key],
-      [payloadRaw, pubCfg.idempotencyKey ? idempotencyKey(tenantId, pubCfg.idempotencyKey) : "", idempotencyTtlMs, trimMinId],
+      [payloadRaw, pubCfg.idempotencyKey ? idempotencyKey(key, pubCfg.idempotencyKey) : "", idempotencyTtlMs, trimMinId],
     );
 
     const eventId = typeof rawId === "string" ? rawId : String(rawId);
@@ -421,7 +464,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
 
   const latestCursor = async (cursorCfg: TopicCursorConfig = {}): Promise<string | null> => {
     const tenantId = resolveTenant(cursorCfg.tenantId);
-    const key = streamKey(tenantId);
+    const key = await streamKey(tenantId);
     const raw = await redis.send("XREVRANGE", [key, "+", "-", "COUNT", "1"]);
     return parseFirstRangeEntry(raw)?.id ?? null;
   };
@@ -512,7 +555,15 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
         eventId,
         owner,
       ]);
-      return Number(acked) > 0;
+      const committed = Number(acked) > 0;
+      if (closed) {
+        try {
+          await evalScript(CLOSE_CONSUMER_SCRIPT, [key], [group, consumer]);
+        } catch {
+          // Best effort: close() already made the reader unusable.
+        }
+      }
+      return committed;
     };
 
     const createDelivery = (entry: ParsedEntry, stored: StoredEvent<unknown>, key: string): TopicDelivery<TData> => ({
@@ -532,14 +583,18 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       readGroup = blockingReadGroup,
     ): Promise<TopicDelivery<TData> | null> => {
       if (closed) return null;
+      const wait = recvCfg.wait ?? true;
+      const timeoutMs = requireSafeInteger(
+        "recv.timeoutMs",
+        recvCfg.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        0,
+        Number.MAX_SAFE_INTEGER - Date.now(),
+      );
       const tenantId = resolveTenant(recvCfg.tenantId);
-      const key = streamKey(tenantId);
+      const key = await streamKey(tenantId);
       usedKeys.add(key);
       await ensureGroup(key, group);
       if (closed) return null;
-
-      const wait = recvCfg.wait ?? true;
-      const timeoutMs = recvCfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
       let result: unknown;
       try {
@@ -590,18 +645,19 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       retriedAfterNoGroup = false,
     ): Promise<TopicReclaimResult<TData>> => {
       if (closed) return { nextCursor: "0-0", entries: [] };
+      const minIdleMs = reclaimCfg.minIdleMs ?? 60_000;
+      if (!Number.isSafeInteger(minIdleMs) || minIdleMs < 0) {
+        throw new Error("minIdleMs must be a non-negative number");
+      }
+      const count = reclaimCfg.count ?? DEFAULT_RECLAIM_COUNT;
+      if (!Number.isSafeInteger(count) || count < 1 || count > MAX_RECLAIM_COUNT) {
+        throw new Error(`count must be an integer between 1 and ${MAX_RECLAIM_COUNT}`);
+      }
       const tenantId = resolveTenant(reclaimCfg.tenantId);
-      const key = streamKey(tenantId);
+      const key = await streamKey(tenantId);
       usedKeys.add(key);
       await ensureGroup(key, group);
       if (closed) return { nextCursor: "0-0", entries: [] };
-
-      const minIdleMs = reclaimCfg.minIdleMs ?? 60_000;
-      if (!Number.isFinite(minIdleMs) || minIdleMs < 0) throw new Error("minIdleMs must be a non-negative number");
-      const count = reclaimCfg.count ?? DEFAULT_RECLAIM_COUNT;
-      if (!Number.isInteger(count) || count < 1 || count > MAX_RECLAIM_COUNT) {
-        throw new Error(`count must be an integer between 1 and ${MAX_RECLAIM_COUNT}`);
-      }
 
       let raw: unknown;
       try {
@@ -705,8 +761,13 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
 
   const live = async function* (liveCfg: TopicLiveConfig = {}): AsyncIterable<TopicLiveEvent<TData>> {
     const tenantId = resolveTenant(liveCfg.tenantId);
-    const key = streamKey(tenantId);
-    const timeoutMs = liveCfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const key = await streamKey(tenantId);
+    const timeoutMs = requireSafeInteger(
+      "live.timeoutMs",
+      liveCfg.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      0,
+      Number.MAX_SAFE_INTEGER - Date.now(),
+    );
 
     let blockingClient: RedisClient | null = null;
     const resetBlockingClient = (): void => {

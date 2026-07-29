@@ -222,8 +222,14 @@ Trace is a callback, not a storage layer. Use it to log, publish, count, or map 
 ## Redis keys (server)
 
 - `sync:job:{id}:seq` — jobId counter
-- `sync:job:{id}:idempotency:{key}` — key → jobId with TTL
-- `sync:job:queue:default:{id}:work:*` — internal queue state
+- `sync:job:claim:v2:{encodedPrefixIdAndKey}` — key → jobId with TTL
+- `sync:queue:namespace:v2:{encodedJobQueueTuple}:*` — internal queue state
+
+All new claims use the injective full identity tuple. Drain old workers before
+upgrading. If a matching legacy claim still exists, submission fails with an
+explicit migration-required error instead of risking duplicate execution.
+The internal work queue also starts in its collision-free v2 namespace; it does
+not claim or acknowledge ambiguous pre-v6 work-queue records.
 
 **What's NOT in Redis (removed in v5):**
 - Per-job state key (`state:{jobId}`) — gone

@@ -24,6 +24,7 @@ const LEGACY_ORPHAN_GRACE_MS = DEFAULT_LEASE_MS;
 const NOTIFY_BLOCK_MS = 1_000;
 // How many dead ids one claim may drain before giving up for this round.
 const CLAIM_MAX_SKIPS = 32;
+const NAMESPACE_CACHE_MAX = 1_024;
 
 // Stored message records are envelopes whose user-controlled parts (`dataJson`,
 // `metaJson`) are opaque pre-serialized JSON strings. Lua may copy them but never
@@ -561,6 +562,8 @@ const DLQ_REMOVE_SCRIPT = `
 const textEncoder = new TextEncoder();
 
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
+/** Internal switch for versioned queues that intentionally leave legacy work for old workers to drain. */
+export const INTERNAL_QUEUE_IGNORE_LEGACY_NAMESPACE = Symbol("sync.queue.ignoreLegacyNamespace");
 const requireSafeInteger = (name: string, value: number, min: number, max = Number.MAX_SAFE_INTEGER): number => {
   if (!Number.isSafeInteger(value) || value < min || value > max) {
     throw new RangeError(`${name} must be a safe integer between ${min} and ${max}`);
@@ -719,6 +722,11 @@ const parseOpaque = <T>(json: string | undefined): T | undefined => {
 
 export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   type TData = T;
+  const ignoreLegacyNamespace = Boolean(
+    (config as QueueConfig<T> & { [INTERNAL_QUEUE_IGNORE_LEGACY_NAMESPACE]?: boolean })[
+      INTERNAL_QUEUE_IGNORE_LEGACY_NAMESPACE
+    ],
+  );
 
   if (config.ordering?.mode === "ordering_key_partitioned") {
     // Nothing in this module partitions or serialises by ordering key, so
@@ -760,9 +768,53 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   );
 
   const resolveTenant = (tenantId?: string): string => tenantId ?? defaultTenant;
+  const namespaceBases = new Map<string, string>();
 
-  const keysForTenant = (tenantId: string): QueueKeys => {
-    const base = `${prefix}:${tenantId}:${config.id}`;
+  const cacheNamespaceBase = (tenantId: string, base: string): string => {
+    if (!namespaceBases.has(tenantId) && namespaceBases.size >= NAMESPACE_CACHE_MAX) {
+      const oldest = namespaceBases.keys().next().value;
+      if (oldest !== undefined) namespaceBases.delete(oldest);
+    }
+    namespaceBases.set(tenantId, base);
+    return base;
+  };
+
+  const legacyNamespaceExists = async (base: string): Promise<boolean> => {
+    const suffixes = [
+      "seq",
+      "ready",
+      "notify",
+      "delayed",
+      "leases",
+      "deliveries",
+      "messages",
+      "active",
+      "delivery-owners",
+      "orphan-candidates",
+      "maintenance",
+      "dlq",
+      "dlq:index",
+    ];
+    return Number(await redis.send("EXISTS", suffixes.map((suffix) => `${base}:${suffix}`))) > 0;
+  };
+
+  const resolveNamespaceBase = async (tenantId: string): Promise<string> => {
+    const cached = namespaceBases.get(tenantId);
+    if (cached) return cached;
+
+    const legacyBase = `${prefix}:${tenantId}:${config.id}`;
+    const encodedBase =
+      `sync:queue:namespace:v2:${encodeURIComponent(JSON.stringify([prefix, tenantId, config.id]))}`;
+    if (!ignoreLegacyNamespace && await legacyNamespaceExists(legacyBase)) {
+      throw new Error(
+        "queue namespace migration required; drain old workers and migrate or remove legacy keys",
+      );
+    }
+    return cacheNamespaceBase(tenantId, encodedBase);
+  };
+
+  const keysForTenant = async (tenantId: string): Promise<QueueKeys> => {
+    const base = await resolveNamespaceBase(tenantId);
     return {
       seq: `${base}:seq`,
       ready: `${base}:ready`,
@@ -857,7 +909,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
 
     const recv = async (recvCfg: QueueRecvConfig = {}): Promise<QueueReceived<TData> | null> => {
       const tenantId = resolveTenant(recvCfg.tenantId);
-      const keys = keysForTenant(tenantId);
+      const keys = await keysForTenant(tenantId);
       const wait = recvCfg.wait ?? true;
       const timeoutMs = requireFutureDuration(
         "recv.timeoutMs",
@@ -1035,7 +1087,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
 
   const send = async (sendCfg: QueueSendConfig<TData>): Promise<{ messageId: string }> => {
     const tenantId = resolveTenant(sendCfg.tenantId);
-    const keys = keysForTenant(tenantId);
+    const keys = await keysForTenant(tenantId);
 
     const now = Date.now();
     const delayMs = requireFutureDuration("send.delayMs", sendCfg.delayMs ?? 0, 0);
@@ -1123,7 +1175,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   };
 
   const dlq = async (cfg: { tenantId?: string; limit?: number } = {}): Promise<Array<QueueDeadLetter<TData>>> => {
-    const keys = keysForTenant(resolveTenant(cfg.tenantId));
+    const keys = await keysForTenant(resolveTenant(cfg.tenantId));
     const limit = requireSafeInteger("dlq.limit", cfg.limit ?? 100, 1);
     const raws = (await evalScript(
       DLQ_READ_SCRIPT,
@@ -1141,7 +1193,7 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   };
 
   const dlqRemove = async (cfg: { messageId: string; tenantId?: string }): Promise<boolean> => {
-    const keys = keysForTenant(resolveTenant(cfg.tenantId));
+    const keys = await keysForTenant(resolveTenant(cfg.tenantId));
     const removed = await evalScript(DLQ_REMOVE_SCRIPT, [keys.dlq, keys.dlqIndex], [cfg.messageId]);
     return Number(removed) > 0;
   };

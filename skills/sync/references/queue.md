@@ -94,17 +94,22 @@ const msg2 = await reader.recv({ signal });
 - **Payloads are JSON snapshots**: `data` and `meta` are serialized at `send()` and parsed for each delivery. Mutating the caller's object or a received object cannot change a later redelivery. JSON restrictions therefore match the Redis-backed server.
 - **Ordering**: only `best_effort` exists. `orderingKey` is stored and delivered back with the message, but nothing partitions or serialises by it, so concurrent consumers can reorder same-key messages. Constructing a queue with `ordering: { mode: "ordering_key_partitioned" }` throws rather than silently ignoring the guarantee.
 - **`tenantId`**: isolates queue state (separate namespace). Presence in config sets the default; can be overridden per-call.
-- **Rolling upgrades from <= 5.8.0**: maintenance gives a legacy non-atomic claim 30 seconds plus two complete delivery-index scans before recovering it as orphaned. This bounds the practical race, but an old worker paused arbitrarily long between its list move and delivery write cannot be strictly fenced without changing that old protocol.
 
 ## Redis keys (server)
 
-- `{prefix}:{tenantId}:{id}:seq` — messageId counter
-- `{prefix}:{tenantId}:{id}:dlq:index` — ZSET messageId → movedAt (DLQ retention index)
-- `{prefix}:{tenantId}:{id}:messages` — hash messageId → payload
-- `{prefix}:{tenantId}:{id}:ready` — list (FIFO ready queue)
-- `{prefix}:{tenantId}:{id}:delayed` — sorted set of delayed messages
-- `{prefix}:{tenantId}:{id}:deliveries` + `:leases` + `:active`
-- `{prefix}:{tenantId}:{id}:delivery-owners` — messageId → deliveryId reverse index
-- `{prefix}:{tenantId}:{id}:orphan-candidates` + `:maintenance` — incremental rolling-upgrade recovery state
-- `{prefix}:{tenantId}:{id}:dlq` — dead-letter list
-- `{prefix}:{tenantId}:{id}:idempotency:{key}` — messageId with TTL
+New queues use the injective full-tuple
+`sync:queue:namespace:v2:{encodedPrefixTenantAndId}` base. Drain old workers
+before upgrading. Legacy concatenated namespaces cannot prove which tuple owned
+their data, so operations fail with an explicit migration-required error while
+matching legacy state remains.
+
+- `{base}:seq` — messageId counter
+- `{base}:dlq:index` — ZSET messageId → movedAt (DLQ retention index)
+- `{base}:messages` — hash messageId → payload
+- `{base}:ready` — list (FIFO ready queue)
+- `{base}:delayed` — sorted set of delayed messages
+- `{base}:deliveries` + `:leases` + `:active`
+- `{base}:delivery-owners` — messageId → deliveryId reverse index
+- `{base}:orphan-candidates` + `:maintenance` — incremental orphan-recovery state
+- `{base}:dlq` — hash messageId → dead-letter record
+- `{base}:idempotency:{key}` — messageId with TTL

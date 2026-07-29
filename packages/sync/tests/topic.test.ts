@@ -2,13 +2,23 @@ import { beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
 import { TopicPayloadError, topic } from "../index";
 
+const topicStreamKey = (id: string, tenantId = "default", prefix = "test:t"): string =>
+  `sync:topic:namespace:v2:${encodeURIComponent(JSON.stringify([prefix, tenantId, id]))}:stream`;
+
 const connectedClients = async (): Promise<number> => {
   const info = (await redis.send("INFO", ["clients"])) as string;
   return Number(/connected_clients:(\d+)/.exec(info)?.[1] ?? 0);
 };
 
 beforeEach(async () => {
-  const keys = await redis.send("KEYS", ["test:t:*"]);
+  const [legacyKeys, versionedKeys] = await Promise.all([
+    redis.send("KEYS", ["test:t:*"]),
+    redis.send("KEYS", ["sync:topic:namespace:v2:*"]),
+  ]);
+  const keys = [
+    ...(Array.isArray(legacyKeys) ? legacyKeys : []),
+    ...(Array.isArray(versionedKeys) ? versionedKeys : []),
+  ];
   if (Array.isArray(keys) && keys.length > 0) {
     await redis.send("DEL", keys as string[]);
   }
@@ -128,9 +138,21 @@ test("pub idempotency key deduplicates events", async () => {
   expect(events.length).toBe(1);
 });
 
+test("idempotency keys use the full topic identity", async () => {
+  const t = topic({
+    id: "idempotency-legacy",
+    prefix: "test:t",
+  });
+
+  const published = await t.pub({ data: { id: "a" }, idempotencyKey: "scope:key" });
+
+  const base = topicStreamKey("idempotency-legacy").slice(0, -":stream".length);
+  expect(await redis.get(`${base}:idempotency:scope:key`)).toBe(published.eventId);
+});
+
 test("pub replaces an idempotency key whose stream entry was retained away", async () => {
   const id = `idempotency-retention-${Date.now()}`;
-  const streamKey = `test:t:default:${id}:stream`;
+  const streamKey = topicStreamKey(id);
   const t = topic<{ value: number }>({ id, prefix: "test:t" });
 
   const first = await t.pub({ data: { value: 1 }, idempotencyKey: "same" });
@@ -271,7 +293,7 @@ test("reader reclaims an abandoned delivery through the public API", async () =>
 
 test("invalid transport payload remains pending and is reclaimable", async () => {
   const t = topic<{ value: number }>({ id: "invalid-reclaim", prefix: "test:t" });
-  const key = "test:t:default:invalid-reclaim:stream";
+  const key = topicStreamKey("invalid-reclaim");
   await redis.send("XADD", [key, "*", "payload", "{broken"]);
 
   const reader = t.reader("workers");
@@ -287,7 +309,7 @@ test("invalid transport payload remains pending and is reclaimable", async () =>
 
 test("reader keeps legacy acknowledgement for invalid payloads by default", async () => {
   const t = topic({ id: "invalid-default", prefix: "test:t" });
-  const key = "test:t:default:invalid-default:stream";
+  const key = topicStreamKey("invalid-default");
   await redis.send("XADD", [key, "*", "payload", "{broken"]);
 
   const reader = t.reader("workers");
@@ -307,7 +329,7 @@ test("topic preserves undefined data", async () => {
 
 test("reclaim cursor advances beyond more than one poison batch", async () => {
   const t = topic<{ value: number }>({ id: "poison-prefix", prefix: "test:t" });
-  const key = "test:t:default:poison-prefix:stream";
+  const key = topicStreamKey("poison-prefix");
   const reader = t.reader("workers");
 
   for (let index = 0; index < 30; index++) {
@@ -344,7 +366,7 @@ test("reclaim validates its batch controls", async () => {
 
 test("reclaim advances across an ineligible pending prefix", async () => {
   const t = topic<{ value: number }>({ id: "ineligible-prefix", prefix: "test:t" });
-  const key = "test:t:default:ineligible-prefix:stream";
+  const key = topicStreamKey("ineligible-prefix");
   const group = "workers";
   const originalReader = t.reader(group);
   const eventIds: string[] = [];
@@ -374,7 +396,7 @@ test("reclaim advances across an ineligible pending prefix", async () => {
 
 test("reclaim recreates a consumer group removed after it was cached", async () => {
   const id = "reclaim-nogroup";
-  const key = `test:t:default:${id}:stream`;
+  const key = topicStreamKey(id);
   const group = "workers";
   const t = topic<{ value: number }>({ id, prefix: "test:t" });
   const reader = t.reader(group, { consumerId: "recovery" });
@@ -688,7 +710,7 @@ test("a topic retention longer than the epoch does not break pub", async () => {
 
 test("invalid idempotency TTL is rejected before publishing", async () => {
   const id = `invalid-idem-ttl-${Date.now()}`;
-  const key = `test:t:default:${id}:stream`;
+  const key = topicStreamKey(id);
   const t = topic<{ v: number }>({ id, prefix: "test:t" });
 
   await expect(
@@ -705,7 +727,9 @@ test("invalid idempotency TTL is rejected before publishing", async () => {
 // ==========================
 
 test("a stale consumer cannot commit an entry another consumer reclaimed", async () => {
-  const t = topic<{ v: number }>({ id: `fenced-commit-${Date.now()}`, prefix: "test:t" });
+  const id = `fenced-commit-${Date.now()}`;
+  const key = topicStreamKey(id);
+  const t = topic<{ v: number }>({ id, prefix: "test:t" });
 
   await t.pub({ data: { v: 1 } });
 
@@ -714,6 +738,7 @@ test("a stale consumer cannot commit an entry another consumer reclaimed", async
 
   const delivered = await a.recv({ wait: false });
   expect(delivered).not.toBeNull();
+  await a.close();
 
   // B takes the stalled delivery over.
   const reclaimed = await b.reclaim({ minIdleMs: 0 });
@@ -723,19 +748,19 @@ test("a stale consumer cannot commit an entry another consumer reclaimed", async
   // the group PEL entirely, so if B then died it was in nobody's PEL and could
   // never be redelivered or reclaimed again.
   expect(await delivered!.commit()).toBe(false);
+  expect(JSON.stringify(await redis.send("XINFO", ["CONSUMERS", key, "workers"]))).not.toContain("consumer-a");
 
   // Still owned by B, so still recoverable.
   const stillThere = await b.reclaim({ minIdleMs: 0 });
   expect(stillThere.entries.length).toBe(1);
 
-  await a.close();
   await b.close();
 });
 
 test("stream({ wait: false }) drains past a poison payload instead of stopping", async () => {
   const id = `poison-drain-${Date.now()}`;
   const t = topic<{ v: number }>({ id, prefix: "test:t" });
-  const key = `test:t:default:${id}:stream`;
+  const key = topicStreamKey(id);
 
   // A malformed envelope at the head of a backlog.
   await redis.send("XADD", [key, "*", "payload", "not-json"]);
@@ -798,12 +823,12 @@ test("reader.close cleans every used tenant without deleting pending consumers",
 
   const committedConsumers = await redis.send("XINFO", [
     "CONSUMERS",
-    `test:t:committed:${id}:stream`,
+    topicStreamKey(id, "committed"),
     group,
   ]);
   const pendingConsumers = await redis.send("XINFO", [
     "CONSUMERS",
-    `test:t:pending:${id}:stream`,
+    topicStreamKey(id, "pending"),
     group,
   ]);
   expect(committedConsumers).toEqual([]);
@@ -843,7 +868,7 @@ test("reader.close cannot delete a replacement consumer's pending delivery", asy
 
 test("close is terminal for a reader", async () => {
   const id = "closed-reader";
-  const key = `test:t:default:${id}:stream`;
+  const key = topicStreamKey(id);
   const t = topic({ id, prefix: "test:t" });
   await t.pub({ data: { value: 1 } });
   const reader = t.reader("workers");
@@ -894,4 +919,99 @@ test("two concurrent streams from one reader use independent connections", async
   await reader.close();
 
   expect(collected).toContain(42);
+});
+
+test("tenant and topic id delimiter combinations cannot share streams", async () => {
+  const first = topic<{ source: string }>({ id: "c", prefix: "test:t" });
+  const second = topic<{ source: string }>({ id: "b:c", prefix: "test:t" });
+
+  await first.pub({ tenantId: "a:b", data: { source: "first" } });
+  const secondReader = second.reader("workers");
+  expect(await secondReader.recv({ tenantId: "a", wait: false })).toBeNull();
+
+  await second.pub({ tenantId: "a", data: { source: "second" } });
+  const firstMessage = await first.reader("workers").recv({ tenantId: "a:b", wait: false });
+  const secondMessage = await secondReader.recv({ tenantId: "a", wait: false });
+
+  expect(firstMessage?.data.source).toBe("first");
+  expect(secondMessage?.data.source).toBe("second");
+  expect(await firstMessage?.commit()).toBe(true);
+  expect(await secondMessage?.commit()).toBe(true);
+});
+
+test("delimiter-rich topics fail closed when a legacy stream already exists", async () => {
+  const legacyStream = "test:t:a:b:c:stream";
+  await redis.send("XADD", [legacyStream, "*", "payload", JSON.stringify({
+    data: { value: "legacy" },
+    publishedAt: Date.now(),
+  })]);
+  const t = topic({ id: "c", prefix: "test:t" });
+
+  await expect(t.latestCursor({ tenantId: "a:b" })).rejects.toThrow(
+    /topic namespace migration required/,
+  );
+});
+
+test("delimiter-safe topics cannot claim an ambiguous legacy namespace", async () => {
+  await redis.send("XADD", ["test:t:scope:a:b:stream", "*", "payload", JSON.stringify({
+    data: { value: "foreign" },
+    publishedAt: Date.now(),
+  })]);
+  const t = topic({ id: "b", prefix: "test:t:scope" });
+
+  await expect(t.pub({ tenantId: "a", data: { value: "current" } })).rejects.toThrow(
+    /topic namespace migration required/,
+  );
+});
+
+test("legacy stream checks escape Redis glob characters", async () => {
+  await redis.send("XADD", ["test:t:a:bee:stream", "*", "payload", "{}"]);
+  const t = topic({ id: "b*", prefix: "test:t" });
+
+  await expect(t.pub({ tenantId: "a", data: { value: 1 } })).resolves.toHaveProperty("eventId");
+});
+
+test("prefix and tenant delimiter combinations cannot share streams", async () => {
+  const first = topic<{ source: string }>({ id: "b", prefix: "test:t:scope" });
+  const second = topic<{ source: string }>({ id: "b", prefix: "test:t" });
+
+  await first.pub({ tenantId: "a", data: { source: "first" } });
+  await second.pub({ tenantId: "scope:a", data: { source: "second" } });
+
+  const firstMessage = await first.reader("workers").recv({ tenantId: "a", wait: false });
+  const secondMessage = await second.reader("workers").recv({ tenantId: "scope:a", wait: false });
+  expect(firstMessage?.data.source).toBe("first");
+  expect(secondMessage?.data.source).toBe("second");
+  expect(await firstMessage?.commit()).toBe(true);
+  expect(await secondMessage?.commit()).toBe(true);
+});
+
+test("invalid topic limits and timings fail before creating Redis state", async () => {
+  const invalid = [Number.NaN, Number.POSITIVE_INFINITY, 1.5, 0, -1];
+  for (const value of invalid) {
+    expect(() => topic({ id: "bad-retention", prefix: "test:t", retentionMs: value })).toThrow(/retentionMs/);
+    expect(() => topic({ id: "bad-payload", prefix: "test:t", limits: { payloadBytes: value } })).toThrow(
+      /payloadBytes/,
+    );
+  }
+
+  const id = `invalid-read-${Date.now()}`;
+  const t = topic({ id, prefix: "test:t" });
+  const reader = t.reader("workers");
+  await expect(reader.recv({ timeoutMs: Number.NaN })).rejects.toThrow(/timeoutMs/);
+  await expect(reader.reclaim({ minIdleMs: 0.5 })).rejects.toThrow(/minIdleMs/);
+  expect(await redis.exists(topicStreamKey(id))).toBe(false);
+  await reader.close();
+});
+
+test("commit after close removes the now-idle consumer", async () => {
+  const id = `close-commit-${Date.now()}`;
+  const t = topic({ id, prefix: "test:t" });
+  const reader = t.reader("workers", { consumerId: "closer" });
+  await t.pub({ data: { value: 1 } });
+  const delivery = await reader.recv({ wait: false });
+
+  await reader.close();
+  expect(await delivery?.commit()).toBe(true);
+  expect(await redis.send("XINFO", ["CONSUMERS", topicStreamKey(id), "workers"])).toEqual([]);
 });

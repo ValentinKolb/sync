@@ -57,6 +57,10 @@ try {
 - `check` counts the current request toward the limit (it's not a peek).
 - Window is sliding, not calendar-aligned. "100 per 60s" means 100 in the trailing 60s from now.
 - Both packages support `store?: Store` in the browser version; server uses Redis directly.
+- During browser rolling upgrades, checks read and advance both the current and
+  legacy Store counters. This prevents a bundle upgrade from resetting an active
+  limit; identities that collided under the old layout conservatively share the
+  counter until those windows expire.
 
 ## Redis keys (server)
 

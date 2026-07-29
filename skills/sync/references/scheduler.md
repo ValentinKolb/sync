@@ -65,6 +65,8 @@ type SchedulerMetrics = {
   failures: number;
   reschedules: number;
   tickErrors: number;
+  staleWrites: number;
+  unservedSlots: number;
   lastTickAt: number | null;
 };
 
@@ -239,7 +241,7 @@ Each item has its own `ctx.failureCount`. Already-running items skip duplicate s
 
 - **`cron` is validated** at `create` time (invalid cron throws).
 - **`tz` is validated** (invalid IANA tz throws).
-- **Misfire behavior**: always "skip" — if the system was down when a slot was due, `nextRunAt` advances past all missed slots to the next future cron slot. There's no `catch_up_one` / `catch_up_all` in v5.
+- **Misfire behavior**: one persisted overdue slot is dispatched, then `nextRunAt` advances to the next future cron slot. There is no unbounded catch-up.
 - **`create` is idempotent by id**: second call with same id updates. If `cron`/`tz` changed, `nextRunAt` resets; otherwise it's preserved.
 - **`runNow` does NOT advance cron**: the regular schedule continues unchanged, unless you call `ctx.reschedule` inside `after`.
 - **`schedulerControl.runNow` is remote accepted, not completed**: it returns when a live scheduler with the handler accepts the request. The handler then runs with `ctx.trigger === "manual"`.
@@ -255,19 +257,37 @@ Each item has its own `ctx.failureCount`. Already-running items skip duplicate s
 
 ## Redis keys (server)
 
-- `sync:scheduler:{sid}:schedule:{id}` — stored schedule JSON
-- `sync:scheduler:{sid}:due` — sorted set of scheduleId by nextRunAt
-- `sync:scheduler:{sid}:index` — set of all schedule ids
-- `sync:scheduler:leader:{sid}:leader:active` — leader mutex key
-- `sync:scheduler:index` — set of scheduler ids for `schedulerControl().list()`
-- `sync:scheduler:{sid}:control:{id}:handler:{instance}` — live handler heartbeat
-- `sync:scheduler:control:*` — durable manual-run control queues and short-lived accepted responses
+- `sync:scheduler:namespace:v4:{encodedPrefixAndSid}:schedule:{encodedId}:record` — stored schedule JSON
+- `sync:scheduler:namespace:v4:{encodedPrefixAndSid}:schedule:{encodedId}:deleted` — deletion tombstone
+- `sync:scheduler:namespace:v4:{encodedPrefixAndSid}:due` — sorted set of scheduleId by nextRunAt
+- `sync:scheduler:namespace:v4:{encodedPrefixAndSid}:index` — set of all schedule ids
+- `{prefix}:v3:leader:{encodedSid}:*` — leader mutex
+- `{prefix}:v3:dispatch:{encodedSid}:*` — per-schedule dispatch mutex
+- `{prefix}:index` — set of scheduler ids for `schedulerControl().list()`
+- `sync:scheduler:namespace:v4:{encodedPrefixAndSid}:registered` — durable v4 identity marker
+- `{prefix}:{schedulerId}:namespace-owner` — exact tuple allowed to mirror the legacy namespace
+- `{prefix}:{encodedSid}:control:{encodedId}:handler:{instance}` — live handler heartbeat
+- `sync:queue:namespace:v2:{encodedControlQueueTuple}:*` — durable manual-run requests
+- `{prefix}:control:response:*` — short-lived manual-run responses
 
-**Removed in v5**: `leader:epoch`, CAS Lua scripts, `dispatch:dlq`.
+The scheduler dual-reads and mirrors the v2 and legacy record/index/due layouts
+during rolling upgrades only for the exact `{prefix, schedulerId}` tuple that
+atomically owns the legacy namespace. Colliding identities use only their v4
+state and cannot read, dispatch, or delete the owner's legacy records.
+Tombstones prevent a delayed legacy migration or in-flight run from resurrecting
+a deleted or recreated schedule and are retained across later generations.
+Unowned or multiply registered legacy state fails with an explicit
+migration-required error instead of being claimed by whichever process reads it
+first. Drain old scheduler workers before upgrading; mixed-version execution is
+not supported because old workers do not understand the namespace-owner fence.
+Legacy manual-run queue entries are left for old workers and are not imported
+into the collision-free control queue, so let pending manual runs settle before
+replacing the final old worker.
 
 ## Browser differences
 
 - Handlers registered per-instance (can't serialize functions). Multiple instances with same `id` share schedule records but each has local handlers.
 - `store?: Store` lets `runNumber`/`nextRunAt`/`failureCount` survive tab reloads (via `createLocalStorageStore()`).
+- Browser scheduler state written under the concatenated <=5.8 key is not auto-imported because that key cannot prove which scheduler identity owned it. The first registration after upgrade starts a fresh checkpoint.
 - Leader election always succeeds in single tab.
-- Tick loop uses `setTimeout` — may be throttled in background tabs. Misfire-skip handles catch-up implicitly.
+- Tick loop uses `setTimeout` — it may be throttled in background tabs. A persisted overdue slot still runs once when the tab resumes.

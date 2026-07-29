@@ -92,10 +92,21 @@ type WorkPayload = {
   meta?: Record<string, unknown>;
 };
 
-type IdempotencyEntry = {
+type PendingIdempotencyEntry = {
   jobId: JobId;
   expiresAt: number;
+  state: "pending";
+  settled: Promise<boolean>;
+  settle(enqueued: boolean): void;
 };
+
+type EnqueuedIdempotencyEntry = {
+  jobId: JobId;
+  expiresAt: number;
+  state: "enqueued";
+};
+
+type IdempotencyEntry = PendingIdempotencyEntry | EnqueuedIdempotencyEntry;
 
 type SharedJobState = {
   idempotency: Map<string, IdempotencyEntry>;
@@ -129,7 +140,7 @@ const resolveDelayMs = (name: string, value = 0): number =>
  * It is applied per recv instead.
  */
 const getSharedState = (id: string, prefix: string): SharedJobState => {
-  const key = `${prefix}:${id}`;
+  const key = JSON.stringify([prefix, id]);
   let shared = sharedStates.get(key);
   if (!shared) {
     shared = {
@@ -183,32 +194,65 @@ export const job = <Input = void, Result = unknown>(
   const sweepExpiredKeys = (): void => {
     const now = Date.now();
     for (const [k, v] of shared.idempotency) {
-      if (now >= v.expiresAt) shared.idempotency.delete(k);
+      if (now < v.expiresAt) continue;
+      if (v.state === "pending") v.settle(false);
+      shared.idempotency.delete(k);
     }
   };
 
-  const claimKey = (key: string, keyTtlMs: number): { jobId: JobId; isNew: boolean } => {
+  const claimKey = (key: string, keyTtlMs: number): { entry: IdempotencyEntry; isNew: boolean } => {
     sweepExpiredKeys();
     const existing = shared.idempotency.get(key);
     if (existing && Date.now() < existing.expiresAt) {
-      return { jobId: existing.jobId, isNew: false };
+      return { entry: existing, isNew: false };
     }
     const jobId = String(++shared.seq);
-    shared.idempotency.set(key, { jobId, expiresAt: Date.now() + keyTtlMs });
-    return { jobId, isNew: true };
+    let settle!: (enqueued: boolean) => void;
+    const settled = new Promise<boolean>((resolve) => {
+      settle = resolve;
+    });
+    const entry: PendingIdempotencyEntry = {
+      jobId,
+      expiresAt: Date.now() + keyTtlMs,
+      state: "pending",
+      settled,
+      settle,
+    };
+    shared.idempotency.set(key, entry);
+    return { entry, isNew: true };
   };
 
   const refreshKey = (key: string, jobId: JobId, keyTtlMs: number): boolean => {
     const entry = shared.idempotency.get(key);
-    if (entry?.jobId !== jobId) return false;
+    if (entry?.jobId !== jobId || entry.state !== "enqueued") return false;
     entry.expiresAt = Date.now() + keyTtlMs;
     return true;
   };
 
+  const waitForEnqueuedClaim = async (key: string, jobId: JobId): Promise<boolean> => {
+    const entry = shared.idempotency.get(key);
+    if (entry?.jobId !== jobId) return false;
+    if (entry.state === "enqueued") return true;
+    return await entry.settled;
+  };
+
+  const markEnqueued = (key: string, jobId: JobId, keyTtlMs: number): boolean => {
+    const entry = shared.idempotency.get(key);
+    if (entry?.jobId !== jobId || entry.state !== "pending") return false;
+    shared.idempotency.set(key, {
+      jobId,
+      expiresAt: Date.now() + keyTtlMs,
+      state: "enqueued",
+    });
+    entry.settle(true);
+    return true;
+  };
+
   const releaseKey = (key: string, jobId: JobId): void => {
-    if (shared.idempotency.get(key)?.jobId === jobId) {
-      shared.idempotency.delete(key);
-    }
+    const entry = shared.idempotency.get(key);
+    if (entry?.jobId !== jobId) return;
+    if (entry.state === "pending") entry.settle(false);
+    shared.idempotency.delete(key);
   };
 
   const startWorker = (): void => {
@@ -239,9 +283,16 @@ export const job = <Input = void, Result = unknown>(
             const startedAt = Date.now();
             const jobAc = new AbortController();
             let leaseLost = false;
+            let claimLost = false;
             activeJobAc = jobAc;
 
             try {
+              if (!(await waitForEnqueuedClaim(payload.key, payload.jobId))) {
+                claimLost = true;
+                jobAc.abort();
+                continue;
+              }
+
               const keepLease = async (leaseMs = payload.leaseMs): Promise<boolean> => {
                 requireFutureDuration("heartbeat.leaseMs", leaseMs, 1);
                 const held = await message.touch({ leaseMs });
@@ -250,7 +301,16 @@ export const job = <Input = void, Result = unknown>(
                   jobAc.abort();
                   return false;
                 }
-                refreshKey(payload.key, payload.jobId, payload.keyTtlMs);
+                const ownsClaim = refreshKey(
+                  payload.key,
+                  payload.jobId,
+                  Math.max(payload.keyTtlMs, leaseMs),
+                );
+                if (!ownsClaim) {
+                  claimLost = true;
+                  jobAc.abort();
+                  return false;
+                }
                 return true;
               };
               const canceled = (): boolean => workerAc.signal.aborted || leaseLost || jobAc.signal.aborted;
@@ -266,6 +326,7 @@ export const job = <Input = void, Result = unknown>(
                 failureCount,
                 signal: jobAc.signal,
                 heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
+                  if (canceled()) return;
                   await keepLease(cfg?.leaseMs);
                 },
               } as JobCtx<Input>;
@@ -341,10 +402,11 @@ export const job = <Input = void, Result = unknown>(
 
               if (rescheduleRequested) {
                 const delayMs = (rescheduleRequested as { delayMs: number }).delayMs;
+                const retryKeyTtlMs = Math.min(MAX_KEY_TTL_MS, delayMs + payload.keyTtlMs);
                 const extended = refreshKey(
                   payload.key,
                   payload.jobId,
-                  Math.min(MAX_KEY_TTL_MS, delayMs + payload.keyTtlMs),
+                  Math.max(payload.leaseMs, retryKeyTtlMs),
                 );
                 if (!extended || canceled()) continue;
                 const nacked = await message.nack({
@@ -353,6 +415,7 @@ export const job = <Input = void, Result = unknown>(
                   error: error?.message,
                 });
                 if (!nacked) continue;
+                refreshKey(payload.key, payload.jobId, retryKeyTtlMs);
                 metrics.reschedules += 1;
                 await emitTrace(config.trace, {
                   type: "rescheduled",
@@ -364,10 +427,12 @@ export const job = <Input = void, Result = unknown>(
                 continue;
               }
 
-              // Terminal: ack + release key
+              // Both mutations start in the same event-loop turn. Releasing
+              // first also fences a stale redelivery if the browser closes
+              // before the in-memory ACK promise settles.
+              releaseKey(payload.key, payload.jobId);
               const acked = await message.ack();
               if (!acked) continue;
-              releaseKey(payload.key, payload.jobId);
 
               if (error) {
                 metrics.failures += 1;
@@ -382,6 +447,13 @@ export const job = <Input = void, Result = unknown>(
                 durationMs: Date.now() - startedAt,
               });
             } finally {
+              if (claimLost) {
+                try {
+                  await message.ack();
+                } catch {
+                  // A stale delivery will otherwise be recovered after its lease.
+                }
+              }
               // Ordinary completion keeps the signal live through after().
               // Only clear the controller if this attempt still owns the slot.
               if (activeJobAc === jobAc) activeJobAc = null;
@@ -418,43 +490,53 @@ export const job = <Input = void, Result = unknown>(
         : resolveDelayMs("submit.delayMs", cfg.delayMs);
     const initialKeyTtlMs = Math.min(MAX_KEY_TTL_MS, delayMs + keyTtlMs);
 
-    const { jobId, isNew } = claimKey(cfg.key, initialKeyTtlMs);
-    if (!isNew) {
-      startWorker();
-      return jobId;
-    }
+    while (true) {
+      const { entry, isNew } = claimKey(cfg.key, initialKeyTtlMs);
+      if (!isNew) {
+        if (entry.state === "pending" && !(await entry.settled)) continue;
+        startWorker();
+        return entry.jobId;
+      }
 
-    const payload: WorkPayload = {
-      jobId,
-      key: cfg.key,
-      input: (cfg as { input?: Input }).input,
-      keyTtlMs,
-      leaseMs,
-      meta: cfg.meta,
-    };
-
-    try {
-      await shared.workQueue.send({
-        data: payload,
-        delayMs,
+      const payload: WorkPayload = {
+        jobId: entry.jobId,
+        key: cfg.key,
+        input: (cfg as { input?: Input }).input,
+        keyTtlMs,
+        leaseMs,
         meta: cfg.meta,
+      };
+
+      try {
+        await shared.workQueue.send({
+          data: payload,
+          delayMs,
+          idempotencyKey: entry.jobId,
+          idempotencyTtlMs: initialKeyTtlMs,
+          meta: cfg.meta,
+        });
+      } catch (error) {
+        releaseKey(cfg.key, entry.jobId);
+        throw error;
+      }
+
+      if (!markEnqueued(cfg.key, entry.jobId, initialKeyTtlMs)) {
+        startWorker();
+        throw new Error(`job submit lost idempotency claim for key ${cfg.key}`);
+      }
+
+      const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
+      await emitTrace(config.trace, {
+        type: "submitted",
+        jobId: entry.jobId,
+        key: cfg.key,
+        ...traceInput,
+        ...(cfg.meta ? { meta: cfg.meta } : {}),
       });
-    } catch (error) {
-      releaseKey(cfg.key, jobId);
-      throw error;
+      startWorker();
+
+      return entry.jobId;
     }
-
-    const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
-    await emitTrace(config.trace, {
-      type: "submitted",
-      jobId,
-      key: cfg.key,
-      ...traceInput,
-      ...(cfg.meta ? { meta: cfg.meta } : {}),
-    });
-    startWorker();
-
-    return jobId;
   };
 
   const metric = (): JobMetrics => ({ ...metrics });

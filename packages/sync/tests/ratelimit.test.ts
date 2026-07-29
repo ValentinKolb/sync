@@ -228,6 +228,7 @@ test("invalid limiter configuration is rejected instead of failing open", () => 
   // abuse-control primitive. The browser already threw on the same config.
   expect(() => ratelimit({ id: "bad-window", limit: 5, windowSecs: 0 })).toThrow(/windowSecs/);
   expect(() => ratelimit({ id: "frac-window", limit: 5, windowSecs: 0.1 })).toThrow(/windowSecs/);
+  expect(() => ratelimit({ id: "huge-window", limit: 5, windowSecs: 1e308 })).toThrow(/windowSecs/);
   expect(() => ratelimit({ id: "bad-limit", limit: 0, windowSecs: 60 })).toThrow(/limit/);
   expect(() => ratelimit({ id: "ok", limit: 5, windowSecs: 60 })).not.toThrow();
 });

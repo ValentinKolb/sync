@@ -9,11 +9,21 @@ import {
   markSchedulerControlPending,
   markSchedulerControlUnavailable,
   readSchedulerScheduleRaw,
+  hasCompatibleLegacySchedule,
+  resolveLegacySchedulerAccess,
   refreshSchedulerControlRequestBinding,
   refreshSchedulerControlHandler,
-  registerSchedulerControlIndex,
   removeSchedulerControlHandler,
+  encodeSchedulerKeyPart,
+  legacySchedulerDueKey,
+  legacySchedulerScheduleIndexKey,
+  legacySchedulerScheduleKey,
+  schedulerDueKey,
+  schedulerScheduleIndexKey,
+  schedulerRegistrationKey,
   schedulerScheduleKey,
+  schedulerScheduleTombstoneKey,
+  schedulerV2ScheduleKey,
   schedulerControlQueue,
   type SchedulerControlRequest,
 } from "./scheduler-control";
@@ -44,40 +54,136 @@ const assertNonNegativeMs = (name: string, value: number | undefined): void => {
   }
 };
 
+const LUA_KEY_TYPE_HELPER = `
+  local function keyType(key)
+    local value = redis.call("TYPE", key)
+    if type(value) == "table" then return value.ok end
+    return value
+  end
+`;
+
+const LUA_SCHEDULE_RECORD_HELPERS = `
+  ${LUA_KEY_TYPE_HELPER}
+
+  local function readRecord(key)
+    if keyType(key) ~= "string" then return nil end
+    local raw = redis.call("GET", key)
+    if not raw then return nil end
+    local ok, value = pcall(cjson.decode, raw)
+    if not ok or type(value) ~= "table" or tostring(value.id or "") ~= scheduleId then return nil end
+    return { raw = raw, value = value }
+  end
+
+  local function readTombstone(key)
+    if keyType(key) ~= "string" then return nil end
+    local raw = redis.call("GET", key)
+    local ok, value = pcall(cjson.decode, raw)
+    if ok and type(value) == "table" then return value end
+    return nil
+  end
+
+  local function isDeleted(record, tombstone)
+    if not tombstone then return false end
+    local revision = tostring(record.value.revision or "")
+    if revision == "" then return true end
+    if type(tombstone.revisions) == "table" then
+      for _, deletedRevision in ipairs(tombstone.revisions) do
+        if revision == tostring(deletedRevision) then return true end
+      end
+    end
+    return false
+  end
+
+  local function isNewer(candidate, current)
+    if not current then return true end
+    local candidateRun = tonumber(candidate.value.runNumber) or 0
+    local currentRun = tonumber(current.value.runNumber) or 0
+    if candidateRun ~= currentRun then return candidateRun > currentRun end
+    return (tonumber(candidate.value.updatedAt) or 0) > (tonumber(current.value.updatedAt) or 0)
+  end
+
+  local function hasRevision(record)
+    return tostring(record.value.revision or "") ~= ""
+  end
+
+  local function runtimeCompatible(candidate, canonical)
+    return tostring(candidate.value.cron or "") == tostring(canonical.value.cron or "")
+      and tostring(candidate.value.tz or "") == tostring(canonical.value.tz or "")
+  end
+
+  local function mergeRuntime(canonical, runtime)
+    canonical.value.runNumber = tonumber(runtime.value.runNumber) or canonical.value.runNumber
+    canonical.value.nextRunAt = tonumber(runtime.value.nextRunAt) or canonical.value.nextRunAt
+    canonical.value.failureCount = tonumber(runtime.value.failureCount) or canonical.value.failureCount
+    canonical.value.updatedAt = tonumber(runtime.value.updatedAt) or canonical.value.updatedAt
+    if runtime.value.lastError ~= nil and runtime.value.lastError ~= cjson.null then
+      canonical.value.lastError = runtime.value.lastError
+    else
+      canonical.value.lastError = nil
+    end
+    canonical.raw = cjson.encode(canonical.value)
+    return canonical
+  end
+
+  local function selectRecord(keys, tombstone, deleteTombstoned)
+    local revisioned = nil
+    local revisionless = nil
+    for _, key in ipairs(keys) do
+      local candidate = readRecord(key)
+      if candidate and isDeleted(candidate, tombstone) then
+        if deleteTombstoned then redis.call("DEL", key) end
+      elseif candidate and hasRevision(candidate) and isNewer(candidate, revisioned) then
+        revisioned = candidate
+      elseif candidate and not hasRevision(candidate) and isNewer(candidate, revisionless) then
+        revisionless = candidate
+      end
+    end
+
+    if revisioned then
+      if revisionless
+        and runtimeCompatible(revisionless, revisioned)
+        and isNewer(revisionless, revisioned)
+      then
+        return mergeRuntime(revisioned, revisionless)
+      end
+      return revisioned
+    end
+    return revisionless
+  end
+`;
+
 // Upsert: creates or updates the schedule record. Preserves runNumber always;
 // preserves nextRunAt/failureCount iff cron/tz unchanged.
 // Returns [1 = created | 2 = updated, stored nextRunAt].
 const UPSERT_SCRIPT = `
-  local raw = redis.call("GET", KEYS[1])
   local incomingRaw = ARGV[1]
   local firstRunAt = tonumber(ARGV[2])
   local scheduleId = ARGV[3]
   local now = tonumber(ARGV[4])
 
+  ${LUA_SCHEDULE_RECORD_HELPERS}
+  local tombstone = readTombstone(KEYS[4])
+
+  local existingRecord = selectRecord({ KEYS[1], KEYS[2], KEYS[3] }, tombstone, true)
+
   local created = 1
   local incoming = cjson.decode(incomingRaw)
 
-  if raw then
+  if existingRecord then
     created = 0
-    local ok, existing = pcall(cjson.decode, raw)
-    if ok and tostring(existing.id or "") == scheduleId then
-      incoming.createdAt = tonumber(existing.createdAt) or incoming.createdAt
-      incoming.runNumber = tonumber(existing.runNumber) or 0
+    local existing = existingRecord.value
+    incoming.createdAt = tonumber(existing.createdAt) or incoming.createdAt
+    incoming.runNumber = tonumber(existing.runNumber) or 0
 
-      local shouldResetNext = tostring(existing.cron) ~= tostring(incoming.cron)
-        or tostring(existing.tz) ~= tostring(incoming.tz)
+    local shouldResetNext = tostring(existing.cron) ~= tostring(incoming.cron)
+      or tostring(existing.tz) ~= tostring(incoming.tz)
 
-      if shouldResetNext then
-        incoming.nextRunAt = firstRunAt
-        incoming.failureCount = 0
-      else
-        incoming.nextRunAt = tonumber(existing.nextRunAt) or firstRunAt
-        incoming.failureCount = tonumber(existing.failureCount) or 0
-      end
-    else
-      incoming.runNumber = 0
+    if shouldResetNext then
       incoming.nextRunAt = firstRunAt
       incoming.failureCount = 0
+    else
+      incoming.nextRunAt = tonumber(existing.nextRunAt) or firstRunAt
+      incoming.failureCount = tonumber(existing.failureCount) or 0
     end
   else
     incoming.runNumber = 0
@@ -86,32 +192,105 @@ const UPSERT_SCRIPT = `
   end
 
   incoming.updatedAt = now
+  local storedRaw = cjson.encode(incoming)
+  if keyType(KEYS[5]) ~= "none" and keyType(KEYS[5]) ~= "zset" then
+    return redis.error_reply("scheduler due key has wrong type")
+  end
+  if keyType(KEYS[7]) ~= "none" and keyType(KEYS[7]) ~= "set" then
+    return redis.error_reply("scheduler index key has wrong type")
+  end
+  if keyType(KEYS[9]) ~= "none" and keyType(KEYS[9]) ~= "set" then
+    return redis.error_reply("scheduler global index key has wrong type")
+  end
+  if keyType(KEYS[10]) ~= "none" and keyType(KEYS[10]) ~= "string" then
+    return redis.error_reply("scheduler registration key has wrong type")
+  end
 
-  redis.call("SET", KEYS[1], cjson.encode(incoming))
-  redis.call("ZADD", KEYS[2], tostring(incoming.nextRunAt), scheduleId)
-  redis.call("SADD", KEYS[3], scheduleId)
+  local function mirrorRecord(key)
+    local kind = keyType(key)
+    if kind ~= "none" and kind ~= "string" then return end
+    local existing = readRecord(key)
+    if kind == "none" or existing then redis.call("SET", key, storedRaw) end
+  end
+
+  redis.call("SET", KEYS[1], storedRaw)
+  mirrorRecord(KEYS[2])
+  mirrorRecord(KEYS[3])
+  redis.call("ZADD", KEYS[5], tostring(incoming.nextRunAt), scheduleId)
+  redis.call("SADD", KEYS[7], scheduleId)
+  redis.call("SADD", KEYS[9], ARGV[5])
+  redis.call("SET", KEYS[10], "1")
+  if keyType(KEYS[6]) == "none" or keyType(KEYS[6]) == "zset" then
+    redis.call("ZADD", KEYS[6], tostring(incoming.nextRunAt), scheduleId)
+  end
+  if keyType(KEYS[8]) == "none" or keyType(KEYS[8]) == "set" then
+    redis.call("SADD", KEYS[8], scheduleId)
+  end
 
   if created == 1 then return {1, tostring(incoming.nextRunAt)} end
   return {2, tostring(incoming.nextRunAt)}
 `;
 
 const DELETE_SCRIPT = `
-  local currentRaw = redis.call("GET", KEYS[1])
-  if currentRaw then
-    local ok, current = pcall(cjson.decode, currentRaw)
-    if not ok or type(current) ~= "table" or tostring(current.id or "") == ARGV[1] then
-      redis.call("DEL", KEYS[1])
+  local scheduleId = ARGV[1]
+  local deletedAt = tonumber(ARGV[2])
+
+  ${LUA_KEY_TYPE_HELPER}
+
+  local revisions = {}
+  local seenRevisions = {}
+  local function rememberRevision(revision)
+    if revision == nil then return end
+    local value = tostring(revision)
+    if seenRevisions[value] then return end
+    seenRevisions[value] = true
+    table.insert(revisions, value)
+  end
+  local existingDeletedAt = 0
+  if keyType(KEYS[4]) == "string" then
+    local raw = redis.call("GET", KEYS[4])
+    local ok, existing = pcall(cjson.decode, raw)
+    if ok and type(existing) == "table" then
+      existingDeletedAt = tonumber(existing.deletedAt) or 0
+      if type(existing.revisions) == "table" then
+        for _, revision in ipairs(existing.revisions) do
+          rememberRevision(revision)
+        end
+      end
     end
   end
-  local legacyRaw = redis.call("GET", KEYS[4])
-  if legacyRaw then
-    local ok, legacy = pcall(cjson.decode, legacyRaw)
-    if ok and type(legacy) == "table" and tostring(legacy.id or "") == ARGV[1] then
-      redis.call("DEL", KEYS[4])
+  local function deleteRecord(key, collisionFree)
+    local kind = keyType(key)
+    if collisionFree and kind ~= "none" and kind ~= "string" then
+      redis.call("DEL", key)
+      return
+    end
+    if kind ~= "string" then return end
+    local raw = redis.call("GET", key)
+    local ok, value = pcall(cjson.decode, raw)
+    if collisionFree or (ok and type(value) == "table" and tostring(value.id or "") == scheduleId) then
+      if ok and type(value) == "table" and value.revision ~= nil then
+        rememberRevision(value.revision)
+      end
+      redis.call("DEL", key)
     end
   end
-  redis.call("ZREM", KEYS[2], ARGV[1])
-  redis.call("SREM", KEYS[3], ARGV[1])
+
+  deleteRecord(KEYS[1], true)
+  deleteRecord(KEYS[2], false)
+  deleteRecord(KEYS[3], false)
+  redis.call("SET", KEYS[4], cjson.encode({
+    deletedAt = math.max(deletedAt, existingDeletedAt),
+    revisions = revisions,
+  }))
+  redis.call("ZREM", KEYS[5], scheduleId)
+  redis.call("SREM", KEYS[7], scheduleId)
+  if keyType(KEYS[6]) == "zset" then
+    redis.call("ZREM", KEYS[6], scheduleId)
+  end
+  if keyType(KEYS[8]) == "set" then
+    redis.call("SREM", KEYS[8], scheduleId)
+  end
   return 1
 `;
 
@@ -133,14 +312,19 @@ const DELETE_SCRIPT = `
 // field written by someone else in the meantime is preserved, and `metaJson`
 // stays an opaque string.
 const PERSIST_SCRIPT = `
-  local raw = redis.call("GET", KEYS[1])
-  if not raw then return 0 end
-
   if ARGV[3] ~= "" and redis.call("GET", KEYS[3]) ~= ARGV[3] then return 0 end
   if redis.call("GET", KEYS[4]) ~= ARGV[5] then return 0 end
+  if ARGV[7] ~= "" and redis.call("GET", KEYS[8]) ~= ARGV[7] then return 0 end
+  if ARGV[8] ~= "" and redis.call("GET", KEYS[9]) ~= ARGV[8] then return 0 end
 
-  local ok, existing = pcall(cjson.decode, raw)
-  if not ok or type(existing) ~= "table" then return 0 end
+  local scheduleId = ARGV[1]
+  ${LUA_SCHEDULE_RECORD_HELPERS}
+  local tombstone = readTombstone(KEYS[10])
+
+  local record = selectRecord({ KEYS[1], KEYS[5], KEYS[6] }, tombstone, true)
+  if not record then return 0 end
+
+  local existing = record.value
   if tostring(tonumber(existing.runNumber) or 0) ~= ARGV[2] then return 0 end
   if tostring(existing.revision or "") ~= ARGV[6] then return 0 end
 
@@ -155,8 +339,31 @@ const PERSIST_SCRIPT = `
     existing.lastError = nil
   end
 
-  redis.call("SET", KEYS[1], cjson.encode(existing))
+  local storedRaw = cjson.encode(existing)
+  if keyType(KEYS[2]) ~= "none" and keyType(KEYS[2]) ~= "zset" then
+    return redis.error_reply("scheduler due key has wrong type")
+  end
+  if keyType(KEYS[11]) ~= "none" and keyType(KEYS[11]) ~= "set" then
+    return redis.error_reply("scheduler index key has wrong type")
+  end
+  local function mirrorRecord(key)
+    local kind = keyType(key)
+    if kind ~= "none" and kind ~= "string" then return end
+    local current = readRecord(key)
+    if kind == "none" or current then redis.call("SET", key, storedRaw) end
+  end
+
+  redis.call("SET", KEYS[1], storedRaw)
+  mirrorRecord(KEYS[5])
+  mirrorRecord(KEYS[6])
   redis.call("ZADD", KEYS[2], tostring(patch.nextRunAt), ARGV[1])
+  redis.call("SADD", KEYS[11], ARGV[1])
+  if keyType(KEYS[7]) == "none" or keyType(KEYS[7]) == "zset" then
+    redis.call("ZADD", KEYS[7], tostring(patch.nextRunAt), ARGV[1])
+  end
+  if keyType(KEYS[12]) == "none" or keyType(KEYS[12]) == "set" then
+    redis.call("SADD", KEYS[12], ARGV[1])
+  end
   return 1
 `;
 
@@ -182,6 +389,11 @@ type StoredSchedule = {
    * carry a decoded `meta` instead and are normalized on read.
    */
   metaJson?: string;
+};
+
+type PairedLock = {
+  current: Lock;
+  legacy: Lock | null;
 };
 
 export type SchedulerMetrics = {
@@ -359,18 +571,57 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const controlHeartbeatMs = Math.max(500, Math.floor(controlHandlerTtlMs / 3));
 
   const scheduleKey = (id: string): string => schedulerScheduleKey(prefix, config.id, id);
-  const legacyScheduleKey = (id: string): string => `${prefix}:${config.id}:schedule:${id}`;
-  const dueKey = `${prefix}:${config.id}:due`;
-  const indexKey = `${prefix}:${config.id}:index`;
+  const v2ScheduleKey = (id: string): string => schedulerV2ScheduleKey(prefix, config.id, id);
+  const legacyScheduleKey = (id: string): string => legacySchedulerScheduleKey(prefix, config.id, id);
+  const tombstoneKey = (id: string): string => schedulerScheduleTombstoneKey(prefix, config.id, id);
+  const dueKey = schedulerDueKey(prefix, config.id);
+  const legacyDueKey = legacySchedulerDueKey(prefix, config.id);
+  const indexKey = schedulerScheduleIndexKey(prefix, config.id);
+  const legacyIndexKey = legacySchedulerScheduleIndexKey(prefix, config.id);
   const instanceId = crypto.randomUUID();
+  const hasLegacyAccess = (): Promise<boolean> =>
+    resolveLegacySchedulerAccess(prefix, config.id);
+  const compatibilityKeys = async (scheduleId: string) => {
+    const legacyAccess = await hasLegacyAccess();
+    if (legacyAccess) {
+      const legacyScheduleAccess = await hasCompatibleLegacySchedule(prefix, config.id, scheduleId);
+      return {
+        v2Schedule: v2ScheduleKey(scheduleId),
+        legacySchedule: legacyScheduleAccess
+          ? legacyScheduleKey(scheduleId)
+          : `${scheduleKey(scheduleId)}:compat-disabled:legacy`,
+        legacyDue: legacyDueKey,
+        legacyIndex: legacyIndexKey,
+      };
+    }
+    const base = `${scheduleKey(scheduleId)}:compat-disabled`;
+    return {
+      v2Schedule: `${base}:v2`,
+      legacySchedule: `${base}:legacy`,
+      legacyDue: `${dueKey}:compat-disabled`,
+      legacyIndex: `${indexKey}:compat-disabled`,
+    };
+  };
 
   const leaderMutex = mutex({
+    id: "scheduler",
+    prefix: `${prefix}:v3:leader:${encodeSchedulerKeyPart(config.id)}`,
+    defaultTtl: leaseMs,
+    retryCount: 0,
+  });
+  const legacyLeaderMutex = mutex({
     id: `${config.id}:leader`,
     prefix: `${prefix}:leader`,
     defaultTtl: leaseMs,
     retryCount: 0,
   });
   const dispatchMutex = mutex({
+    id: "scheduler",
+    prefix: `${prefix}:v3:dispatch:${encodeSchedulerKeyPart(config.id)}`,
+    defaultTtl: leaseMs,
+    retryCount: 0,
+  });
+  const legacyDispatchMutex = mutex({
     id: `${config.id}:dispatch`,
     prefix: `${prefix}:dispatch`,
     defaultTtl: leaseMs,
@@ -396,10 +647,12 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   let heartbeatPromise: Promise<void> | null = null;
   let controlHeartbeatPromise: Promise<void> | null = null;
   let controlRefreshPromise: Promise<void> | null = null;
+  let stopPromise: Promise<void> | null = null;
+  let restartRequested = false;
   let dispatchGeneration = 0;
   // Controllers of the callbacks currently running, so stop() can cancel them.
   const activeRuns = new Set<AbortController>();
-  let currentLeaderLock: Lock | null = null;
+  let currentLeaderLock: PairedLock | null = null;
   let lastHeartbeatAt = 0;
   let nextLeadershipAttemptAt = 0;
 
@@ -420,9 +673,17 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const tryAcquireLeadership = async (): Promise<void> => {
     if (currentLeaderLock) return;
     if (Date.now() < nextLeadershipAttemptAt) return;
-    const acquired = await leaderMutex.acquire("active", leaseMs);
-    if (!acquired) return;
-    currentLeaderLock = acquired;
+    const current = await leaderMutex.acquire("active", leaseMs);
+    if (!current) return;
+    let legacy: Lock | null = null;
+    if (await hasLegacyAccess()) {
+      legacy = await legacyLeaderMutex.acquire("active", leaseMs);
+      if (!legacy) {
+        await leaderMutex.release(current);
+        return;
+      }
+    }
+    currentLeaderLock = { current, legacy };
     lastHeartbeatAt = Date.now();
     setLeader(true);
   };
@@ -433,22 +694,64 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     const nowMs = Date.now();
     if (nowMs - lastHeartbeatAt < heartbeatMs) return;
     lastHeartbeatAt = nowMs;
-    const ok = await leaderMutex.extend(lock, leaseMs);
+    const [currentOk, legacyOk] = await Promise.all([
+      leaderMutex.extend(lock.current, leaseMs),
+      lock.legacy ? legacyLeaderMutex.extend(lock.legacy, leaseMs) : true,
+    ]);
+    const ok = currentOk && legacyOk;
     if (!ok && currentLeaderLock === lock) {
       currentLeaderLock = null;
       setLeader(false);
+      await Promise.allSettled([
+        leaderMutex.release(lock.current),
+        ...(lock.legacy ? [legacyLeaderMutex.release(lock.legacy)] : []),
+      ]);
     }
   };
 
   const relinquishLeadership = async (): Promise<void> => {
     if (!currentLeaderLock) return;
+    const lock = currentLeaderLock;
+    currentLeaderLock = null;
+    setLeader(false);
     try {
-      await leaderMutex.release(currentLeaderLock);
+      await Promise.all([
+        leaderMutex.release(lock.current),
+        ...(lock.legacy ? [legacyLeaderMutex.release(lock.legacy)] : []),
+      ]);
     } catch {
       // best effort
     }
-    currentLeaderLock = null;
-    setLeader(false);
+  };
+
+  const acquireDispatchLock = async (scheduleId: string): Promise<PairedLock | null> => {
+    const current = await dispatchMutex.acquire(encodeSchedulerKeyPart(scheduleId), leaseMs);
+    if (!current) return null;
+    let legacy: Lock | null = null;
+    if (await hasLegacyAccess()) {
+      // The namespace owner keeps the old fence throughout a rolling upgrade.
+      legacy = await legacyDispatchMutex.acquire(scheduleId, leaseMs);
+      if (!legacy) {
+        await dispatchMutex.release(current);
+        return null;
+      }
+    }
+    return { current, legacy };
+  };
+
+  const extendDispatchLock = async (lock: PairedLock): Promise<boolean> => {
+    const [currentOk, legacyOk] = await Promise.all([
+      dispatchMutex.extend(lock.current, leaseMs),
+      lock.legacy ? legacyDispatchMutex.extend(lock.legacy, leaseMs) : true,
+    ]);
+    return currentOk && legacyOk;
+  };
+
+  const releaseDispatchLock = async (lock: PairedLock): Promise<void> => {
+    await Promise.allSettled([
+      dispatchMutex.release(lock.current),
+      ...(lock.legacy ? [legacyDispatchMutex.release(lock.legacy)] : []),
+    ]);
   };
 
   /**
@@ -461,21 +764,31 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     schedule: StoredSchedule,
     expectedRunNumber: number,
     requireLeadership: boolean,
-    dispatchLock: Lock,
+    dispatchLock: PairedLock,
   ): Promise<boolean> => {
-    const leaderToken = requireLeadership ? (currentLeaderLock?.value ?? null) : "";
-    if (leaderToken === null) return false;
+    const compatibility = await compatibilityKeys(schedule.id);
+    const currentLeaderToken = requireLeadership ? (currentLeaderLock?.current.value ?? null) : "";
+    const legacyLeaderToken = requireLeadership ? (currentLeaderLock?.legacy?.value ?? null) : "";
+    if (currentLeaderToken === null || legacyLeaderToken === null) return false;
 
     const result = await redis.send("EVAL", [
       PERSIST_SCRIPT,
-      "4",
+      "12",
       scheduleKey(schedule.id),
       dueKey,
-      currentLeaderLock?.resource ?? `${prefix}:leader:${config.id}:leader:active`,
-      dispatchLock.resource,
+      currentLeaderLock?.current.resource ?? `${prefix}:v3:unused:leader`,
+      dispatchLock.current.resource,
+      compatibility.v2Schedule,
+      compatibility.legacySchedule,
+      compatibility.legacyDue,
+      currentLeaderLock?.legacy?.resource ?? `${prefix}:legacy:unused:leader`,
+      dispatchLock.legacy?.resource ?? `${prefix}:legacy:unused:dispatch`,
+      tombstoneKey(schedule.id),
+      indexKey,
+      compatibility.legacyIndex,
       schedule.id,
       String(expectedRunNumber),
-      leaderToken,
+      currentLeaderToken,
       JSON.stringify({
         runNumber: schedule.runNumber,
         nextRunAt: schedule.nextRunAt,
@@ -483,8 +796,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         updatedAt: schedule.updatedAt,
         lastError: schedule.lastError ?? null,
       }),
-      dispatchLock.value,
+      dispatchLock.current.value,
       schedule.revision,
+      legacyLeaderToken,
+      dispatchLock.legacy?.value ?? "",
     ]);
     const persisted = Number(result) > 0;
     if (!persisted) metrics.staleWrites += 1;
@@ -517,7 +832,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     schedule: StoredSchedule,
     handler: HandlerEntry,
     trigger: "cron" | "manual",
-    dispatchLock: Lock,
+    dispatchLock: PairedLock,
   ): Promise<void> => {
     const advanceCron = trigger === "cron";
     const slotTs = schedule.nextRunAt;
@@ -535,7 +850,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       heartbeatTail = heartbeatTail.then(async () => {
         if (dispatchLeaseLost || jobAc.signal.aborted) return;
         try {
-          if (await dispatchMutex.extend(dispatchLock, leaseMs)) return;
+          if (await extendDispatchLock(dispatchLock)) return;
         } catch {
           // A transport failure makes ownership uncertain. Fail closed.
         }
@@ -686,14 +1001,14 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   ): Promise<void> => {
     const generation = options?.generation ?? dispatchGeneration;
     await serializeDispatch(scheduleId, async () => {
-      let dispatchLock = await dispatchMutex.acquire(scheduleId, leaseMs);
+      let dispatchLock = await acquireDispatchLock(scheduleId);
       if (trigger === "cron" && !dispatchLock) return;
       while (!dispatchLock) {
         if (generation !== dispatchGeneration || (options?.shouldContinue && !options.shouldContinue())) {
           throw new Error(`scheduler dispatch stopped for ${scheduleId}`);
         }
         await sleep(Math.max(25, Math.min(100, Math.floor(heartbeatMs / 2))));
-        dispatchLock = await dispatchMutex.acquire(scheduleId, leaseMs);
+        dispatchLock = await acquireDispatchLock(scheduleId);
       }
 
       let preparationLeaseLost = false;
@@ -702,7 +1017,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         preparationHeartbeatTail = preparationHeartbeatTail.then(async () => {
           if (preparationLeaseLost) return;
           try {
-            if (await dispatchMutex.extend(dispatchLock, leaseMs)) return;
+            if (await extendDispatchLock(dispatchLock)) return;
           } catch {
             // Ownership is uncertain after a transport error.
           }
@@ -722,13 +1037,13 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         ) {
           throw new Error(`scheduler dispatch stopped for ${scheduleId}`);
         }
-        if (preparationLeaseLost || !(await dispatchMutex.extend(dispatchLock, leaseMs))) {
+        if (preparationLeaseLost || !(await extendDispatchLock(dispatchLock))) {
           throw new Error(`scheduler dispatch lease lost for ${scheduleId}`);
         }
         await options?.onAcquired?.();
         clearInterval(preparationHeartbeat);
         await preparationHeartbeatTail;
-        if (preparationLeaseLost || !(await dispatchMutex.extend(dispatchLock, leaseMs))) {
+        if (preparationLeaseLost || !(await extendDispatchLock(dispatchLock))) {
           throw new Error(`scheduler dispatch lease lost for ${scheduleId}`);
         }
         if (
@@ -741,25 +1056,33 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       } finally {
         clearInterval(preparationHeartbeat);
         await preparationHeartbeatTail;
-        await dispatchMutex.release(dispatchLock);
+        await releaseDispatchLock(dispatchLock);
       }
     });
   };
 
   const dispatchDue = async (generation: number): Promise<void> => {
     const nowMs = Date.now();
-    const dueIdsRaw = await redis.send("ZRANGEBYSCORE", [
-      dueKey,
-      "-inf",
-      String(nowMs),
-      "LIMIT",
-      "0",
-      String(batchSize),
-    ]);
+    const dueArgs = ["-inf", String(nowMs), "LIMIT", "0", String(batchSize)];
+    const legacyAccess = await hasLegacyAccess();
+    const dueIdsRaw = await redis.send("ZRANGEBYSCORE", [dueKey, ...dueArgs]);
+    const legacyDueTypeRaw = legacyAccess ? await redis.send("TYPE", [legacyDueKey]) : "none";
+    const legacyDueType = typeof legacyDueTypeRaw === "string"
+      ? legacyDueTypeRaw
+      : (legacyDueTypeRaw as { ok?: unknown } | null)?.ok;
+    const legacyDueIdsRaw = legacyAccess && legacyDueType === "zset"
+      ? await redis.send("ZRANGEBYSCORE", [legacyDueKey, ...dueArgs])
+      : [];
     if (!running || generation !== dispatchGeneration) return;
-    if (!Array.isArray(dueIdsRaw) || dueIdsRaw.length === 0) return;
-
-    const dueIds = dueIdsRaw.map((v) => String(v));
+    const dueIds = Array.from(
+      new Set(
+        [
+          ...(Array.isArray(dueIdsRaw) ? dueIdsRaw : []),
+          ...(Array.isArray(legacyDueIdsRaw) ? legacyDueIdsRaw : []),
+        ].map((value) => String(value)),
+      ),
+    ).slice(0, batchSize);
+    if (dueIds.length === 0) return;
 
     for (const scheduleId of dueIds) {
       if (!currentLeaderLock) break;
@@ -769,14 +1092,20 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       const schedule = parseSchedule(raw);
       if (!schedule) {
         // Broken record: clean up
+        const compatibility = await compatibilityKeys(scheduleId);
         await redis.send("EVAL", [
           DELETE_SCRIPT,
-          "4",
+          "8",
           scheduleKey(scheduleId),
+          compatibility.v2Schedule,
+          compatibility.legacySchedule,
+          tombstoneKey(scheduleId),
           dueKey,
+          compatibility.legacyDue,
           indexKey,
-          legacyScheduleKey(scheduleId),
+          compatibility.legacyIndex,
           scheduleId,
+          String(Date.now()),
         ]);
         continue;
       }
@@ -798,7 +1127,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         return;
       }
 
-      await dispatchSchedule(scheduleId, "cron", { generation, shouldContinue: () => running });
+      await dispatchSchedule(scheduleId, "cron", {
+        generation,
+        shouldContinue: () => running && generation === dispatchGeneration,
+      });
     }
   };
 
@@ -831,10 +1163,11 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     );
   };
 
-  const dispatchControlRequests = async (): Promise<void> => {
+  const dispatchControlRequests = async (generation: number): Promise<void> => {
     let dispatched = 0;
     const controlLeaseMs = 30_000;
     for (const scheduleId of handlers.keys()) {
+      if (!running || generation !== dispatchGeneration) return;
       if (dispatched >= batchSize) break;
       const message = await controlQueueForSchedule(scheduleId).recv({
         wait: false,
@@ -908,7 +1241,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
               throw new Error(`schedulerControl.runNow: stale request ${request.requestId}`);
             }
           },
-          shouldContinue: () => running,
+          shouldContinue: () => running && generation === dispatchGeneration,
+          generation,
         });
         await message.ack();
       } catch (error) {
@@ -933,11 +1267,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     }
   };
 
-  const loop = async (): Promise<void> => {
-    while (running) {
-      const generation = dispatchGeneration;
+  const loop = async (generation: number): Promise<void> => {
+    while (running && generation === dispatchGeneration) {
       try {
-        await dispatchControlRequests();
+        await dispatchControlRequests(generation);
         if (!running || generation !== dispatchGeneration) break;
         await tryAcquireLeadership();
         if (!running || generation !== dispatchGeneration) {
@@ -957,8 +1290,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
   // Handler liveness must not depend on the dispatch loop: that loop awaits
   // user callbacks, which may legitimately run longer than the presence TTL.
-  const controlHeartbeatLoop = async (): Promise<void> => {
-    while (running) {
+  const controlHeartbeatLoop = async (generation: number): Promise<void> => {
+    while (running && generation === dispatchGeneration) {
       try {
         controlRefreshPromise = refreshControlHandlers();
         await controlRefreshPromise;
@@ -976,8 +1309,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   // that outlived leaseMs — an ordinary batch job — silently dropped the lease,
   // let a second pod take over and dispatch the same slot, and then wrote its
   // own stale state over the new leader's.
-  const heartbeatLoop = async (): Promise<void> => {
-    while (running) {
+  const heartbeatLoop = async (generation: number): Promise<void> => {
+    while (running && generation === dispatchGeneration) {
       try {
         await maintainLeadership();
       } catch {
@@ -995,6 +1328,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     const tz = cfg.tz ?? "UTC";
     assertValidTimeZone(tz);
     const firstRunAt = nextCronTimestamp(cfg.cron, tz, Date.now());
+    const compatibility = await compatibilityKeys(cfg.id);
 
     const incoming: StoredSchedule = {
       id: cfg.id,
@@ -1009,23 +1343,29 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       ...(cfg.meta === undefined ? {} : { metaJson: JSON.stringify(cfg.meta) }),
     };
 
-    await readSchedulerScheduleRaw(prefix, config.id, cfg.id);
     const resultRaw = await redis.send("EVAL", [
       UPSERT_SCRIPT,
-      "3",
+      "10",
       scheduleKey(cfg.id),
+      compatibility.v2Schedule,
+      compatibility.legacySchedule,
+      tombstoneKey(cfg.id),
       dueKey,
+      compatibility.legacyDue,
       indexKey,
+      compatibility.legacyIndex,
+      `${prefix}:index`,
+      schedulerRegistrationKey(prefix, config.id),
       JSON.stringify(incoming),
       String(firstRunAt),
       cfg.id,
       String(Date.now()),
+      config.id,
     ]);
     const resultTuple = Array.isArray(resultRaw) ? resultRaw : [resultRaw, firstRunAt];
     const result = Number(resultTuple[0]);
     const storedNextRunAt = Number(resultTuple[1] ?? firstRunAt);
 
-    await registerSchedulerControlIndex(prefix, config.id);
     handlers.set(cfg.id, {
       process: cfg.process as HandlerEntry["process"],
       after: cfg.after as HandlerEntry["after"],
@@ -1057,14 +1397,20 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   };
 
   const deleteSchedule = async (cfg: { id: string }): Promise<void> => {
+    const compatibility = await compatibilityKeys(cfg.id);
     await redis.send("EVAL", [
       DELETE_SCRIPT,
-      "4",
+      "8",
       scheduleKey(cfg.id),
+      compatibility.v2Schedule,
+      compatibility.legacySchedule,
+      tombstoneKey(cfg.id),
       dueKey,
+      compatibility.legacyDue,
       indexKey,
-      legacyScheduleKey(cfg.id),
+      compatibility.legacyIndex,
       cfg.id,
+      String(Date.now()),
     ]);
     handlers.delete(cfg.id);
     // A refresh may have captured this handler immediately before deletion.
@@ -1094,9 +1440,24 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   };
 
   const list = async (): Promise<SchedulerInfo[]> => {
+    const legacyAccess = await hasLegacyAccess();
     const idsRaw = await redis.send("SMEMBERS", [indexKey]);
-    if (!Array.isArray(idsRaw) || idsRaw.length === 0) return [];
-    const ids = idsRaw.map((v) => String(v));
+    const legacyIndexTypeRaw = legacyAccess ? await redis.send("TYPE", [legacyIndexKey]) : "none";
+    const legacyIndexType = typeof legacyIndexTypeRaw === "string"
+      ? legacyIndexTypeRaw
+      : (legacyIndexTypeRaw as { ok?: unknown } | null)?.ok;
+    const legacyIdsRaw = legacyAccess && legacyIndexType === "set"
+      ? await redis.send("SMEMBERS", [legacyIndexKey])
+      : [];
+    const ids = Array.from(
+      new Set(
+        [
+          ...(Array.isArray(idsRaw) ? idsRaw : []),
+          ...(Array.isArray(legacyIdsRaw) ? legacyIdsRaw : []),
+        ].map((value) => String(value)),
+      ),
+    );
+    if (ids.length === 0) return [];
     const values = await Promise.all(ids.map((id) => readSchedulerScheduleRaw(prefix, config.id, id)));
 
     const out: SchedulerInfo[] = [];
@@ -1110,15 +1471,27 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
   const metric = (): SchedulerMetrics => ({ ...metrics });
 
-  const start = (): void => {
-    if (running) return;
+  const launch = (): void => {
     running = true;
-    loopPromise = loop();
-    heartbeatPromise = heartbeatLoop();
-    controlHeartbeatPromise = controlHeartbeatLoop();
+    const generation = dispatchGeneration;
+    loopPromise = loop(generation);
+    heartbeatPromise = heartbeatLoop(generation);
+    controlHeartbeatPromise = controlHeartbeatLoop(generation);
   };
 
-  const stop = async (): Promise<void> => {
+  const start = (): void => {
+    if (running) return;
+    if (stopPromise) {
+      restartRequested = true;
+      return;
+    }
+    launch();
+  };
+
+  const stop = (): Promise<void> => {
+    restartRequested = false;
+    if (stopPromise) return stopPromise;
+
     const wasRunning = running;
     running = false;
     dispatchGeneration += 1;
@@ -1126,15 +1499,33 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     // Cancel in-flight callbacks so `ctx.signal.aborted` is a usable
     // cancellation signal instead of something that is always false.
     for (const ac of activeRuns) ac.abort();
-    if (wasRunning) {
-      await Promise.all([loopPromise, heartbeatPromise, controlHeartbeatPromise]);
-    }
-    await Promise.all(pendingDispatches);
-    loopPromise = null;
-    heartbeatPromise = null;
-    controlHeartbeatPromise = null;
-    await removeControlHandlers();
-    await relinquishLeadership();
+
+    const cleanup = (async (): Promise<void> => {
+      if (wasRunning) {
+        await Promise.all([loopPromise, heartbeatPromise, controlHeartbeatPromise]);
+      }
+      await Promise.all(pendingDispatches);
+      loopPromise = null;
+      heartbeatPromise = null;
+      controlHeartbeatPromise = null;
+      await removeControlHandlers();
+      await relinquishLeadership();
+    })();
+    stopPromise = cleanup;
+
+    const finish = (): void => {
+      if (stopPromise !== cleanup) return;
+      stopPromise = null;
+      if (!restartRequested) return;
+      restartRequested = false;
+      launch();
+    };
+    void cleanup.then(finish, () => {
+      if (stopPromise !== cleanup) return;
+      stopPromise = null;
+      restartRequested = false;
+    });
+    return cleanup;
   };
 
   return {

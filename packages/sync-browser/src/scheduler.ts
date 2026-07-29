@@ -1,4 +1,4 @@
-import { mutex, type Lock } from "./mutex";
+import { mutex, type Lock, type Mutex } from "./mutex";
 import { type Store } from "./store";
 import { expBackoff, type BackoffOptions } from "./retry";
 import { sleep } from "./internal/sleep";
@@ -18,6 +18,10 @@ const DEFAULT_TICK_MS = 500;
 const DEFAULT_BATCH_SIZE = 200;
 const MIN_LEASE_MS = 500;
 const MIN_HEARTBEAT_MS = 100;
+const BROWSER_SCHEDULER_KEY_PREFIX = "sync:scheduler:browser:v2";
+
+const encodeIdentity = (parts: readonly string[]): string =>
+  encodeURIComponent(JSON.stringify(parts));
 
 const normalizeMs = (value: number | undefined, fallback: number, minimum: number): number =>
   Math.max(minimum, Math.floor(value !== undefined && Number.isFinite(value) ? value : fallback));
@@ -182,6 +186,9 @@ type HandlerEntry = {
 
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
 
+const cloneMeta = (meta: Record<string, unknown> | undefined): Record<string, unknown> | undefined =>
+  meta === undefined ? undefined : structuredClone(meta);
+
 const asInfo = (schedule: StoredSchedule): SchedulerInfo => ({
   id: schedule.id,
   cron: schedule.cron,
@@ -192,7 +199,7 @@ const asInfo = (schedule: StoredSchedule): SchedulerInfo => ({
   runNumber: schedule.runNumber,
   failureCount: schedule.failureCount,
   ...(schedule.lastError ? { lastError: schedule.lastError } : {}),
-  ...(schedule.meta ? { meta: schedule.meta } : {}),
+  ...(schedule.meta ? { meta: cloneMeta(schedule.meta) } : {}),
 });
 
 // ==========================
@@ -217,29 +224,36 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const store = resolveStore(config.store);
   const instanceId = crypto.randomUUID();
 
-  const schedulesKey = `${prefix}:${config.id}:schedules`;
+  const schedulesKey = JSON.stringify(["scheduler", prefix, config.id, "schedules"]);
   const schedules = sharedState(schedulesKey, store, () => new Map<string, StoredSchedule>());
 
   const leaderMutex = mutex({
-    id: `${config.id}:leader`,
-    prefix: `${prefix}:leader`,
+    id: encodeIdentity([prefix, config.id]),
+    prefix: `${BROWSER_SCHEDULER_KEY_PREFIX}:leader`,
     defaultTtl: leaseMs,
     retryCount: 0,
     store,
   });
-  const dispatchMutex = mutex({
-    id: `${config.id}:dispatch`,
-    prefix: `${prefix}:dispatch`,
-    defaultTtl: leaseMs,
-    retryCount: 0,
-    store,
-  });
+  const dispatchMutexes = new Map<string, Mutex>();
+  const dispatchMutexFor = (scheduleId: string): Mutex => {
+    let scheduleMutex = dispatchMutexes.get(scheduleId);
+    if (!scheduleMutex) {
+      scheduleMutex = mutex({
+        id: encodeIdentity([prefix, config.id, scheduleId]),
+        prefix: `${BROWSER_SCHEDULER_KEY_PREFIX}:dispatch`,
+        defaultTtl: leaseMs,
+        retryCount: 0,
+        store,
+      });
+      dispatchMutexes.set(scheduleId, scheduleMutex);
+    }
+    return scheduleMutex;
+  };
 
   const persistedStateKey = (scheduleId: string): string =>
-    `${prefix}:${config.id}:state:${scheduleId}`;
+    `${BROWSER_SCHEDULER_KEY_PREFIX}:state:${encodeIdentity([prefix, config.id, scheduleId])}`;
 
-  const readPersistedState = (scheduleId: string): PersistedState | null => {
-    const raw = store.get(persistedStateKey(scheduleId));
+  const parsePersistedState = (raw: unknown): PersistedState | null => {
     if (!raw || typeof raw !== "object") return null;
     const value = raw as Record<string, unknown>;
     const runNumber = Number(value.runNumber);
@@ -257,6 +271,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       ...(typeof value.cron === "string" ? { cron: value.cron } : {}),
       ...(typeof value.tz === "string" ? { tz: value.tz } : {}),
     };
+  };
+
+  const readPersistedState = (scheduleId: string): PersistedState | null => {
+    return parsePersistedState(store.get(persistedStateKey(scheduleId)));
   };
 
   const writePersistedState = (schedule: StoredSchedule): void => {
@@ -362,6 +380,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     handler: HandlerEntry,
     trigger: "cron" | "manual",
     dispatchLock: Lock,
+    scheduleMutex: Mutex,
   ): Promise<void> => {
     const schedule = { ...source };
     const advanceCron = trigger === "cron";
@@ -379,7 +398,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       heartbeatTail = heartbeatTail
         .then(async () => {
           if (dispatchLeaseLost || jobAc.signal.aborted) return;
-          if (await dispatchMutex.extend(dispatchLock, leaseMs)) return;
+          if (await scheduleMutex.extend(dispatchLock, leaseMs)) return;
           dispatchLeaseLost = true;
           jobAc.abort();
         })
@@ -498,13 +517,13 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         !current
         || current.runNumber !== expectedRunNumber
         || current.revision !== schedule.revision
-        || !(await dispatchMutex.extend(dispatchLock, leaseMs))
+        || !(await scheduleMutex.extend(dispatchLock, leaseMs))
       ) {
         metrics.staleWrites += 1;
         throw new Error(`scheduler dispatch state changed for ${schedule.id}`);
       }
-      schedules.set(schedule.id, schedule);
       writePersistedState(schedule);
+      schedules.set(schedule.id, schedule);
       if (error) metrics.failures += 1;
       else metrics.dispatches += 1;
       if (traceRescheduled) metrics.reschedules += 1;
@@ -534,14 +553,15 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   ): Promise<void> => {
     const generation = dispatchGeneration;
     await serializeDispatch(scheduleId, async () => {
-      let dispatchLock = await dispatchMutex.acquire(scheduleId, leaseMs);
+      const scheduleMutex = dispatchMutexFor(scheduleId);
+      let dispatchLock = await scheduleMutex.acquire("active", leaseMs);
       if (trigger === "cron" && !dispatchLock) return;
       while (!dispatchLock) {
         if (generation !== dispatchGeneration || (options?.shouldContinue && !options.shouldContinue())) {
           throw new Error(`scheduler dispatch stopped for ${scheduleId}`);
         }
         await sleep(Math.max(25, Math.min(100, Math.floor(heartbeatMs / 2))));
-        dispatchLock = await dispatchMutex.acquire(scheduleId, leaseMs);
+        dispatchLock = await scheduleMutex.acquire("active", leaseMs);
       }
 
       let preparationLeaseLost = false;
@@ -550,7 +570,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         preparationHeartbeatTail = preparationHeartbeatTail
           .then(async () => {
             if (preparationLeaseLost) return;
-            if (await dispatchMutex.extend(dispatchLock, leaseMs)) return;
+            if (await scheduleMutex.extend(dispatchLock, leaseMs)) return;
             preparationLeaseLost = true;
           })
           .catch(() => {
@@ -570,13 +590,13 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         ) {
           throw new Error(`scheduler dispatch stopped for ${scheduleId}`);
         }
-        if (preparationLeaseLost || !(await dispatchMutex.extend(dispatchLock, leaseMs))) {
+        if (preparationLeaseLost || !(await scheduleMutex.extend(dispatchLock, leaseMs))) {
           throw new Error(`scheduler dispatch lease lost for ${scheduleId}`);
         }
         await options?.onAcquired?.();
         clearInterval(preparationHeartbeat);
         await preparationHeartbeatTail;
-        if (preparationLeaseLost || !(await dispatchMutex.extend(dispatchLock, leaseMs))) {
+        if (preparationLeaseLost || !(await scheduleMutex.extend(dispatchLock, leaseMs))) {
           throw new Error(`scheduler dispatch lease lost for ${scheduleId}`);
         }
         if (
@@ -585,11 +605,11 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         ) {
           throw new Error(`scheduler dispatch stopped for ${scheduleId}`);
         }
-        await dispatchOne(schedule, handler, trigger, dispatchLock);
+        await dispatchOne(schedule, handler, trigger, dispatchLock, scheduleMutex);
       } finally {
         clearInterval(preparationHeartbeat);
         await preparationHeartbeatTail;
-        await dispatchMutex.release(dispatchLock);
+        await scheduleMutex.release(dispatchLock);
       }
     });
   };
@@ -676,7 +696,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       nextRunAt: firstRunAt,
       runNumber: 0,
       failureCount: 0,
-      meta: cfg.meta,
+      meta: cloneMeta(cfg.meta),
     };
 
     // Preserve runNumber always (from existing in-memory or persisted store)
@@ -692,7 +712,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       stored.failureCount = existing.failureCount;
     } else if (!existing && persisted && persisted.cron === cfg.cron && persisted.tz === tz) {
       // Resume from persisted state on tab reopen.
-      stored.nextRunAt = persisted.nextRunAt <= nowMs ? firstRunAt : persisted.nextRunAt;
+      stored.nextRunAt = persisted.nextRunAt;
       stored.failureCount = persisted.failureCount;
     }
 
@@ -726,7 +746,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       cron: cfg.cron,
       tz,
       nextRunAt: stored.nextRunAt,
-      ...(cfg.meta ? { meta: cfg.meta } : {}),
+      ...(stored.meta ? { meta: cloneMeta(stored.meta) } : {}),
     });
 
     return {
@@ -736,10 +756,11 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   };
 
   const deleteSchedule = async (cfg: { id: string }): Promise<void> => {
+    deletePersistedState(cfg.id);
     schedules.delete(cfg.id);
     handlers.delete(cfg.id);
+    dispatchMutexes.delete(cfg.id);
     unregisterBrowserSchedulerControl({ prefix, schedulerId: config.id, scheduleId: cfg.id, instanceId });
-    deletePersistedState(cfg.id);
   };
 
   const runNow = async (cfg: { id: string }, onAccepted?: () => void): Promise<void> => {

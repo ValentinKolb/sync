@@ -203,12 +203,83 @@ const assertJsonValue = (value: unknown, label: string, seen = new WeakSet<objec
   seen.delete(value);
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+
+const isPumpStatus = (value: unknown): value is PumpStatus =>
+  value === "queued" ||
+  value === "running" ||
+  value === "waiting" ||
+  value === "completed" ||
+  value === "failed" ||
+  value === "canceled";
+
+const isNonNegativeSafeInteger = (value: unknown): value is number =>
+  Number.isSafeInteger(value) && (value as number) >= 0;
+
+const isFiniteTimestamp = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0;
+
+const isJsonValue = (value: unknown): boolean => {
+  try {
+    assertJsonValue(value, "persisted pump state");
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const cloneState = <Input, Cursor, Item extends PumpItem>(
   value: unknown,
 ): StoredPumpState<Input, Cursor, Item> | null => {
-  if (!value || typeof value !== "object") return null;
   try {
-    return JSON.parse(JSON.stringify(value)) as StoredPumpState<Input, Cursor, Item>;
+    const cloned = JSON.parse(JSON.stringify(value)) as unknown;
+    if (
+      !isRecord(cloned) ||
+      cloned.version !== 1 ||
+      typeof cloned.key !== "string" ||
+      cloned.key.length === 0 ||
+      textEncoder.encode(cloned.key).byteLength > MAX_KEY_BYTES ||
+      !Object.prototype.hasOwnProperty.call(cloned, "cursor") ||
+      !isPumpStatus(cloned.state) ||
+      !isNonNegativeSafeInteger(cloned.dispatched) ||
+      !isNonNegativeSafeInteger(cloned.failureCount) ||
+      !isFiniteTimestamp(cloned.createdAt) ||
+      !isFiniteTimestamp(cloned.updatedAt) ||
+      (cloned.lastError !== undefined && typeof cloned.lastError !== "string") ||
+      (cloned.nextRunAt !== undefined && !isFiniteTimestamp(cloned.nextRunAt)) ||
+      (cloned.leaseToken !== undefined && (typeof cloned.leaseToken !== "string" || cloned.leaseToken.length === 0)) ||
+      (cloned.leaseUntil !== undefined && !isFiniteTimestamp(cloned.leaseUntil)) ||
+      (cloned.input !== undefined && !isJsonValue(cloned.input)) ||
+      !isJsonValue(cloned.cursor) ||
+      (cloned.meta !== undefined && (!isRecord(cloned.meta) || !isJsonValue(cloned.meta)))
+    ) {
+      return null;
+    }
+
+    const hasLeaseToken = cloned.leaseToken !== undefined;
+    const hasLeaseUntil = cloned.leaseUntil !== undefined;
+    if (hasLeaseToken !== hasLeaseUntil || (cloned.state === "running") !== hasLeaseToken) return null;
+    if ((cloned.state === "queued" || cloned.state === "waiting") && cloned.nextRunAt === undefined) return null;
+
+    if (cloned.activePage !== undefined) {
+      if (
+        !isRecord(cloned.activePage) ||
+        !Array.isArray(cloned.activePage.items) ||
+        !Object.prototype.hasOwnProperty.call(cloned.activePage, "nextCursor") ||
+        !isNonNegativeSafeInteger(cloned.activePage.nextIndex) ||
+        cloned.activePage.nextIndex > cloned.activePage.items.length ||
+        !isJsonValue(cloned.activePage.items) ||
+        !isJsonValue(cloned.activePage.nextCursor) ||
+        !cloned.activePage.items.every(
+          (item) => isRecord(item) && typeof item.key === "string" && item.key.length > 0,
+        )
+      ) {
+        return null;
+      }
+    }
+
+    return cloned as StoredPumpState<Input, Cursor, Item>;
   } catch {
     return null;
   }
@@ -236,7 +307,8 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   assertIdentifier(config.id, "config.id");
 
   const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const baseKey = `${prefix}:${config.id}`;
+  const baseKey =
+    `sync:pump:browser:v2:${encodeURIComponent(JSON.stringify([prefix, config.id]))}`;
   const runPrefix = `${baseKey}:run:`;
   const store = resolveStore(config.store);
   const batchSize = Math.max(1, Math.floor(finiteConfig(config.batchSize, DEFAULT_BATCH_SIZE, "batchSize")));
@@ -270,8 +342,15 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
 
   const stateKeyFor = (key: string): string => `${runPrefix}${encodeURIComponent(key)}`;
 
-  const readStateByKey = (stateKey: string): StoredPumpState<Input, Cursor, Item> | null =>
-    cloneState<Input, Cursor, Item>(store.get(stateKey));
+  const readStateByKey = (stateKey: string): StoredPumpState<Input, Cursor, Item> | null => {
+    const raw = store.get(stateKey);
+    const state = cloneState<Input, Cursor, Item>(raw);
+    if ((!state || stateKeyFor(state.key) !== stateKey) && raw !== undefined) {
+      store.del(stateKey);
+      return null;
+    }
+    return state;
+  };
 
   const readState = (key: string): StoredPumpState<Input, Cursor, Item> | null =>
     readStateByKey(stateKeyFor(key));

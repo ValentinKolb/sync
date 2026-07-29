@@ -32,6 +32,71 @@ describe("append", () => {
   });
 });
 
+test("persisted entries are validated, deduplicated, and sorted by cursor", () => {
+  const restored = new EventLog({
+    retentionMs: 0,
+    initialEntries: [
+      { id: "2", ts: 2, fields: { value: "two" } },
+      { id: "1", ts: 1, fields: { value: "one" } },
+      { id: "2", ts: 3, fields: { value: "duplicate" } },
+      { id: "not-a-cursor", ts: 4, fields: { value: "invalid" } },
+      { id: "3", ts: Number.NaN, fields: { value: "invalid" } },
+      { id: "4", ts: 4, fields: [] as unknown as Record<string, unknown> },
+    ],
+  });
+
+  expect(restored.snapshot().map((entry) => entry.id)).toEqual(["1", "2"]);
+  expect(restored.latest()).toBe("2");
+  expect(restored.range("0").map((entry) => entry.fields.value)).toEqual(["one", "two"]);
+  expect(restored.append({ value: "three" })).toBe("3");
+});
+
+test("restore keeps active subscribers attached and wakes them to drain restored entries", async () => {
+  const restored = new EventLog({ retentionMs: 0 });
+  const ac = new AbortController();
+  const next = restored.subscribe("0", ac.signal)[Symbol.asyncIterator]().next();
+  await Bun.sleep(0);
+
+  restored.restore([{ id: "4", ts: Date.now(), fields: { value: "restored" } }]);
+  expect(await next).toMatchObject({
+    done: false,
+    value: { id: "4", fields: { value: "restored" } },
+  });
+  ac.abort();
+});
+
+test("restore merges stale snapshots without deleting events or rewinding the cursor", () => {
+  const restored = new EventLog({
+    retentionMs: 0,
+    initialEntries: [{ id: "4", ts: 4, fields: { value: "persisted" } }],
+  });
+  expect(restored.append({ value: "current" })).toBe("5");
+
+  restored.restore([
+    { id: "3", ts: 3, fields: { value: "older" } },
+    { id: "4", ts: 4, fields: { value: "stale-duplicate" } },
+  ]);
+
+  expect(restored.snapshot().map((entry) => [entry.id, entry.fields.value])).toEqual([
+    ["3", "older"],
+    ["4", "persisted"],
+    ["5", "current"],
+  ]);
+  expect(restored.append({ value: "next" })).toBe("6");
+});
+
+test("a failed append rolls back the entry without reusing its cursor", () => {
+  const durable = new EventLog({ retentionMs: 0 });
+  expect(() => durable.append({ value: "failed" }, {
+    beforeEmit: () => {
+      throw new Error("write failed");
+    },
+  })).toThrow("write failed");
+
+  expect(durable.latest()).toBe("0");
+  expect(durable.append({ value: "next" })).toBe("2");
+});
+
 // ==========================
 // range
 // ==========================

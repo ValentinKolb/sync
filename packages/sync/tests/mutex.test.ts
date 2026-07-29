@@ -318,3 +318,15 @@ test("rejects invalid lock TTLs before changing Redis state", async () => {
   expect(await m.acquire("resource")).toBeNull();
   await m.release(lock!);
 });
+
+test("rejects invalid retry configuration before acquiring", () => {
+  const invalidCounts = [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1];
+  for (const retryCount of invalidCounts) {
+    expect(() => mutex({ id: "invalid-retry-count", retryCount })).toThrow(/retryCount/);
+  }
+
+  const invalidDelays = [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1];
+  for (const retryDelay of invalidDelays) {
+    expect(() => mutex({ id: "invalid-retry-delay", retryDelay })).toThrow(/retryDelay/);
+  }
+});

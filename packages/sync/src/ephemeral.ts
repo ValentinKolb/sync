@@ -516,6 +516,14 @@ const assertTtlMs = (ttlMs: number): void => {
   }
 };
 
+const positiveSafeIntegerLimit = (value: number | undefined, fallback: number, label: string): number => {
+  const resolved = value ?? fallback;
+  if (!Number.isSafeInteger(resolved) || resolved <= 0) {
+    throw new RangeError(`${label} must be a positive safe integer`);
+  }
+  return resolved;
+};
+
 export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
   type TData = T;
 
@@ -524,10 +532,26 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
 
   const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
   assertIdentifier(defaultTenant, "tenantId");
-  const maxEntries = config.limits?.maxEntries ?? DEFAULT_MAX_ENTRIES;
-  const maxPayloadBytes = config.limits?.maxPayloadBytes ?? DEFAULT_MAX_PAYLOAD_BYTES;
-  const eventRetentionMs = config.limits?.eventRetentionMs ?? DEFAULT_EVENT_RETENTION_MS;
-  const eventMaxLen = config.limits?.eventMaxLen ?? DEFAULT_EVENT_MAXLEN;
+  const maxEntries = positiveSafeIntegerLimit(
+    config.limits?.maxEntries,
+    DEFAULT_MAX_ENTRIES,
+    "limits.maxEntries",
+  );
+  const maxPayloadBytes = positiveSafeIntegerLimit(
+    config.limits?.maxPayloadBytes,
+    DEFAULT_MAX_PAYLOAD_BYTES,
+    "limits.maxPayloadBytes",
+  );
+  const eventRetentionMs = positiveSafeIntegerLimit(
+    config.limits?.eventRetentionMs,
+    DEFAULT_EVENT_RETENTION_MS,
+    "limits.eventRetentionMs",
+  );
+  const eventMaxLen = positiveSafeIntegerLimit(
+    config.limits?.eventMaxLen,
+    DEFAULT_EVENT_MAXLEN,
+    "limits.eventMaxLen",
+  );
 
   const resolveTenant = (tenantId?: string): string => {
     const resolved = tenantId ?? defaultTenant;
@@ -778,6 +802,9 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
 
     await runFullReconcile(keys);
 
+    // Capture the replay boundary first. A write between this read and HVALS may
+    // then appear in both snapshot and replay, but can never be absent from both.
+    const cursor = await latestCursor(keys.events);
     const rawEntries = await redis.hvals(keys.state);
     const entries: EphemeralEntry<TData>[] = [];
     const prefix = cfg.prefix;
@@ -798,7 +825,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
 
     return {
       entries,
-      cursor: await latestCursor(keys.events),
+      cursor,
     };
   };
 
@@ -831,6 +858,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     let activeOperations = 0;
     let operationsIdle = Promise.resolve();
     let resolveOperationsIdle: (() => void) | null = null;
+    let operationTail: Promise<void> | null = null;
 
     const assertOpen = (): void => {
       if (closed) throw new Error("ephemeral reader is closed");
@@ -844,9 +872,18 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
         });
       }
       activeOperations += 1;
+      const previous = operationTail;
+      let releaseTurn!: () => void;
+      const turn = new Promise<void>((resolve) => {
+        releaseTurn = resolve;
+      });
+      operationTail = turn;
       try {
+        if (previous) await previous;
         return await operation();
       } finally {
+        releaseTurn();
+        if (operationTail === turn) operationTail = null;
         activeOperations -= 1;
         if (activeOperations === 0) {
           resolveOperationsIdle?.();
@@ -856,8 +893,8 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     };
 
     /**
-     * Release this reader's blocking connections. Each stream owns one connection
-     * so concurrent streams cannot serialize or close each other's reads.
+     * Release this reader's blocking connections. Streams keep separate clients
+     * for cancellation, while their reads are serialized around the shared cursor.
      */
     const close = (): Promise<void> => {
       if (closePromise) return closePromise;
@@ -911,6 +948,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       cfg: EphemeralRecvConfig = {},
       blockingRead = blockingReadWithTemporaryClient,
     ): Promise<EphemeralEvent<TData> | null> => {
+      if (closed) return null;
       await anchorLiveCursor();
       if (closed) return null;
       await maybeRunReconcile(tenantId, keys);

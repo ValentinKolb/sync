@@ -48,7 +48,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile --registry=https://registry.npmjs.org
       - name: Typecheck + parity
-        run: bun run typecheck
+        run: |
+          bun run typecheck
+          bun test scripts/*.test.ts
 
   publish-sync:
     needs: [test-server, test-browser, parity]
@@ -130,6 +132,51 @@ jobs:
 
       - name: Finalize ESM imports
         run: node scripts/rewrite-esm-imports.mjs packages/sync/dist
+
+      - name: Verify packed consumer
+        run: |
+          PACKAGE_TGZ=$(npm pack --silent)
+          PACKAGE_PATH="$GITHUB_WORKSPACE/packages/sync/dist/$PACKAGE_TGZ"
+          CONSUMER_DIR=$(mktemp -d)
+          cd "$CONSUMER_DIR"
+          npm init -y >/dev/null
+          npm install "$PACKAGE_PATH" >/dev/null
+          cat > index.mjs <<'EOF'
+          import { job, pump, scheduler, topic } from "@k2b/sync";
+          import { createMemoryStore, topic as browserTopic } from "@k2b/sync/browser";
+          if (![job, pump, scheduler, topic, createMemoryStore, browserTopic].every((value) => typeof value === "function")) {
+            throw new Error("packed runtime exports are incomplete");
+          }
+          EOF
+          bun index.mjs
+          node --input-type=module --eval \
+            'import("@k2b/sync/browser").then((mod) => { if (typeof mod.topic !== "function") throw new Error("packed browser ESM export is incomplete"); })'
+          cat > index.ts <<'EOF'
+          import type { PumpConfig, SchedulerControlInfo, TopicReaderConfig } from "@k2b/sync";
+          import type { PumpConfig as BrowserPumpConfig, Store, TopicReaderConfig as BrowserTopicReaderConfig } from "@k2b/sync/browser";
+          declare const serverPump: PumpConfig<{ id: string }, string, { key: string }>;
+          declare const browserPump: BrowserPumpConfig<{ id: string }, string, { key: string }>;
+          declare const store: Store;
+          declare const info: SchedulerControlInfo;
+          const serverReader: TopicReaderConfig = {};
+          const browserReader: BrowserTopicReaderConfig = {};
+          void [serverPump, browserPump, store, info, serverReader, browserReader];
+          EOF
+          cat > tsconfig.json <<'EOF'
+          {
+            "compilerOptions": {
+              "module": "NodeNext",
+              "moduleResolution": "NodeNext",
+              "target": "ESNext",
+              "strict": true,
+              "noEmit": true
+            },
+            "include": ["index.ts"]
+          }
+          EOF
+          "$GITHUB_WORKSPACE/node_modules/.bin/tsc" --project tsconfig.json
+          rm "$PACKAGE_PATH"
+        working-directory: ./packages/sync/dist
 
       - name: Publish @k2b/sync
         run: npm publish --provenance --access public

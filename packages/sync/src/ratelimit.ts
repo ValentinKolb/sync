@@ -86,7 +86,12 @@ export const ratelimit = (config: RateLimitConfig): RateLimiter => {
   if (!Number.isFinite(config.limit) || config.limit <= 0) {
     throw new Error("limit must be > 0");
   }
-  if (config.windowSecs !== undefined && (!Number.isInteger(config.windowSecs) || config.windowSecs <= 0)) {
+  if (
+    config.windowSecs !== undefined
+    && (!Number.isSafeInteger(config.windowSecs)
+      || config.windowSecs <= 0
+      || config.windowSecs > Math.floor(Number.MAX_SAFE_INTEGER / 2_000))
+  ) {
     throw new Error("windowSecs must be a positive integer number of seconds");
   }
 

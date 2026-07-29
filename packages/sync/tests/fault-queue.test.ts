@@ -4,6 +4,8 @@ import { queue } from "../index";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 const EXPIRED_ORPHAN_OBSERVED_AT = (): number => Date.now() - 31_000;
+const queueBase = (id: string): string =>
+  `sync:queue:namespace:v2:${encodeURIComponent(JSON.stringify(["test:fq", "default", id]))}`;
 
 beforeEach(async () => {
   const keys = await redis.send("KEYS", ["test:fq:*"]);
@@ -217,7 +219,7 @@ test("recv skips message with corrupted payload and does not block queue", async
 
   // Corrupt the message payload in Redis directly. The guard around this used
   // to let the corruption silently no-op.
-  const messagesKey = `test:fq:default:${qId}:messages`;
+  const messagesKey = `${queueBase(qId)}:messages`;
   const msgIds = (await redis.send("HKEYS", [messagesKey])) as string[];
   expect(msgIds.length).toBe(1);
   const poisonId = String(msgIds[0]);
@@ -342,7 +344,7 @@ test("message that ages out while in delayed queue goes to DLQ", async () => {
   expect(result).toBeNull();
 
   // Check DLQ
-  const dlqKey = `test:fq:default:${qId}:dlq`;
+  const dlqKey = `${queueBase(qId)}:dlq`;
   const dlqRaw = await redis.hget(dlqKey, msg!.messageId);
   expect(dlqRaw).not.toBeNull();
   const entry = JSON.parse(dlqRaw!);
@@ -416,7 +418,7 @@ test("rapid lease expiry cycle — message survives multiple lease expirations",
 test("a message orphaned between dequeue and claim is recovered, not lost", async () => {
   const id = uid("orphan-recovery");
   const q = queue<{ v: number }>({ id, prefix: "test:fq" });
-  const base = `test:fq:default:${id}`;
+  const base = queueBase(id);
 
   const { messageId } = await q.send({ data: { v: 1 } });
 
@@ -464,7 +466,7 @@ test("a message orphaned between dequeue and claim is recovered, not lost", asyn
 test("a legacy claim that materializes within the orphan grace is not requeued", async () => {
   const id = uid("orphan-legacy-grace");
   const q = queue<{ v: number }>({ id, prefix: "test:fq" });
-  const base = `test:fq:default:${id}`;
+  const base = queueBase(id);
 
   const { messageId } = await q.send({ data: { v: 1 } });
   expect(await redis.send("LMOVE", [`${base}:ready`, `${base}:active`, "RIGHT", "LEFT"])).toBe(messageId);
@@ -500,7 +502,7 @@ test("a legacy claim that materializes within the orphan grace is not requeued",
 test("the reaper leaves genuinely in-flight deliveries alone", async () => {
   const id = uid("orphan-negative");
   const q = queue<{ v: number }>({ id, prefix: "test:fq" });
-  const base = `test:fq:default:${id}`;
+  const base = queueBase(id);
 
   await q.send({ data: { v: 1 } });
   const held = await q.recv({ wait: false, leaseMs: 60_000 });
@@ -520,7 +522,7 @@ test("the reaper leaves genuinely in-flight deliveries alone", async () => {
 test("maintenance backfills a legacy in-flight delivery before orphan recovery", async () => {
   const id = uid("orphan-rolling-upgrade");
   const q = queue<{ v: number }>({ id, prefix: "test:fq" });
-  const base = `test:fq:default:${id}`;
+  const base = queueBase(id);
 
   await q.send({ data: { v: 1 } });
   const held = await q.recv({ wait: false, leaseMs: 60_000 });
@@ -538,7 +540,7 @@ test("maintenance backfills a legacy in-flight delivery before orphan recovery",
 test("a legacy delivery inserted mid-scan survives the overlapping generation", async () => {
   const id = uid("orphan-mid-scan-claim");
   const q = queue<{ v: number }>({ id, prefix: "test:fq" });
-  const base = `test:fq:default:${id}`;
+  const base = queueBase(id);
   const deliveriesKey = `${base}:deliveries`;
   const future = Date.now() + 60_000;
 
@@ -613,7 +615,7 @@ test("a legacy delivery inserted mid-scan survives the overlapping generation", 
 test("an orphan is recovered without requeueing an unrelated live delivery", async () => {
   const id = uid("orphan-with-live-delivery");
   const q = queue<{ v: number }>({ id, prefix: "test:fq" });
-  const base = `test:fq:default:${id}`;
+  const base = queueBase(id);
 
   await q.send({ data: { v: 2 } });
   const held = await q.recv({ wait: false, leaseMs: 60_000 });

@@ -17,12 +17,12 @@ import type {
   RateLimiter as S_RateLimiter,
   RateLimitResult as S_RateLimitResult,
   RateLimitConfig as S_RateLimitConfig,
-} from "../packages/sync/src/ratelimit";
+} from "../packages/sync/index";
 import type {
   Mutex as S_Mutex,
   Lock as S_Lock,
   MutexConfig as S_MutexConfig,
-} from "../packages/sync/src/mutex";
+} from "../packages/sync/index";
 import type {
   Queue as S_Queue,
   QueueConfig as S_QueueConfig,
@@ -31,7 +31,7 @@ import type {
   QueueSendConfig as S_QueueSendConfig,
   QueueReceived as S_QueueReceived,
   QueueDeadLetter as S_QueueDeadLetter,
-} from "../packages/sync/src/queue";
+} from "../packages/sync/index";
 import type {
   Topic as S_Topic,
   RecoverableTopic as S_RecoverableTopic,
@@ -49,7 +49,7 @@ import type {
   TopicDelivery as S_TopicDelivery,
   TopicLiveConfig as S_TopicLiveConfig,
   TopicLiveEvent as S_TopicLiveEvent,
-} from "../packages/sync/src/topic";
+} from "../packages/sync/index";
 import type {
   EphemeralConfig as S_EphemeralConfig,
   EphemeralUpsertConfig as S_EphemeralUpsertConfig,
@@ -61,7 +61,7 @@ import type {
   EphemeralEvent as S_EphemeralEvent,
   EphemeralReader as S_EphemeralReader,
   EphemeralStore as S_EphemeralStore,
-} from "../packages/sync/src/ephemeral";
+} from "../packages/sync/index";
 import type {
   JobId as S_JobId,
   JobCtx as S_JobCtx,
@@ -71,7 +71,7 @@ import type {
   JobMetrics as S_JobMetrics,
   JobTraceEvent as S_JobTraceEvent,
   SubmitConfig as S_SubmitConfig,
-} from "../packages/sync/src/job";
+} from "../packages/sync/index";
 import type {
   PumpItem as S_PumpItem,
   PumpStatus as S_PumpStatus,
@@ -84,7 +84,7 @@ import type {
   PumpConfig as S_PumpConfig,
   PumpStartConfig as S_PumpStartConfig,
   PumpHandle as S_PumpHandle,
-} from "../packages/sync/src/pump";
+} from "../packages/sync/index";
 import type {
   Scheduler as S_Scheduler,
   SchedulerConfig as S_SchedulerConfig,
@@ -94,23 +94,23 @@ import type {
   ScheduleConfig as S_ScheduleConfig,
   ScheduleCtx as S_ScheduleCtx,
   ScheduleAfterCtx as S_ScheduleAfterCtx,
-} from "../packages/sync/src/scheduler";
+} from "../packages/sync/index";
 import type {
   SchedulerControl as S_SchedulerControl,
   SchedulerControlConfig as S_SchedulerControlConfig,
   SchedulerControlInfo as S_SchedulerControlInfo,
   SchedulerControlRunNowConfig as S_SchedulerControlRunNowConfig,
   SchedulerControlState as S_SchedulerControlState,
-} from "../packages/sync/src/scheduler-control";
+} from "../packages/sync/index";
 import type {
   TraceHandler as S_TraceHandler,
-} from "../packages/sync/src/trace";
+} from "../packages/sync/index";
 import type {
   BackoffOptions as S_BackoffOptions,
   RetryCtx as S_RetryCtx,
   RetryAfterCtx as S_RetryAfterCtx,
   RetryConfig as S_RetryConfig,
-} from "../packages/sync/src/retry";
+} from "../packages/sync/index";
 
 // ==========================
 // Browser imports
@@ -120,12 +120,12 @@ import type {
   RateLimiter as B_RateLimiter,
   RateLimitResult as B_RateLimitResult,
   RateLimitConfig as B_RateLimitConfig,
-} from "../packages/sync-browser/src/ratelimit";
+} from "../packages/sync-browser/index";
 import type {
   Mutex as B_Mutex,
   Lock as B_Lock,
   MutexConfig as B_MutexConfig,
-} from "../packages/sync-browser/src/mutex";
+} from "../packages/sync-browser/index";
 import type {
   Queue as B_Queue,
   QueueConfig as B_QueueConfig,
@@ -134,7 +134,7 @@ import type {
   QueueSendConfig as B_QueueSendConfig,
   QueueReceived as B_QueueReceived,
   QueueDeadLetter as B_QueueDeadLetter,
-} from "../packages/sync-browser/src/queue";
+} from "../packages/sync-browser/index";
 import type {
   Topic as B_Topic,
   RecoverableTopic as B_RecoverableTopic,
@@ -152,7 +152,7 @@ import type {
   TopicDelivery as B_TopicDelivery,
   TopicLiveConfig as B_TopicLiveConfig,
   TopicLiveEvent as B_TopicLiveEvent,
-} from "../packages/sync-browser/src/topic";
+} from "../packages/sync-browser/index";
 import type {
   EphemeralConfig as B_EphemeralConfig,
   EphemeralUpsertConfig as B_EphemeralUpsertConfig,
@@ -164,7 +164,7 @@ import type {
   EphemeralEvent as B_EphemeralEvent,
   EphemeralReader as B_EphemeralReader,
   EphemeralStore as B_EphemeralStore,
-} from "../packages/sync-browser/src/ephemeral";
+} from "../packages/sync-browser/index";
 import type {
   JobId as B_JobId,
   JobCtx as B_JobCtx,
@@ -174,7 +174,7 @@ import type {
   JobMetrics as B_JobMetrics,
   JobTraceEvent as B_JobTraceEvent,
   SubmitConfig as B_SubmitConfig,
-} from "../packages/sync-browser/src/job";
+} from "../packages/sync-browser/index";
 import type {
   PumpItem as B_PumpItem,
   PumpStatus as B_PumpStatus,
@@ -187,7 +187,7 @@ import type {
   PumpConfig as B_PumpConfig,
   PumpStartConfig as B_PumpStartConfig,
   PumpHandle as B_PumpHandle,
-} from "../packages/sync-browser/src/pump";
+} from "../packages/sync-browser/index";
 import type {
   Scheduler as B_Scheduler,
   SchedulerConfig as B_SchedulerConfig,
@@ -197,23 +197,23 @@ import type {
   ScheduleConfig as B_ScheduleConfig,
   ScheduleCtx as B_ScheduleCtx,
   ScheduleAfterCtx as B_ScheduleAfterCtx,
-} from "../packages/sync-browser/src/scheduler";
+} from "../packages/sync-browser/index";
 import type {
   SchedulerControl as B_SchedulerControl,
   SchedulerControlConfig as B_SchedulerControlConfig,
   SchedulerControlInfo as B_SchedulerControlInfo,
   SchedulerControlRunNowConfig as B_SchedulerControlRunNowConfig,
   SchedulerControlState as B_SchedulerControlState,
-} from "../packages/sync-browser/src/scheduler-control";
+} from "../packages/sync-browser/index";
 import type {
   TraceHandler as B_TraceHandler,
-} from "../packages/sync-browser/src/trace";
+} from "../packages/sync-browser/index";
 import type {
   BackoffOptions as B_BackoffOptions,
   RetryCtx as B_RetryCtx,
   RetryAfterCtx as B_RetryAfterCtx,
   RetryConfig as B_RetryConfig,
-} from "../packages/sync-browser/src/retry";
+} from "../packages/sync-browser/index";
 
 // ==========================
 // Structural equality helper

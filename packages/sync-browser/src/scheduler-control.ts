@@ -282,7 +282,7 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
     request = {
       target: key,
       accepted,
-      expiresAt: Number.POSITIVE_INFINITY,
+      expiresAt: now + retentionMs,
       retentionMs,
     };
     requests.set(idempotencyKey, request);
