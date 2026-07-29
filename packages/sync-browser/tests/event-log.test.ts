@@ -337,6 +337,36 @@ describe("subscribe", () => {
     // Should have skipped v:1 and received v:2 and v:3
     expect(received).toEqual([{ v: 2 }, { v: 3 }]);
   });
+
+  test("fans out live entries to multiple subscribers", async () => {
+    const first: Record<string, unknown>[] = [];
+    const second: Record<string, unknown>[] = [];
+
+    const consume = async (
+      received: Record<string, unknown>[],
+      signal: AbortSignal,
+    ): Promise<void> => {
+      for await (const entry of log.subscribe("0", signal)) {
+        received.push(entry.fields);
+        if (received.length === 2) return;
+      }
+    };
+
+    const firstAbort = new AbortController();
+    const secondAbort = new AbortController();
+    const firstDone = consume(first, firstAbort.signal);
+    const secondDone = consume(second, secondAbort.signal);
+
+    await Bun.sleep(0);
+    log.append({ v: 1 });
+    log.append({ v: 2 });
+    await Promise.all([firstDone, secondDone]);
+
+    firstAbort.abort();
+    secondAbort.abort();
+    expect(first).toEqual([{ v: 1 }, { v: 2 }]);
+    expect(second).toEqual(first);
+  });
 });
 
 // ==========================

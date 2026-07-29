@@ -241,6 +241,7 @@ const createLocalStorageMock = () => {
 };
 
 import { LocalStorageStore, StoreWriteError, createLocalStorageStore } from "../src/store";
+import { mutex } from "../src/mutex";
 
 // We need to polyfill localStorage for Bun
 const originalLocalStorage = globalThis.localStorage;
@@ -379,6 +380,35 @@ test("createLocalStorageStore factory works", () => {
     const store = createLocalStorageStore("factory-test");
     store.set("k", 42);
     expect(store.get("k")).toBe(42);
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("a module coordinates through separate LocalStorageStore handles", async () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const first = mutex({
+      id: "local-storage",
+      prefix: "test:mx",
+      retryCount: 0,
+      store: createLocalStorageStore("module-integration"),
+    });
+    const second = mutex({
+      id: "local-storage",
+      prefix: "test:mx",
+      retryCount: 0,
+      store: createLocalStorageStore("module-integration"),
+    });
+
+    const held = await first.acquire("resource");
+    expect(held).not.toBeNull();
+    expect(await second.acquire("resource")).toBeNull();
+
+    await first.release(held!);
+    const acquired = await second.acquire("resource");
+    expect(acquired).not.toBeNull();
+    await second.release(acquired!);
   } finally {
     globalThis.localStorage = originalLocalStorage;
   }
