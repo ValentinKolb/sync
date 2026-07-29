@@ -307,6 +307,7 @@ const blockingReadWithTemporaryClient = async (
 
   try {
     if (!client.connected) await client.connect();
+    if (signal?.aborted) return null;
     return await client.send("XREAD", args);
   } catch (error) {
     if (signal?.aborted) return null;
@@ -778,6 +779,35 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     let replayChecked = false;
     let anchored = false;
     let blockingClient: RedisClient | null = null;
+    const closeController = new AbortController();
+    let closed = false;
+    let closePromise: Promise<void> | null = null;
+    let activeOperations = 0;
+    let operationsIdle = Promise.resolve();
+    let resolveOperationsIdle: (() => void) | null = null;
+
+    const assertOpen = (): void => {
+      if (closed) throw new Error("ephemeral reader is closed");
+    };
+
+    const runOperation = async <R>(operation: () => Promise<R>): Promise<R> => {
+      assertOpen();
+      if (activeOperations === 0) {
+        operationsIdle = new Promise<void>((resolve) => {
+          resolveOperationsIdle = resolve;
+        });
+      }
+      activeOperations += 1;
+      try {
+        return await operation();
+      } finally {
+        activeOperations -= 1;
+        if (activeOperations === 0) {
+          resolveOperationsIdle?.();
+          resolveOperationsIdle = null;
+        }
+      }
+    };
 
     const resetBlockingClient = (): void => {
       if (!blockingClient) return;
@@ -795,11 +825,16 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     };
 
     const ensureBlockingClient = async (): Promise<RedisClient> => {
+      assertOpen();
       if (blockingClient?.connected) return blockingClient;
       resetBlockingClient();
       const client = new RedisClient();
       blockingClient = client;
       await client.connect();
+      if (closed || blockingClient !== client) {
+        safeClose(client);
+        throw new Error("ephemeral reader is closed");
+      }
       // Return the local handle: a concurrent reset may already have cleared the
       // slot while this connect was in flight.
       return client;
@@ -811,9 +846,14 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
      * process hit its fd or maxclients limit, and every other Redis user in the
      * process started failing far from the code that caused it.
      */
-    const close = async (): Promise<void> => {
+    const close = (): Promise<void> => {
+      if (closePromise) return closePromise;
+      closed = true;
+      closeController.abort();
       blockingUsers = 0;
       resetBlockingClient();
+      closePromise = operationsIdle;
+      return closePromise;
     };
 
     /**
@@ -856,10 +896,13 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       cursor = await latestCursor(keys.events);
     };
 
-    const recv = async (cfg: EphemeralRecvConfig = {}): Promise<EphemeralEvent<TData> | null> => {
+    const recvInternal = async (cfg: EphemeralRecvConfig = {}): Promise<EphemeralEvent<TData> | null> => {
       await anchorLiveCursor();
+      if (closed) return null;
       await maybeRunReconcile(tenantId, keys);
+      if (closed) return null;
       await checkReplayGap();
+      if (closed) return null;
 
       if (overflowPending) {
         const event = overflowPending;
@@ -880,7 +923,19 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
           : ["COUNT", "1", "STREAMS", keys.events, cursor];
 
         const result = cfg.signal
-          ? await blockingReadWithTemporaryClient(args, cfg.signal)
+          ? await (async (): Promise<unknown> => {
+              const readController = new AbortController();
+              const abortRead = (): void => readController.abort();
+              cfg.signal!.addEventListener("abort", abortRead, { once: true });
+              closeController.signal.addEventListener("abort", abortRead, { once: true });
+              if (cfg.signal!.aborted || closeController.signal.aborted) readController.abort();
+              try {
+                return await blockingReadWithTemporaryClient(args, readController.signal);
+              } finally {
+                cfg.signal!.removeEventListener("abort", abortRead);
+                closeController.signal.removeEventListener("abort", abortRead);
+              }
+            })()
           : wait
             ? await (async (): Promise<unknown> => {
                 const client = await ensureBlockingClient();
@@ -889,11 +944,13 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
                   return await client.send("XREAD", args);
                 } catch (error) {
                   resetBlockingClient();
+                  if (closed) return null;
                   throw asError(error);
                 }
               })()
             : await redis.send("XREAD", args);
 
+        if (closed) return null;
         const entry = parseFirstStreamEntry(result);
         if (!entry) return null;
 
@@ -905,22 +962,31 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       }
     };
 
+    const recv = async (cfg: EphemeralRecvConfig = {}): Promise<EphemeralEvent<TData> | null> =>
+      await runOperation(() => recvInternal(cfg));
+
     const stream = async function* (cfg: EphemeralRecvConfig = {}): AsyncIterable<EphemeralEvent<TData>> {
       const wait = cfg.wait ?? true;
       blockingUsers += 1;
       try {
-        while (!cfg.signal?.aborted) {
-          const event = wait
-            ? await retry({
-                run: () => recv(cfg),
-                after: ({ ctx }) => {
-                  if (ctx.error && isRetryableTransportError(ctx.error)) {
-                    ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
-                  }
-                },
-                signal: cfg.signal,
-              })
-            : await recv(cfg);
+        while (!closed && !cfg.signal?.aborted) {
+          let event: EphemeralEvent<TData> | null;
+          try {
+            event = wait
+              ? await retry({
+                  run: () => recv(cfg),
+                  after: ({ ctx }) => {
+                    if (ctx.error && isRetryableTransportError(ctx.error)) {
+                      ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
+                    }
+                  },
+                  signal: cfg.signal,
+                })
+              : await recv(cfg);
+          } catch (error) {
+            if (closed) break;
+            throw error;
+          }
           if (event) {
             yield event;
             continue;

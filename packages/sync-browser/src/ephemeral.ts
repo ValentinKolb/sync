@@ -455,6 +455,35 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     let cursor = readerCfg.after ?? null;
     let overflowPending: EphemeralEvent<TData> | null = null;
     let replayChecked = false;
+    const closeController = new AbortController();
+    let closed = false;
+    let closePromise: Promise<void> | null = null;
+    let activeOperations = 0;
+    let operationsIdle = Promise.resolve();
+    let resolveOperationsIdle: (() => void) | null = null;
+
+    const assertOpen = (): void => {
+      if (closed) throw new Error("ephemeral reader is closed");
+    };
+
+    const runOperation = async <R>(operation: () => Promise<R>): Promise<R> => {
+      assertOpen();
+      if (activeOperations === 0) {
+        operationsIdle = new Promise<void>((resolve) => {
+          resolveOperationsIdle = resolve;
+        });
+      }
+      activeOperations += 1;
+      try {
+        return await operation();
+      } finally {
+        activeOperations -= 1;
+        if (activeOperations === 0) {
+          resolveOperationsIdle?.();
+          resolveOperationsIdle = null;
+        }
+      }
+    };
 
     const anchor = (): string => {
       if (cursor === null) cursor = state.eventLog.latest();
@@ -552,7 +581,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       return null;
     };
 
-    const recv = async (cfg: EphemeralRecvConfig = {}): Promise<EphemeralEvent<TData> | null> => {
+    const recvInternal = async (cfg: EphemeralRecvConfig = {}): Promise<EphemeralEvent<TData> | null> => {
       anchor();
       sweep(state);
       checkReplayGap();
@@ -583,7 +612,10 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
         const ac = new AbortController();
         const timeout = setTimeout(() => ac.abort(), timeoutMs);
         const onUserAbort = (): void => ac.abort();
+        const onReaderClose = (): void => ac.abort();
         if (cfg.signal) cfg.signal.addEventListener("abort", onUserAbort, { once: true });
+        closeController.signal.addEventListener("abort", onReaderClose, { once: true });
+        if (cfg.signal?.aborted || closeController.signal.aborted) ac.abort();
 
         let got: EphemeralEvent<TData> | null = null;
         try {
@@ -600,16 +632,20 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
         } finally {
           clearTimeout(timeout);
           if (cfg.signal) cfg.signal.removeEventListener("abort", onUserAbort);
+          closeController.signal.removeEventListener("abort", onReaderClose);
         }
 
         return got;
       }
     };
 
+    const recv = async (cfg: EphemeralRecvConfig = {}): Promise<EphemeralEvent<TData> | null> =>
+      await runOperation(() => recvInternal(cfg));
+
     const stream = async function* (cfg: EphemeralRecvConfig = {}): AsyncIterable<EphemeralEvent<TData>> {
       const wait = cfg.wait ?? true;
 
-      while (!cfg.signal?.aborted) {
+      while (!closed && !cfg.signal?.aborted) {
         const event = await recv(cfg);
         if (event) {
           yield event;
@@ -619,9 +655,12 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       }
     };
 
-    const close = async (): Promise<void> => {
-      // No connection to release in memory; present so the same teardown code
-      // works on both runtimes.
+    const close = (): Promise<void> => {
+      if (closePromise) return closePromise;
+      closed = true;
+      closeController.abort();
+      closePromise = operationsIdle;
+      return closePromise;
     };
 
     return { recv, stream, close, [Symbol.asyncDispose]: close };

@@ -69,6 +69,10 @@ Only `id`, `pull`, and `dispatch` are required. Optional configuration:
 All options shown above are their defaults. Heartbeats are automatic; callback
 code only receives an `AbortSignal`.
 
+`limits.pageBytes` applies to the UTF-8 JSON size of `{ items, nextCursor }`.
+The internal dispatch checkpoint is persisted separately and does not count
+toward this source-page limit.
+
 ## Delivery and recovery
 
 The server stores `input`, the committed cursor, and the complete active page

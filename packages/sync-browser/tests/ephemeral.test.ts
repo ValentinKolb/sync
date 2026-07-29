@@ -398,6 +398,47 @@ test("stream stops promptly when aborted", async () => {
   }
 });
 
+test("reader close is terminal and aborts pending reads", async () => {
+  const store = makeStore();
+  const recvReader = store.reader();
+  const pendingRecv = recvReader.recv({ wait: true, timeoutMs: 5_000 });
+
+  await Bun.sleep(10);
+  await recvReader.close();
+  await recvReader.close();
+
+  expect(await pendingRecv).toBeNull();
+  await expect(recvReader.recv({ wait: false })).rejects.toThrow("ephemeral reader is closed");
+
+  const closedStream = recvReader.stream({ wait: true, timeoutMs: 5_000 })[Symbol.asyncIterator]();
+  expect(await closedStream.next()).toEqual({ value: undefined, done: true });
+
+  const streamReader = store.reader();
+  const iterator = streamReader.stream({ wait: true, timeoutMs: 5_000 })[Symbol.asyncIterator]();
+  const pendingNext = iterator.next();
+
+  await Bun.sleep(10);
+  await streamReader.close();
+
+  expect(await pendingNext).toEqual({ value: undefined, done: true });
+});
+
+test("reader close during signal registration aborts the pending read", async () => {
+  const store = makeStore();
+  const reader = store.reader();
+  const signal = {
+    aborted: false,
+    addEventListener: () => {
+      void reader.close();
+    },
+    removeEventListener: () => {},
+  } as unknown as AbortSignal;
+
+  const startedAt = Date.now();
+  expect(await reader.recv({ wait: true, timeoutMs: 5_000, signal })).toBeNull();
+  expect(Date.now() - startedAt).toBeLessThan(500);
+});
+
 // ==========================
 // Overflow and validation
 // ==========================

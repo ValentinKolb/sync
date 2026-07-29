@@ -320,6 +320,27 @@ test("terminally fails a page that exceeds pageBytes without dispatching it", as
   expect((await worker.get({ key: "oversized" }))?.lastError).toContain("page exceeds limit");
 });
 
+test("accepts a page exactly at the server pageBytes boundary", async () => {
+  const items: Item[] = [{ key: "boundary", value: 1 }];
+  const nextCursor = null;
+  const pageBytes = new TextEncoder().encode(JSON.stringify({ items, nextCursor })).byteLength;
+  let dispatches = 0;
+  const worker = track(pump<Input, Cursor, Item>({
+    id: uid("page-bytes-boundary"),
+    limits: { pageBytes },
+    retry: { maxAttempts: 1 },
+    pull: () => ({ items, nextCursor }),
+    dispatch: () => {
+      dispatches += 1;
+    },
+  }));
+
+  await worker.start({ key: "boundary", input: { source: "messages" } });
+  await waitFor(async () => (await worker.get({ key: "boundary" }))?.state === "completed");
+
+  expect(dispatches).toBe(1);
+});
+
 test("rejects every unsupported JSON input shape before persisting a run", async () => {
   const circular: Record<string, unknown> = {};
   circular.self = circular;

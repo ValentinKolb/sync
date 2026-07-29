@@ -349,7 +349,10 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
           nextCursor: result.nextCursor,
           nextIndex: 0,
         };
-        const pageRaw = JSON.stringify(activePage);
+        const pageRaw = JSON.stringify({
+          items: activePage.items,
+          nextCursor: activePage.nextCursor,
+        });
         if (textEncoder.encode(pageRaw).byteLength > pageBytes) {
           throw new Error(`pump page exceeds limit (${pageBytes} bytes)`);
         }

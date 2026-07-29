@@ -29,6 +29,12 @@ type EphemeralStore<T> = {
   reader(cfg?: { after?: string; tenantId?: string; prefix?: string }): EphemeralReader<T>;
 };
 
+type EphemeralReader<T> = {
+  recv(cfg?: EphemeralRecvConfig): Promise<EphemeralEvent<T> | null>;
+  stream(cfg?: EphemeralRecvConfig): AsyncIterable<EphemeralEvent<T>>;
+  close(): Promise<void>;
+};
+
 type EphemeralEntry<T> = {
   key: string;
   value: T;
@@ -103,6 +109,7 @@ for await (const event of apps.reader({ prefix: "apps/" }).stream()) {
 
 - **`tenantId` vs `prefix`**: `tenantId` is **hard isolation** (separate Redis stream, separate TTL zone, separate `maxEntries` quota). `prefix` is **soft filter** within a tenant. Use `tenantId` for multi-tenant apps where streams must be separate; use `prefix` for organizing keys inside one namespace.
 - **`reader` prefix filter**: server Redis Streams can't do server-side filtering, so `reader({ prefix })` discards non-matching events in the client. Still useful but doesn't save bandwidth server-side.
+- **Reader lifecycle**: `close()` is idempotent, aborts pending reads, and permanently closes that reader. A pending `recv()` resolves `null`, a pending `stream()` ends, and later `recv()` calls reject.
 - **`overflow` events** fire when the reader's cursor fell behind the retention window. Handle by re-snapshotting.
 - **`maxEntries` per tenant**: once reached, `upsert` throws `EphemeralCapacityError`. Scale via multiple tenants or raise the limit.
 - **Touch returns `{ ok: false }`** if the key already expired between check and touch.

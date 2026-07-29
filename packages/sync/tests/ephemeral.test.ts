@@ -349,6 +349,53 @@ test("stream stops promptly when aborted", async () => {
   }
 });
 
+test("reader close is terminal and aborts pending reads", async () => {
+  const store = ephemeral<{ value: number }>({
+    id: testId("reader-close"),
+    ttlMs: 2_000,
+  });
+  const recvReader = trackReader(store.reader());
+  const pendingRecv = recvReader.recv({ wait: true, timeoutMs: 5_000 });
+
+  await Bun.sleep(20);
+  await recvReader.close();
+  await recvReader.close();
+
+  expect(await pendingRecv).toBeNull();
+  await expect(recvReader.recv({ wait: false })).rejects.toThrow("ephemeral reader is closed");
+
+  const closedStream = recvReader.stream({ wait: true, timeoutMs: 5_000 })[Symbol.asyncIterator]();
+  expect(await closedStream.next()).toEqual({ value: undefined, done: true });
+
+  const streamReader = trackReader(store.reader());
+  const iterator = streamReader.stream({ wait: true, timeoutMs: 5_000 })[Symbol.asyncIterator]();
+  const pendingNext = iterator.next();
+
+  await Bun.sleep(20);
+  await streamReader.close();
+
+  expect(await pendingNext).toEqual({ value: undefined, done: true });
+});
+
+test("reader close during signal registration aborts the pending read", async () => {
+  const store = ephemeral<{ value: number }>({
+    id: testId("reader-close-registration"),
+    ttlMs: 2_000,
+  });
+  const reader = trackReader(store.reader());
+  const signal = {
+    aborted: false,
+    addEventListener: () => {
+      void reader.close();
+    },
+    removeEventListener: () => {},
+  } as unknown as AbortSignal;
+
+  const startedAt = Date.now();
+  expect(await reader.recv({ wait: true, timeoutMs: 5_000, signal })).toBeNull();
+  expect(Date.now() - startedAt).toBeLessThan(500);
+});
+
 // ==========================
 // Prefix filter — snapshot
 // ==========================
