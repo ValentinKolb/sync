@@ -14,6 +14,12 @@ const normalizeResource = (resource: string): string => {
   return simpleHash(resource);
 };
 
+const assertTtl = (ttl: number, label = "ttl"): void => {
+  if (!Number.isSafeInteger(ttl) || ttl <= 0) {
+    throw new RangeError(`${label} must be a positive safe integer`);
+  }
+};
+
 // ==========================
 // Types
 // ==========================
@@ -67,9 +73,10 @@ export const mutex = (config: MutexConfig): Mutex => {
   const retryDelay = config.retryDelay ?? DEFAULT_RETRY_DELAY;
   const defaultTtl = config.defaultTtl ?? DEFAULT_TTL;
   const store = resolveStore(config.store);
+  assertTtl(defaultTtl, "defaultTtl");
 
   const acquire = async (resource: string, ttl: number = defaultTtl): Promise<Lock | null> => {
-    if (!Number.isFinite(ttl) || ttl <= 0) return null;
+    assertTtl(ttl);
     const safeResource = normalizeResource(resource);
     const key = `${prefix}:${config.id}:${safeResource}`;
     const value = randomHex(16);
@@ -104,6 +111,7 @@ export const mutex = (config: MutexConfig): Mutex => {
   };
 
   const extend = async (lock: Lock, ttl: number = defaultTtl): Promise<boolean> => {
+    assertTtl(ttl);
     // Compare-and-extend (safe in single-threaded JS)
     const current = store.get(lock.resource);
     if (current === lock.value) {

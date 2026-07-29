@@ -151,6 +151,7 @@ type StoredValue = {
 export class LocalStorageStore implements Store {
   private prefix: string;
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private initialized = false;
 
   constructor(prefix = "sync") {
     this.prefix = prefix;
@@ -158,6 +159,38 @@ export class LocalStorageStore implements Store {
 
   private storageKey(key: string): string {
     return `${this.prefix}:${key}`;
+  }
+
+  private ensureInitialized(): void {
+    if (this.initialized) return;
+    this.initialized = true;
+
+    const now = Date.now();
+    const fullPrefix = this.storageKey("");
+    const storageKeys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key?.startsWith(fullPrefix)) storageKeys.push(key);
+    }
+
+    for (const storageKey of storageKeys) {
+      const raw = localStorage.getItem(storageKey);
+      if (raw === null) continue;
+
+      try {
+        const entry = JSON.parse(raw) as StoredValue;
+        if (entry.expiresAt === null || !Number.isFinite(entry.expiresAt)) continue;
+
+        const logicalKey = storageKey.slice(fullPrefix.length);
+        if (now >= entry.expiresAt) {
+          localStorage.removeItem(storageKey);
+        } else {
+          this.scheduleExpiry(logicalKey, entry.expiresAt);
+        }
+      } catch {
+        // Corrupt values remain unreadable through get(); they have no TTL to restore.
+      }
+    }
   }
 
   private scheduleExpiry(key: string, expiresAt: number): void {
@@ -191,6 +224,7 @@ export class LocalStorageStore implements Store {
   }
 
   get(key: string): unknown | undefined {
+    this.ensureInitialized();
     const raw = localStorage.getItem(this.storageKey(key));
     if (raw === null) return undefined;
 
@@ -210,6 +244,7 @@ export class LocalStorageStore implements Store {
   }
 
   set(key: string, value: unknown, ttlMs?: number): void {
+    this.ensureInitialized();
     // Clear any existing timer
     const existingTimer = this.timers.get(key);
     if (existingTimer) {
@@ -233,6 +268,7 @@ export class LocalStorageStore implements Store {
   }
 
   del(key: string): void {
+    this.ensureInitialized();
     localStorage.removeItem(this.storageKey(key));
     const timer = this.timers.get(key);
     if (timer) {
@@ -242,6 +278,7 @@ export class LocalStorageStore implements Store {
   }
 
   keys(prefix?: string): string[] {
+    this.ensureInitialized();
     const now = Date.now();
     const result: string[] = [];
     const fullPrefix = prefix !== undefined ? this.storageKey(prefix) : this.storageKey("");
@@ -282,6 +319,7 @@ export class LocalStorageStore implements Store {
 
   /** Clear all keys with this store's prefix from localStorage. */
   clear(): void {
+    this.ensureInitialized();
     for (const timer of this.timers.values()) {
       clearTimeout(timer);
     }

@@ -395,6 +395,24 @@ test("windowSecs must be a positive integer", () => {
   ).not.toThrow();
 });
 
+test("malformed persisted counters fail closed", async () => {
+  const store = createMemoryStore();
+  const id = "malformed-counter";
+  const identifier = "user";
+  const windowSecs = 86_400;
+  const currentWindow = Math.floor(Date.now() / (windowSecs * 1000));
+  const key = (window: number): string => `sync:ratelimit:${id}:${identifier}:${window}`;
+  const limiter = ratelimit({ id, limit: 5, windowSecs, store });
+
+  store.set(key(currentWindow - 1), "corrupt");
+  expect(await limiter.check(identifier)).toMatchObject({ limited: true, remaining: 0 });
+
+  store.del(key(currentWindow - 1));
+  store.set(key(currentWindow), Number.NaN);
+  await expect(limiter.checkOrThrow(identifier)).rejects.toBeInstanceOf(RateLimitError);
+  expect(Number.isNaN(store.get(key(currentWindow)) as number)).toBe(true);
+});
+
 test("large windows retain their counter beyond the native timer clamp", async () => {
   const store = createMemoryStore();
   const limiter = ratelimit({

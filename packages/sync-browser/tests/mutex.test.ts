@@ -379,3 +379,24 @@ test("withLockOrThrow success path acquires, executes, and releases", async () =
   expect(lock).not.toBeNull();
   await m.release(lock!);
 });
+
+test("rejects invalid lock TTLs without changing store state", async () => {
+  const invalidTtls = [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1];
+  for (const ttl of invalidTtls) {
+    expect(() => mutex({ id: "invalid-default", defaultTtl: ttl })).toThrow(/positive safe integer/);
+  }
+
+  const store = createMemoryStore();
+  const m = mutex({ id: "invalid-operation", retryCount: 0, store });
+  for (const ttl of invalidTtls) {
+    await expect(m.acquire("resource", ttl)).rejects.toThrow(/positive safe integer/);
+  }
+
+  const lock = await m.acquire("resource");
+  expect(lock).not.toBeNull();
+  for (const ttl of invalidTtls) {
+    await expect(m.extend(lock!, ttl)).rejects.toThrow(/positive safe integer/);
+  }
+  expect(await m.acquire("resource")).toBeNull();
+  await m.release(lock!);
+});

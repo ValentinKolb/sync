@@ -327,6 +327,27 @@ test("LocalStorageStore: TTL expiry works", async () => {
   }
 });
 
+test("LocalStorageStore restores its own TTLs after reload", async () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const now = Date.now();
+    localStorage.setItem("reload:expired", JSON.stringify({ value: "old", expiresAt: now - 1 }));
+    localStorage.setItem("reload:live", JSON.stringify({ value: "fresh", expiresAt: now + 50 }));
+    localStorage.setItem("reload-other:foreign", JSON.stringify({ value: "keep", expiresAt: now - 1 }));
+
+    const store = new LocalStorageStore("reload");
+    expect(store.get("live")).toBe("fresh");
+    expect(localStorage.getItem("reload:expired")).toBeNull();
+    expect(localStorage.getItem("reload-other:foreign")).not.toBeNull();
+
+    await Bun.sleep(100);
+    expect(localStorage.getItem("reload:live")).toBeNull();
+    expect(localStorage.getItem("reload-other:foreign")).not.toBeNull();
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
 test("LocalStorageStore: TTL beyond the native timer limit does not expire early", async () => {
   globalThis.localStorage = createLocalStorageMock();
   try {

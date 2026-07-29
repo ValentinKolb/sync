@@ -29,6 +29,13 @@ test("expBackoff uses defaults", () => {
   expect(v10).toBe(2_000);
 });
 
+test("expBackoff rejects non-finite inputs", () => {
+  expect(() => expBackoff(Number.NaN)).toThrow(/attempt must be finite/);
+  expect(() => expBackoff(1, { baseMs: Number.POSITIVE_INFINITY })).toThrow(/baseMs must be finite/);
+  expect(() => expBackoff(1, { maxMs: Number.NaN })).toThrow(/maxMs must be finite/);
+  expect(() => expBackoff(1, { jitter: Number.NEGATIVE_INFINITY })).toThrow(/jitter must be finite/);
+});
+
 // ==========================
 // retry happy path
 // ==========================
@@ -122,6 +129,22 @@ test("retry gives up when after stops rescheduling", async () => {
     }),
   ).rejects.toThrow("fail");
   expect(runs).toBe(3);
+});
+
+test("retry rejects non-finite reschedule delays without looping", async () => {
+  for (const delayMs of [Number.NaN, Number.POSITIVE_INFINITY]) {
+    let runs = 0;
+    await expect(
+      retry({
+        run: () => {
+          runs += 1;
+          return "ok";
+        },
+        after: ({ ctx }) => ctx.reschedule({ delayMs }),
+      }),
+    ).rejects.toThrow(/reschedule delayMs must be finite/);
+    expect(runs).toBe(1);
+  }
 });
 
 // ==========================

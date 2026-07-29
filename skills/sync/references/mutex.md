@@ -10,9 +10,9 @@ import { mutex, LockError } from "@k2b/sync";
 const m = mutex({
   id: "checkout",
   defaultTtl: 5_000,
-  // retryCount?: number,   // default: 3
-  // retryDelay?: number,   // default: 100 (ms between retries)
-  // prefix?: string,       // default: "sync:mx"
+  // retryCount?: number,   // default: 10
+  // retryDelay?: number,   // default: 200 (ms between retries)
+  // prefix?: string,       // default: "sync:mutex"
   // store?: Store,         // browser only (additive)
 });
 ```
@@ -25,8 +25,8 @@ type Lock = { /* opaque handle — pass to extend/release */ };
 type Mutex = {
   id: string;
   acquire(resource: string, ttlMs?: number): Promise<Lock | null>;
-  extend(lock: Lock, ttlMs: number): Promise<boolean>;
-  release(lock: Lock): Promise<boolean>;
+  extend(lock: Lock, ttlMs?: number): Promise<boolean>;
+  release(lock: Lock): Promise<void>;
 
   withLock<T>(resource: string, fn: (lock: Lock) => Promise<T> | T, ttlMs?: number): Promise<T | null>;
   withLockOrThrow<T>(resource: string, fn: (lock: Lock) => Promise<T> | T, ttlMs?: number): Promise<T>;

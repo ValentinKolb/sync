@@ -163,6 +163,14 @@ const finiteConfig = (value: number | undefined, fallback: number, label: string
   return resolved;
 };
 
+const positiveSafeIntegerConfig = (value: number | undefined, fallback: number, label: string): number => {
+  const resolved = finiteConfig(value, fallback, label);
+  if (!Number.isSafeInteger(resolved) || resolved <= 0) {
+    throw new RangeError(`${label} must be a positive safe integer`);
+  }
+  return resolved;
+};
+
 const assertKey = (key: string): void => {
   if (!key) throw new Error("key must be non-empty");
   if (textEncoder.encode(key).byteLength > MAX_KEY_BYTES) {
@@ -241,13 +249,10 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
       Math.max(10, Math.floor(leaseMs / 2)),
     ),
   );
-  const terminalRetentionMs = Math.max(
-    1,
-    finiteConfig(
-      config.defaults?.terminalRetentionMs,
-      DEFAULT_TERMINAL_RETENTION_MS,
-      "defaults.terminalRetentionMs",
-    ),
+  const terminalRetentionMs = positiveSafeIntegerConfig(
+    config.defaults?.terminalRetentionMs,
+    DEFAULT_TERMINAL_RETENTION_MS,
+    "defaults.terminalRetentionMs",
   );
   const pageBytes = Math.max(1, finiteConfig(config.limits?.pageBytes, DEFAULT_PAGE_BYTES, "limits.pageBytes"));
   const maxAttempts = Math.max(

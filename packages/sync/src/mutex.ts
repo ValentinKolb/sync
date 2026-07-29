@@ -29,6 +29,12 @@ const normalizeResource = (resource: string): string => {
   return `hash:${hash}`;
 };
 
+const assertTtl = (ttl: number, label = "ttl"): void => {
+  if (!Number.isSafeInteger(ttl) || ttl <= 0) {
+    throw new RangeError(`${label} must be a positive safe integer`);
+  }
+};
+
 // ==========================
 // Types
 // ==========================
@@ -80,8 +86,10 @@ export const mutex = (config: MutexConfig): Mutex => {
   const retryCount = config.retryCount ?? DEFAULT_RETRY_COUNT;
   const retryDelay = config.retryDelay ?? DEFAULT_RETRY_DELAY;
   const defaultTtl = config.defaultTtl ?? DEFAULT_TTL;
+  assertTtl(defaultTtl, "defaultTtl");
 
   const acquire = async (resource: string, ttl: number = defaultTtl): Promise<Lock | null> => {
+    assertTtl(ttl);
     const safeResource = normalizeResource(resource);
     const key = `${prefix}:${config.id}:${safeResource}`;
     const value = randomBytes(16).toString("hex");
@@ -111,6 +119,7 @@ export const mutex = (config: MutexConfig): Mutex => {
   };
 
   const extend = async (lock: Lock, ttl: number = defaultTtl): Promise<boolean> => {
+    assertTtl(ttl);
     const result = await redis.send("EVAL", [EXTEND_SCRIPT, "1", lock.resource, lock.value, ttl.toString()]);
     // `Number(result) > 0` is what the rest of the package uses; a strict === 1
     // silently returns false if the driver ever hands back a string.

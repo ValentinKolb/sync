@@ -14,6 +14,7 @@ export {
   type QueueRecvConfig,
   type QueueSendConfig,
   type QueueReceived,
+  type QueueDeadLetter,
 } from "./src/queue";
 export {
   topic,

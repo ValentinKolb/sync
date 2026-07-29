@@ -33,6 +33,11 @@ export type RetryConfig<T = unknown> = {
 
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
 
+const finiteNumber = (value: number, label: string): number => {
+  if (!Number.isFinite(value)) throw new RangeError(`${label} must be finite`);
+  return value;
+};
+
 const createAbortError = (): Error => {
   const error = new Error("retry aborted");
   error.name = "AbortError";
@@ -87,14 +92,15 @@ export const isRetryableTransportError = (error: unknown): boolean => {
  * Defaults: baseMs=100, maxMs=2_000, jitter=0.2 (±20%).
  */
 export const expBackoff = (attempt: number, cfg?: BackoffOptions): number => {
-  const baseMs = Math.max(0, cfg?.baseMs ?? 100);
-  const maxMs = Math.max(baseMs, cfg?.maxMs ?? 2_000);
-  const jitter = Math.min(1, Math.max(0, cfg?.jitter ?? 0.2));
-  const raw = baseMs * 2 ** Math.max(0, attempt - 1);
+  const safeAttempt = finiteNumber(attempt, "attempt");
+  const baseMs = Math.max(0, finiteNumber(cfg?.baseMs ?? 100, "baseMs"));
+  const maxMs = Math.max(baseMs, finiteNumber(cfg?.maxMs ?? 2_000, "maxMs"));
+  const jitter = Math.min(1, Math.max(0, finiteNumber(cfg?.jitter ?? 0.2, "jitter")));
+  const raw = baseMs === 0 ? 0 : baseMs * 2 ** Math.max(0, safeAttempt - 1);
   const capped = Math.min(maxMs, raw);
   const spread = capped * jitter;
   const jittered = capped + (Math.random() * 2 - 1) * spread;
-  return Math.max(0, Math.floor(jittered));
+  return Math.max(0, Math.floor(finiteNumber(jittered, "backoff result")));
 };
 
 const sleepWithSignal = async (delayMs: number, signal?: AbortSignal): Promise<void> => {
@@ -165,7 +171,10 @@ export const retry = async <T>(config: RetryConfig<T>): Promise<T> => {
     if (config.signal?.aborted) throw createAbortError();
 
     if (rescheduleRequested) {
-      const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
+      const delayMs = Math.max(
+        0,
+        finiteNumber((rescheduleRequested as { delayMs?: number }).delayMs ?? 0, "reschedule delayMs"),
+      );
       await sleepWithSignal(delayMs, config.signal);
       continue;
     }

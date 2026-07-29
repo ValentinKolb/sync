@@ -30,6 +30,7 @@ import type {
   QueueRecvConfig as S_QueueRecvConfig,
   QueueSendConfig as S_QueueSendConfig,
   QueueReceived as S_QueueReceived,
+  QueueDeadLetter as S_QueueDeadLetter,
 } from "../packages/sync/src/queue";
 import type {
   Topic as S_Topic,
@@ -132,6 +133,7 @@ import type {
   QueueRecvConfig as B_QueueRecvConfig,
   QueueSendConfig as B_QueueSendConfig,
   QueueReceived as B_QueueReceived,
+  QueueDeadLetter as B_QueueDeadLetter,
 } from "../packages/sync-browser/src/queue";
 import type {
   Topic as B_Topic,
@@ -266,6 +268,7 @@ assertEqual<Equal<S_QueueReader<{ foo: string }>, B_QueueReader<{ foo: string }>
 assertEqual<Equal<S_QueueRecvConfig, B_QueueRecvConfig>>(true);
 assertEqual<Equal<S_QueueSendConfig<{ foo: string }>, B_QueueSendConfig<{ foo: string }>>>(true);
 assertEqual<Equal<S_QueueReceived<{ foo: string }>, B_QueueReceived<{ foo: string }>>>(true);
+assertEqual<Equal<S_QueueDeadLetter<{ foo: string }>, B_QueueDeadLetter<{ foo: string }>>>(true);
 
 // ==========================
 // Topic
@@ -352,6 +355,7 @@ assertEqual<Equal<S_PumpHandle<PumpInput, PumpCursor>, B_PumpHandle<PumpInput, P
 
 assertEqual<Equal<S_Scheduler, B_Scheduler>>(true);
 // SchedulerConfig differs: browser has optional `store?` additive
+assertEqual<Equal<Omit<B_SchedulerConfig, "store">, S_SchedulerConfig>>(true);
 assertEqual<Equal<S_SchedulerInfo, B_SchedulerInfo>>(true);
 assertEqual<Equal<S_SchedulerMetrics, B_SchedulerMetrics>>(true);
 assertEqual<Equal<S_SchedulerTraceEvent<number>, B_SchedulerTraceEvent<number>>>(true);
@@ -390,9 +394,13 @@ import * as ServerApi from "../packages/sync/index";
 import * as BrowserApi from "../packages/sync-browser/index";
 import type { TopicReaderConfig as S_PublicTopicReaderConfig } from "../packages/sync/index";
 import type { TopicReaderConfig as B_PublicTopicReaderConfig } from "../packages/sync-browser/index";
+import type { QueueDeadLetter as S_PublicQueueDeadLetter } from "../packages/sync/index";
+import type { QueueDeadLetter as B_PublicQueueDeadLetter } from "../packages/sync-browser/index";
 
 assertEqual<Equal<S_PublicTopicReaderConfig, S_TopicReaderConfig>>(true);
 assertEqual<Equal<B_PublicTopicReaderConfig, B_TopicReaderConfig>>(true);
+assertEqual<Equal<S_PublicQueueDeadLetter<{ foo: string }>, S_QueueDeadLetter<{ foo: string }>>>(true);
+assertEqual<Equal<B_PublicQueueDeadLetter<{ foo: string }>, B_QueueDeadLetter<{ foo: string }>>>(true);
 
 /** Exports that exist only in the browser build. */
 type BrowserOnlyKeys =

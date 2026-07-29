@@ -54,6 +54,12 @@ test("rejects non-finite numeric configuration", () => {
   expect(() => pump({ ...base, retry: { maxAttempts: Number.POSITIVE_INFINITY } })).toThrow(
     /retry\.maxAttempts must be finite/,
   );
+  expect(() => pump({ ...base, defaults: { terminalRetentionMs: 1.5 } })).toThrow(
+    /defaults\.terminalRetentionMs must be a positive safe integer/,
+  );
+  expect(() =>
+    pump({ ...base, defaults: { terminalRetentionMs: Number.MAX_SAFE_INTEGER + 1 } }),
+  ).toThrow(/defaults\.terminalRetentionMs must be a positive safe integer/);
 });
 
 test("processes multiple pages with the default configuration", async () => {

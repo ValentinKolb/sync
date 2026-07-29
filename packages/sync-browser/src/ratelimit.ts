@@ -11,6 +11,11 @@ const normalizeIdentifier = (identifier: string): string => {
   return simpleHash(identifier);
 };
 
+const readCounter = (value: unknown): number | null => {
+  if (value === undefined) return 0;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+};
+
 // ==========================
 // Types
 // ==========================
@@ -80,16 +85,21 @@ export const ratelimit = (config: RateLimitConfig): RateLimiter => {
     const currentKey = `${prefix}:${config.id}:${safeIdentifier}:${currentWindow}`;
     const previousKey = `${prefix}:${config.id}:${safeIdentifier}:${previousWindow}`;
 
-    const previousCount = (store.get(previousKey) as number) ?? 0;
+    const previousCount = readCounter(store.get(previousKey));
+    const currentStoredCount = readCounter(store.get(currentKey));
+    const resetIn = windowMs - elapsedInWindow;
 
-    const currentCount = ((store.get(currentKey) as number) ?? 0) + 1;
+    if (previousCount === null || currentStoredCount === null) {
+      return { limited: true, remaining: 0, resetIn };
+    }
+
+    const currentCount = currentStoredCount + 1;
     store.set(currentKey, currentCount, windowSecs * 2000);
 
     const weightedCount = previousCount * (1 - elapsedRatio) + currentCount;
 
     const limited = weightedCount > limit;
     const remaining = Math.max(0, Math.floor(limit - weightedCount));
-    const resetIn = windowMs - elapsedInWindow;
 
     return { limited, remaining, resetIn };
   };

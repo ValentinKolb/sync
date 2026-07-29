@@ -296,3 +296,25 @@ test("withLock provides mutual exclusion for concurrent operations", async () =>
 
   expect(counter).toBe(iterations);
 });
+
+test("rejects invalid lock TTLs before changing Redis state", async () => {
+  const invalidTtls = [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1];
+  for (const ttl of invalidTtls) {
+    expect(() => mutex({ id: "invalid-default", prefix: "test:mx", defaultTtl: ttl })).toThrow(
+      /positive safe integer/,
+    );
+  }
+
+  const m = mutex({ id: "invalid-operation", prefix: "test:mx", retryCount: 0 });
+  for (const ttl of invalidTtls) {
+    await expect(m.acquire("resource", ttl)).rejects.toThrow(/positive safe integer/);
+  }
+
+  const lock = await m.acquire("resource");
+  expect(lock).not.toBeNull();
+  for (const ttl of invalidTtls) {
+    await expect(m.extend(lock!, ttl)).rejects.toThrow(/positive safe integer/);
+  }
+  expect(await m.acquire("resource")).toBeNull();
+  await m.release(lock!);
+});
