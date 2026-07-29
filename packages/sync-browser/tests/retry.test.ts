@@ -156,6 +156,34 @@ test("isRetryableTransportError catches common messages", () => {
   expect(isRetryableTransportError(new Error("random"))).toBe(false);
 });
 
+test("isRetryableTransportError does not match broad application vocabulary", () => {
+  expect(isRetryableTransportError(new Error("invalid connection string in config"))).toBe(false);
+  expect(isRetryableTransportError(new Error("error loading user profile"))).toBe(false);
+  expect(isRetryableTransportError(new Error("socket must be a string"))).toBe(false);
+  expect(isRetryableTransportError(new Error("network policy denied"))).toBe(false);
+});
+
+test("zero-delay reschedule yields to timers", async () => {
+  let timerFired = false;
+  let attempts = 0;
+  setTimeout(() => {
+    timerFired = true;
+  }, 0);
+
+  await retry({
+    run: () => {
+      attempts += 1;
+      return attempts;
+    },
+    after: ({ ctx }) => {
+      if (!timerFired && ctx.attempt < 100) ctx.reschedule({ delayMs: 0 });
+    },
+  });
+
+  expect(timerFired).toBe(true);
+  expect(attempts).toBeLessThan(100);
+});
+
 // ==========================
 // after error swallow
 // ==========================

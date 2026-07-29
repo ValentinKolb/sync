@@ -382,6 +382,14 @@ test("uses internal memory store when no store is provided", async () => {
   expect(r3.limited).toBe(true);
 });
 
+test("windowSecs must be a positive integer", () => {
+  expect(() => ratelimit({ id: "zero-window", limit: 1, windowSecs: 0 })).toThrow(/positive integer/);
+  expect(() => ratelimit({ id: "fractional-window", limit: 1, windowSecs: 0.5 })).toThrow(
+    /positive integer/,
+  );
+  expect(() => ratelimit({ id: "safe-window", limit: 1, windowSecs: 1 })).not.toThrow();
+});
+
 test("long identifiers do not collide at a practical scale", async () => {
   const { simpleHash } = await import("../src/internal/id");
   const seen = new Set<string>();

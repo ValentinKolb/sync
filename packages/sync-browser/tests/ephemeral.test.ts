@@ -402,7 +402,42 @@ test("ttlMs <= 0 on factory throws", () => {
       id: `bad-ttl-${Date.now()}`,
       ttlMs: 0,
     })
-  ).toThrow("ttlMs must be > 0");
+  ).toThrow(/positive integer/);
+});
+
+test("fractional ttlMs is rejected at the factory and call sites", async () => {
+  expect(() =>
+    ephemeral({
+      id: `fractional-ttl-${Date.now()}`,
+      ttlMs: 0.5,
+    }),
+  ).toThrow(/positive integer/);
+
+  const store = ephemeral<{ v: number }>({
+    id: `fractional-override-${Date.now()}`,
+    ttlMs: 5_000,
+  });
+  await expect(store.upsert({ key: "k", value: { v: 1 }, ttlMs: 100.5 })).rejects.toThrow(
+    /positive integer/,
+  );
+  await expect(store.touch({ key: "k", ttlMs: 100.5 })).rejects.toThrow(/positive integer/);
+});
+
+test("stored and returned values are isolated JSON snapshots", async () => {
+  const store = ephemeral<{ nested: { value: number } }>({
+    id: `json-snapshot-${Date.now()}`,
+    ttlMs: 5_000,
+  });
+  const input = { nested: { value: 1 } };
+  const returned = await store.upsert({ key: "k", value: input });
+
+  input.nested.value = 2;
+  returned.value.nested.value = 3;
+
+  const first = await store.snapshot();
+  expect(first.entries[0]?.value.nested.value).toBe(1);
+  first.entries[0]!.value.nested.value = 4;
+  expect((await store.snapshot()).entries[0]?.value.nested.value).toBe(1);
 });
 
 // ==========================
@@ -605,4 +640,25 @@ test("a reader anchors at its first recv, not at construction", async () => {
   const event = await reader.recv({ wait: false });
   expect(event?.type).toBe("upsert");
   if (event?.type === "upsert") expect(event.entry.key).toBe("after-first-recv");
+});
+
+test("a reader that falls behind after a healthy read gets overflow", async () => {
+  const store = ephemeral<{ n: number }>({
+    id: `overflow-live-${Date.now()}`,
+    ttlMs: 60_000,
+    limits: { eventMaxLen: 2 },
+  });
+  const reader = store.reader();
+
+  expect(await reader.recv({ wait: false })).toBeNull();
+  await store.upsert({ key: "a", value: { n: 1 } });
+  expect((await reader.recv({ wait: false }))?.type).toBe("upsert");
+
+  await store.upsert({ key: "b", value: { n: 2 } });
+  await store.upsert({ key: "c", value: { n: 3 } });
+  await store.upsert({ key: "d", value: { n: 4 } });
+
+  const event = await reader.recv({ wait: false });
+  expect(event?.type).toBe("overflow");
+  if (event?.type === "overflow") expect(event.after).toBe("1");
 });

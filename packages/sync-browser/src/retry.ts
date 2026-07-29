@@ -62,14 +62,21 @@ export const isRetryableTransportError = (error: unknown): boolean => {
   const message = asError(error).message.toLowerCase();
   return (
     message.includes("econnreset") ||
+    message.includes("econnrefused") ||
+    message.includes("epipe") ||
     message.includes("etimedout") ||
-    message.includes("connection") ||
-    message.includes("socket") ||
+    message.includes("connection closed") ||
+    message.includes("connection refused") ||
+    message.includes("connection reset") ||
+    message.includes("connection lost") ||
+    message.includes("socket closed") ||
+    message.includes("socket hang up") ||
     message.includes("broken pipe") ||
-    message.includes("network") ||
-    message.includes("loading") ||
-    message.includes("tryagain") ||
-    message.includes("clusterdown")
+    message.includes("network error") ||
+    message.startsWith("loading") ||
+    message.startsWith("tryagain") ||
+    message.startsWith("clusterdown") ||
+    message.startsWith("masterdown")
   );
 };
 
@@ -89,7 +96,10 @@ export const expBackoff = (attempt: number, cfg?: BackoffOptions): number => {
 };
 
 const sleepWithSignal = async (delayMs: number, signal?: AbortSignal): Promise<void> => {
-  if (delayMs <= 0) return;
+  if (delayMs <= 0) {
+    await sleep(0);
+    return;
+  }
   if (!signal) {
     await sleep(delayMs);
     return;

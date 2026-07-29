@@ -112,7 +112,7 @@ export type EphemeralStore<T> = {
 
 type StoredEntry<T> = {
   key: string;
-  data: T;
+  dataJson: string;
   version: string;
   createdAt: number;
   updatedAt: number;
@@ -141,6 +141,20 @@ const assertIdentifier = (value: string, label: string): void => {
   if (value.length > 256) throw new Error(`${label} too long (max 256 chars)`);
 };
 
+const assertTtlMs = (ttlMs: number): void => {
+  if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
+    throw new Error("ttlMs must be a positive integer number of milliseconds");
+  }
+};
+
+const serializeValue = <T>(value: T): string => {
+  const raw = JSON.stringify(value);
+  if (raw === undefined) throw new Error("invalid payload encoding");
+  return raw;
+};
+
+const parseValue = <T>(raw: string): T => JSON.parse(raw) as T;
+
 // ==========================
 // Ephemeral Factory
 // ==========================
@@ -148,9 +162,7 @@ const assertIdentifier = (value: string, label: string): void => {
 export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
   type TData = T;
 
-  if (!Number.isFinite(config.ttlMs) || config.ttlMs <= 0) {
-    throw new Error("ttlMs must be > 0");
-  }
+  assertTtlMs(config.ttlMs);
   assertIdentifier(config.id, "config.id");
 
   const defaultTenant = config.tenantId ?? "default";
@@ -254,16 +266,14 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     sweep(state);
 
     const ttlMs = cfg.ttlMs ?? config.ttlMs;
-    if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
-      throw new Error("ttlMs must be > 0");
-    }
+    assertTtlMs(ttlMs);
 
     // Capacity check
     if (!state.entries.has(cfg.key) && state.entries.size >= maxEntries) {
       throw new EphemeralCapacityError(`maxEntries (${maxEntries}) reached`);
     }
 
-    const payloadRaw = JSON.stringify(cfg.value);
+    const payloadRaw = serializeValue(cfg.value);
     const payloadBytes = textEncoder.encode(payloadRaw).byteLength;
     if (payloadBytes > maxPayloadBytes) {
       throw new EphemeralPayloadTooLargeError(`payload exceeds limit (${maxPayloadBytes} bytes)`);
@@ -279,7 +289,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
 
     const stored: StoredEntry<TData> = {
       key: cfg.key,
-      data: cfg.value,
+      dataJson: payloadRaw,
       version,
       createdAt,
       updatedAt: now,
@@ -301,7 +311,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
 
     return {
       key: cfg.key,
-      value: cfg.value,
+      value: parseValue<TData>(payloadRaw),
       version,
       createdAt,
       updatedAt: now,
@@ -320,13 +330,11 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     const state = getTenantState(tenantId);
     sweep(state);
 
+    const ttlMs = cfg.ttlMs ?? config.ttlMs;
+    assertTtlMs(ttlMs);
+
     const existing = state.entries.get(cfg.key);
     if (!existing) return { ok: false };
-
-    const ttlMs = cfg.ttlMs ?? config.ttlMs;
-    if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
-      throw new Error("ttlMs must be > 0");
-    }
 
     const now = Date.now();
     const version = String(++state.seq);
@@ -401,7 +409,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       if (prefix && !stored.key.startsWith(prefix)) continue;
       entries.push({
         key: stored.key,
-        value: stored.data,
+        value: parseValue<TData>(stored.dataJson),
         version: stored.version,
         createdAt: stored.createdAt,
         updatedAt: stored.updatedAt,
@@ -446,10 +454,9 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     };
 
     const checkReplayGap = (): void => {
-      if (replayChecked) return;
+      const after = replayChecked ? cursor : (readerCfg.after ?? cursor);
       replayChecked = true;
 
-      const after = readerCfg.after;
       if (!after) return;
 
       const earliest = state.eventLog.earliest();
