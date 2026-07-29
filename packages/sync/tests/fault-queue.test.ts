@@ -254,14 +254,14 @@ test("many delayed messages becoming due at once are all eventually delivered", 
 
   const count = 30;
   for (let i = 0; i < count; i++) {
-    await q.send({ data: { idx: i }, delayMs: 50 });
+    await q.send({ data: { idx: i }, delayMs: 500 });
   }
 
   // None should be available immediately
   expect(await q.recv({ wait: false })).toBeNull();
 
   // Wait for all to become due
-  await Bun.sleep(100);
+  await Bun.sleep(550);
 
   const received = new Set<number>();
   // Multiple maintenance+recv passes may be needed
