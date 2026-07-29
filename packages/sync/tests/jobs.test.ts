@@ -1,6 +1,6 @@
 import { beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { job, queue, type JobTraceEvent } from "../index";
+import { job, queue, type JobMetrics, type JobTraceEvent } from "../index";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
 
@@ -431,24 +431,28 @@ test("metric() reflects dispatches / failures / reschedules", async () => {
 });
 
 test("ctx.metric is a live reference inside after", async () => {
-  let seenDispatches = -1;
+  const references: JobMetrics[] = [];
 
   const worker = job({
     id: uid("ctx-metric"),
     process: async () => {},
     after: async ({ ctx }) => {
-      seenDispatches = ctx.metric.dispatches;
+      references.push(ctx.metric);
     },
   });
 
-  await worker.submit({ key: "a" });
-  await waitFor(() => seenDispatches !== -1);
-  // At the moment after ran, the success increment hasn't fired yet,
-  // so ctx.metric.dispatches is 0. This is a documented semantic:
-  // ctx.metric is a reference, updated AFTER the after callback completes.
-  expect(seenDispatches).toBe(0);
+  try {
+    await worker.submit({ key: "a" });
+    await waitFor(() => references.length === 1 && worker.metric().dispatches === 1);
+    expect(references[0]?.dispatches).toBe(1);
 
-  worker.stop();
+    await worker.submit({ key: "b" });
+    await waitFor(() => references.length === 2 && worker.metric().dispatches === 2);
+    expect(references[0]?.dispatches).toBe(2);
+    expect(references[1]).toBe(references[0]);
+  } finally {
+    worker.stop();
+  }
 });
 
 // ==========================

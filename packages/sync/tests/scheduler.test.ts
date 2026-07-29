@@ -6,6 +6,7 @@ import {
   scheduler,
   schedulerControl,
   type Scheduler,
+  type SchedulerMetrics,
   type SchedulerTraceEvent,
 } from "../index";
 
@@ -434,7 +435,7 @@ test("metric() reflects dispatches, failures, reschedules", async () => {
 
 test("ctx.metric is live reference inside after", async () => {
   const s = makeScheduler(uid("ctx-metric"));
-  let seen: number = -1;
+  const references: SchedulerMetrics[] = [];
 
   await s.create({
     id: "m",
@@ -442,15 +443,18 @@ test("ctx.metric is live reference inside after", async () => {
     tz: "UTC",
     process: async () => {},
     after: async ({ ctx }) => {
-      seen = ctx.metric.dispatches;
+      references.push(ctx.metric);
     },
   });
 
   await s.runNow({ id: "m" });
-  expect(seen).toBe(0);
+  expect(references).toHaveLength(1);
+  expect(references[0]?.dispatches).toBe(1);
 
-  await Bun.sleep(50);
-  expect(s.metric().dispatches).toBe(1);
+  await s.runNow({ id: "m" });
+  expect(references).toHaveLength(2);
+  expect(references[0]?.dispatches).toBe(2);
+  expect(references[1]).toBe(references[0]);
 });
 
 // ==========================
