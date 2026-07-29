@@ -79,16 +79,7 @@ const CLAIM_KEY_SCRIPT = `
 // Mark the claim as backed by a real queue message, and refresh its TTL.
 const MARK_ENQUEUED_SCRIPT = `
   local existing = redis.call("GET", KEYS[1])
-  if not existing then
-    redis.call(
-      "SET",
-      KEYS[1],
-      cjson.encode({ jobId = ARGV[1], enqueued = true, claimedAt = tonumber(ARGV[3]) }),
-      "PX",
-      tostring(ARGV[2])
-    )
-    return 1
-  end
+  if not existing then return 0 end
   local ok, record = pcall(cjson.decode, existing)
   if not ok or type(record) ~= "table" or record.jobId ~= ARGV[1] then return 0 end
   if record.enqueued then
@@ -296,7 +287,7 @@ export const job = <Input = void, Result = unknown>(
     jobId: JobId,
     keyTtlMs: number,
   ): Promise<"new" | "existing" | "lost"> => {
-    const result = await evalKeyScript(MARK_ENQUEUED_SCRIPT, key, [jobId, String(keyTtlMs), String(Date.now())]);
+    const result = await evalKeyScript(MARK_ENQUEUED_SCRIPT, key, [jobId, String(keyTtlMs)]);
     if (Number(result) === 1) return "new";
     if (Number(result) === 2) return "existing";
     return "lost";

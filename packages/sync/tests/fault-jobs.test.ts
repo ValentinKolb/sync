@@ -538,15 +538,10 @@ test("a retry near claim expiry cannot accept stale work under a newer claim", a
   const id = uid("expiring-send-retry");
   const targetSeqKey = `sync:job:queue:default:${id}:work:seq`;
   const seen: number[] = [];
-  let releaseCurrent = (): void => {};
-  const currentGate = new Promise<void>((resolve) => {
-    releaseCurrent = resolve;
-  });
   const j = job<{ value: number }>({
     id,
     process: async ({ ctx }) => {
       seen.push(ctx.input.value);
-      if (ctx.input.value === 2) await currentGate;
     },
   });
   const originalSend = redis.send.bind(redis);
@@ -591,11 +586,12 @@ test("a retry near claim expiry cannot accept stale work under a newer claim", a
       keyTtlMs: 1_000,
     });
     expect(currentJobId).toBe("2");
+    await waitFor(() => j.metric().dispatches === 1);
+    expect(await redis.get(`sync:job:${id}:idempotency:orders/expiring`)).toBeNull();
     releaseSend();
     await expect(staleRetry).rejects.toThrow("lost idempotency claim");
   } finally {
     releaseSend();
-    releaseCurrent();
     redis.send = originalSend as typeof redis.send;
   }
 
