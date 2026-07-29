@@ -496,6 +496,44 @@ test("an ambiguous successful queue send starts the worker and keeps one job", a
   j.stop();
 });
 
+test("an immediate retry re-enqueues a transport failure that happened before the queue write", async () => {
+  const id = uid("prewrite-send-retry");
+  const targetSeqKey = `sync:job:queue:default:${id}:work:seq`;
+  const seen: number[] = [];
+  const j = job<{ value: number }>({
+    id,
+    process: async ({ ctx }) => {
+      seen.push(ctx.input.value);
+    },
+  });
+  const originalSend = redis.send.bind(redis);
+  let failedBeforeWrite = false;
+
+  redis.send = (async (command, args) => {
+    if (!failedBeforeWrite && command === "EVAL" && args.includes(targetSeqKey)) {
+      failedBeforeWrite = true;
+      const error = new Error("connection refused before write") as Error & { code: string };
+      error.code = "ECONNREFUSED";
+      throw error;
+    }
+    return await originalSend(command, args);
+  }) as typeof redis.send;
+
+  try {
+    await expect(j.submit({ key: "orders/retry", input: { value: 1 } })).rejects.toThrow(
+      "connection refused before write",
+    );
+  } finally {
+    redis.send = originalSend as typeof redis.send;
+  }
+
+  expect(failedBeforeWrite).toBe(true);
+  expect(await j.submit({ key: "orders/retry", input: { value: 2 } })).toBe("1");
+  await waitFor(() => seen.length === 1);
+  expect(seen).toEqual([1]);
+  j.stop();
+});
+
 test("a stale terminal release cannot delete a claim a later submit took over", async () => {
   const id = uid("stale-release");
   let started = false;

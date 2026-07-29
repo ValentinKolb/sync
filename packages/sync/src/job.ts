@@ -32,6 +32,7 @@ const CLAIM_KEY_SCRIPT = `
   local ttlMs = tonumber(ARGV[1])
   local now = tonumber(ARGV[2])
   local graceMs = tonumber(ARGV[3])
+  local incomingPayloadJson = ARGV[4]
 
   local existing = redis.call("GET", idemKey)
   if existing then
@@ -40,20 +41,37 @@ const CLAIM_KEY_SCRIPT = `
       return { existing, 0 }
     end
     if record.enqueued then
-      return { record.jobId, 0 }
+      return { record.jobId, 0, "" }
+    end
+    if type(record.payloadJson) == "string" and record.payloadJson ~= "" then
+      -- Every contender retries the exact payload captured by the first claim.
+      -- The work queue's jobId idempotency key makes concurrent sends harmless.
+      return { record.jobId, 1, record.payloadJson }
     end
     if (now - (tonumber(record.claimedAt) or 0)) <= graceMs then
       -- A concurrent submit is still mid-flight; do not enqueue a second time.
-      return { record.jobId, 0 }
+      return { record.jobId, 0, "" }
     end
     record.claimedAt = now
+    record.payloadJson = incomingPayloadJson
     redis.call("SET", idemKey, cjson.encode(record), "PX", tostring(ttlMs))
-    return { record.jobId, 1 }
+    return { record.jobId, 1, incomingPayloadJson }
   end
 
   local nextId = tostring(redis.call("INCR", seqKey))
-  redis.call("SET", idemKey, cjson.encode({ jobId = nextId, enqueued = false, claimedAt = now }), "PX", tostring(ttlMs))
-  return { nextId, 1 }
+  redis.call(
+    "SET",
+    idemKey,
+    cjson.encode({
+      jobId = nextId,
+      enqueued = false,
+      claimedAt = now,
+      payloadJson = incomingPayloadJson
+    }),
+    "PX",
+    tostring(ttlMs)
+  )
+  return { nextId, 1, incomingPayloadJson }
 `;
 
 // Mark the claim as backed by a real queue message, and refresh its TTL.
@@ -62,7 +80,12 @@ const MARK_ENQUEUED_SCRIPT = `
   if not existing then return 0 end
   local ok, record = pcall(cjson.decode, existing)
   if not ok or type(record) ~= "table" or record.jobId ~= ARGV[1] then return 0 end
+  if record.enqueued then
+    redis.call("PEXPIRE", KEYS[1], tostring(ARGV[2]))
+    return 2
+  end
   record.enqueued = true
+  record.payloadJson = nil
   redis.call("SET", KEYS[1], cjson.encode(record), "PX", tostring(ARGV[2]))
   return 1
 `;
@@ -175,6 +198,12 @@ type WorkPayload = {
   meta?: Record<string, unknown>;
 };
 
+type PendingEnqueue = {
+  payload: Omit<WorkPayload, "jobId">;
+  availableAt: number;
+  idempotencyTtlMs: number;
+};
+
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
 const requireSafeInteger = (name: string, value: number, min: number, max = Number.MAX_SAFE_INTEGER): number => {
   if (!Number.isSafeInteger(value) || value < min || value > max) {
@@ -259,11 +288,16 @@ export const job = <Input = void, Result = unknown>(
     }
   };
 
-  const markEnqueued = async (key: string, jobId: JobId, keyTtlMs: number): Promise<void> => {
-    await evalKeyScript(MARK_ENQUEUED_SCRIPT, key, [jobId, String(keyTtlMs)]);
+  const markEnqueued = async (key: string, jobId: JobId, keyTtlMs: number): Promise<boolean> => {
+    const result = await evalKeyScript(MARK_ENQUEUED_SCRIPT, key, [jobId, String(keyTtlMs)]);
+    return Number(result) === 1;
   };
 
-  const claimKey = async (key: string, keyTtlMs: number): Promise<{ jobId: JobId; isNew: boolean }> => {
+  const claimKey = async (
+    key: string,
+    keyTtlMs: number,
+    pendingPayloadJson: string,
+  ): Promise<{ jobId: JobId; shouldEnqueue: boolean; pendingPayloadJson?: string }> => {
     const result = await redis.send("EVAL", [
       CLAIM_KEY_SCRIPT,
       "2",
@@ -272,9 +306,14 @@ export const job = <Input = void, Result = unknown>(
       String(keyTtlMs),
       String(Date.now()),
       String(ENQUEUE_GRACE_MS),
+      pendingPayloadJson,
     ]);
-    const arr = result as [string, number];
-    return { jobId: String(arr[0]), isNew: Number(arr[1]) === 1 };
+    const arr = result as [string, number, string?];
+    return {
+      jobId: String(arr[0]),
+      shouldEnqueue: Number(arr[1]) === 1,
+      ...(typeof arr[2] === "string" && arr[2] ? { pendingPayloadJson: arr[2] } : {}),
+    };
   };
 
   // The worker belongs to this handle, not to the id. Keying it by
@@ -509,28 +548,36 @@ export const job = <Input = void, Result = unknown>(
         : resolveDelayMs("submit.delayMs", cfg.delayMs);
     const initialKeyTtlMs = Math.min(MAX_KEY_TTL_MS, delayMs + keyTtlMs);
 
-    const { jobId, isNew } = await claimKey(cfg.key, initialKeyTtlMs);
-    if (!isNew) {
+    const pendingPayloadJson = JSON.stringify({
+      payload: {
+        key: cfg.key,
+        input: (cfg as { input?: Input }).input,
+        keyTtlMs,
+        leaseMs,
+        meta: cfg.meta,
+      },
+      availableAt: now + delayMs,
+      idempotencyTtlMs: initialKeyTtlMs,
+    });
+    const claim = await claimKey(cfg.key, initialKeyTtlMs, pendingPayloadJson);
+    if (!claim.shouldEnqueue) {
       startWorker();
-      return jobId;
+      return claim.jobId;
     }
 
+    const pending = JSON.parse(claim.pendingPayloadJson ?? pendingPayloadJson) as PendingEnqueue;
     const payload: WorkPayload = {
-      jobId,
-      key: cfg.key,
-      input: (cfg as { input?: Input }).input,
-      keyTtlMs,
-      leaseMs,
-      meta: cfg.meta,
+      ...pending.payload,
+      jobId: claim.jobId,
     };
 
     try {
       await workQueue.send({
         data: payload,
-        delayMs,
-        idempotencyKey: jobId,
-        idempotencyTtlMs: initialKeyTtlMs,
-        meta: cfg.meta,
+        delayMs: Math.max(0, pending.availableAt - Date.now()),
+        idempotencyKey: claim.jobId,
+        idempotencyTtlMs: pending.idempotencyTtlMs,
+        meta: payload.meta,
       });
     } catch (error) {
       if (isRetryableTransportError(error)) {
@@ -540,7 +587,7 @@ export const job = <Input = void, Result = unknown>(
       } else {
         // Serialization, validation and deterministic Redis errors did not
         // ambiguously accept work, so a corrected submit may claim the key.
-        await releaseKey(cfg.key, jobId);
+        await releaseKey(cfg.key, claim.jobId);
       }
       throw error;
     }
@@ -548,19 +595,21 @@ export const job = <Input = void, Result = unknown>(
     // Only now is the claim genuinely backed by queued work. A crash before
     // this point leaves the claim pending; a later submit retries the enqueue,
     // while the queue's jobId key prevents a successful send from duplicating.
-    await markEnqueued(cfg.key, jobId, initialKeyTtlMs);
+    const newlyEnqueued = await markEnqueued(cfg.key, claim.jobId, pending.idempotencyTtlMs);
 
-    const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
-    await emitTrace(config.trace, {
-      type: "submitted",
-      jobId,
-      key: cfg.key,
-      ...traceInput,
-      ...(cfg.meta ? { meta: cfg.meta } : {}),
-    });
+    if (newlyEnqueued) {
+      const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
+      await emitTrace(config.trace, {
+        type: "submitted",
+        jobId: claim.jobId,
+        key: payload.key,
+        ...traceInput,
+        ...(payload.meta ? { meta: payload.meta } : {}),
+      });
+    }
     startWorker();
 
-    return jobId;
+    return claim.jobId;
   };
 
   const metric = (): JobMetrics => ({ ...metrics });
