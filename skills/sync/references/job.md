@@ -217,7 +217,7 @@ Trace is a callback, not a storage layer. Use it to log, publish, count, or map 
 - **`after` errors are swallowed**: don't throw inside `after` — decide via `ctx.reschedule` instead.
 - **`data` is passed in-memory**: the result of `process` is handed to `after` without JSON round-trip. `Date`, `Map`, class instances all work. Only `input` is marshalled (through the queue).
 - **Multiple workers with same `id`**: coordinate automatically via the internal queue. Each message is delivered to one worker.
-- **`stop()` halts the receive loop** but lets in-flight process run to completion.
+- **`stop()` halts the receive loop and aborts `ctx.signal`** for the in-flight process. The callback must cooperate with that signal; an ignored signal cannot forcibly interrupt JavaScript. In the browser runtime, a stopped attempt is left unacknowledged so its queue lease can expire and another worker can retry it.
 
 ## Redis keys (server)
 

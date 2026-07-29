@@ -143,6 +143,8 @@ export const job = <Input = void, Result = unknown>(
   const prefix = config.prefix ?? DEFAULT_PREFIX;
   // The worker belongs to this handle, not to the id.
   let workerAcRef: AbortController | null = null;
+  let activeJobAc: AbortController | null = null;
+  let restartRequested = false;
   const defaultLeaseMs = Math.max(1, config.defaults?.leaseMs ?? DEFAULT_LEASE_MS);
   const defaultKeyTtlMs = Math.min(
     MAX_KEY_TTL_MS,
@@ -176,7 +178,11 @@ export const job = <Input = void, Result = unknown>(
   };
 
   const startWorker = (): void => {
-    if (workerAcRef) return;
+    if (workerAcRef) {
+      if (workerAcRef.signal.aborted) restartRequested = true;
+      return;
+    }
+    restartRequested = false;
     const workerAc = new AbortController();
     workerAcRef = workerAc;
 
@@ -188,6 +194,7 @@ export const job = <Input = void, Result = unknown>(
               wait: true,
               timeoutMs: DEFAULT_WORKER_RECV_TIMEOUT_MS,
               leaseMs: defaultLeaseMs,
+              signal: workerAc.signal,
             });
 
             if (!message) continue;
@@ -197,6 +204,8 @@ export const job = <Input = void, Result = unknown>(
             const failureCount = attempt - 1;
             const startedAt = Date.now();
             const jobAc = new AbortController();
+            let leaseLost = false;
+            activeJobAc = jobAc;
 
             const makeCtx = (): JobCtx<Input> => {
               const ctx = {
@@ -206,7 +215,11 @@ export const job = <Input = void, Result = unknown>(
                 failureCount,
                 signal: jobAc.signal,
                 heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
-                  await message.touch({ leaseMs: cfg?.leaseMs ?? payload.leaseMs });
+                  const held = await message.touch({ leaseMs: cfg?.leaseMs ?? payload.leaseMs });
+                  if (!held) {
+                    leaseLost = true;
+                    jobAc.abort();
+                  }
                 },
               } as JobCtx<Input>;
               Object.defineProperty(ctx, "duration", {
@@ -227,14 +240,26 @@ export const job = <Input = void, Result = unknown>(
               attempt,
             });
 
+            if (workerAc.signal.aborted) {
+              jobAc.abort();
+              if (activeJobAc === jobAc) activeJobAc = null;
+              continue;
+            }
+
             let result: Result | undefined;
             let error: Error | undefined;
             try {
               result = await Promise.resolve(config.process({ ctx }));
             } catch (err) {
-              jobAc.abort();
               error = asError(err);
+            } finally {
+              jobAc.abort();
+              if (activeJobAc === jobAc) activeJobAc = null;
             }
+
+            // stop() and a failed heartbeat both leave the message unsettled so
+            // its lease can expire and another worker can safely retry it.
+            if (workerAc.signal.aborted || leaseLost) continue;
 
             if (error) {
               await emitTrace(config.trace, {
@@ -255,6 +280,7 @@ export const job = <Input = void, Result = unknown>(
                 durationMs: Date.now() - startedAt,
               });
             }
+            if (workerAc.signal.aborted || leaseLost) continue;
 
             // Build after ctx
             let rescheduleRequested: { delayMs?: number } | null = null;
@@ -274,6 +300,7 @@ export const job = <Input = void, Result = unknown>(
                 // after errors are swallowed
               }
             }
+            if (workerAc.signal.aborted || leaseLost) continue;
 
             if (rescheduleRequested) {
               const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
@@ -321,6 +348,7 @@ export const job = <Input = void, Result = unknown>(
         if (current === workerAc) {
           workerAcRef = null;
         }
+        if (restartRequested) startWorker();
       }
     })();
   };
@@ -374,11 +402,9 @@ export const job = <Input = void, Result = unknown>(
   const metric = (): JobMetrics => ({ ...metrics });
 
   const stop = (): void => {
-    const ac = workerAcRef;
-    if (ac) {
-      ac.abort();
-      workerAcRef = null;
-    }
+    restartRequested = false;
+    workerAcRef?.abort();
+    activeJobAc?.abort();
   };
 
   return {

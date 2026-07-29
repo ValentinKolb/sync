@@ -1,5 +1,6 @@
 import { test, expect, beforeEach } from "bun:test";
 import { job, type JobTraceEvent } from "../src/job";
+import { queue } from "../src/queue";
 
 let testCounter = 0;
 const uid = (name: string): string => `${name}-${Date.now()}-${++testCounter}`;
@@ -425,6 +426,140 @@ test("ctx.heartbeat extends lease for long runs", async () => {
   expect(done).toBe(true);
 
   worker.stop();
+});
+
+test("stop aborts the active callback without completing its delivery", async () => {
+  let signal: AbortSignal | undefined;
+  let afterCalled = false;
+  const events: string[] = [];
+
+  const worker = job({
+    id: uid("stop-signal"),
+    defaults: { leaseMs: 100 },
+    trace: (event) => {
+      events.push(event.type);
+    },
+    process: async ({ ctx }) => {
+      signal = ctx.signal;
+      while (!ctx.signal.aborted) await Bun.sleep(10);
+    },
+    after: async () => {
+      afterCalled = true;
+    },
+  });
+
+  await worker.submit({ key: "cancel-me" });
+  await waitFor(() => signal !== undefined);
+  worker.stop();
+  await waitFor(() => signal?.aborted === true);
+  await Bun.sleep(50);
+
+  expect(afterCalled).toBe(false);
+  expect(worker.metric().dispatches).toBe(0);
+  expect(events).toEqual(["submitted", "started"]);
+});
+
+test("submit after stop restarts only after the aborted callback exits", async () => {
+  const processed: string[] = [];
+  let firstStarted = false;
+
+  const worker = job({
+    id: uid("stop-restart"),
+    process: async ({ ctx }) => {
+      if (ctx.key === "first") {
+        firstStarted = true;
+        while (!ctx.signal.aborted) await Bun.sleep(10);
+        await Bun.sleep(25);
+        return;
+      }
+      processed.push(ctx.key);
+    },
+  });
+
+  await worker.submit({ key: "first" });
+  await waitFor(() => firstStarted);
+  worker.stop();
+  await worker.submit({ key: "second" });
+
+  await waitFor(() => processed.includes("second"));
+  expect(processed).toEqual(["second"]);
+  worker.stop();
+});
+
+test("stop during started trace does not invoke the process callback", async () => {
+  let startedTrace = false;
+  let processCalled = false;
+  let releaseTrace: (() => void) | undefined;
+  const traceGate = new Promise<void>((resolve) => {
+    releaseTrace = resolve;
+  });
+
+  const worker = job({
+    id: uid("stop-before-process"),
+    trace: async (event) => {
+      if (event.type !== "started") return;
+      startedTrace = true;
+      await traceGate;
+    },
+    process: async () => {
+      processCalled = true;
+    },
+  });
+
+  try {
+    await worker.submit({ key: "x" });
+    await waitFor(() => startedTrace);
+    worker.stop();
+    releaseTrace?.();
+    await Bun.sleep(50);
+
+    expect(processCalled).toBe(false);
+    expect(worker.metric().dispatches).toBe(0);
+  } finally {
+    releaseTrace?.();
+    worker.stop();
+  }
+});
+
+test("a failed heartbeat aborts the attempt without false completion", async () => {
+  const id = uid("lease-loss");
+  let started = false;
+  let observedAbort = false;
+  let afterCalled = false;
+  const events: string[] = [];
+
+  const worker = job({
+    id,
+    defaults: { leaseMs: 50 },
+    trace: (event) => {
+      events.push(event.type);
+    },
+    process: async ({ ctx }) => {
+      started = true;
+      await Bun.sleep(100);
+      await ctx.heartbeat();
+      observedAbort = ctx.signal.aborted;
+    },
+    after: async () => {
+      afterCalled = true;
+    },
+  });
+
+  await worker.submit({ key: "lease-loss" });
+  await waitFor(() => started);
+  await Bun.sleep(70);
+
+  const competitor = queue({ id: `${id}:work`, prefix: "sync:job:queue" });
+  const stolen = await competitor.recv({ wait: false });
+  expect(stolen).not.toBeNull();
+
+  await waitFor(() => observedAbort);
+  worker.stop();
+  expect(await stolen?.ack()).toBe(true);
+
+  expect(afterCalled).toBe(false);
+  expect(worker.metric().dispatches).toBe(0);
+  expect(events).toEqual(["submitted", "started"]);
 });
 
 // ==========================

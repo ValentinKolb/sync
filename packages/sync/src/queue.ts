@@ -134,6 +134,8 @@ const MAINTENANCE_SCRIPT = `
   local function toDlq(messageId, message, reason)
     writeDeadLetter(KEYS[7], KEYS[9], messageId, message, now, reason, nil, dlqTtlMs)
     redis.call("HDEL", KEYS[5], messageId)
+    redis.call("HDEL", KEYS[10], messageId)
+    redis.call("HDEL", KEYS[11], messageId)
   end
 
   local delayedIds = redis.call("ZRANGEBYSCORE", KEYS[2], "0", tostring(now), "LIMIT", "0", tostring(batch))
@@ -168,6 +170,10 @@ const MAINTENANCE_SCRIPT = `
       local ok, delivery = pcall(cjson.decode, deliveryRaw)
       if ok then
         local messageId = delivery.messageId
+        if redis.call("HGET", KEYS[10], messageId) == deliveryId then
+          redis.call("HDEL", KEYS[10], messageId)
+        end
+        redis.call("HDEL", KEYS[11], messageId)
         redis.call("LREM", KEYS[6], 1, messageId)
 
         local messageRaw = redis.call("HGET", KEYS[5], messageId)
@@ -191,27 +197,77 @@ const MAINTENANCE_SCRIPT = `
     end
   end
 
-  -- Reap orphans: ids parked in the active list with no delivery record. The
-  -- atomic claim cannot create these, but a <= 5.8.0 consumer that died between
-  -- its LMOVE and its claim did, and such a message is otherwise unreachable
-  -- forever. Both scans are bounded: the active list holds one entry per
-  -- in-flight delivery, and the batch caps the slice examined per pass.
-  local activeIds = redis.call("LRANGE", KEYS[6], 0, batch - 1)
-  if #activeIds > 0 then
-    local claimed = {}
-    for _, deliveryRaw in ipairs(redis.call("HVALS", KEYS[4])) do
-      local ok, delivery = pcall(cjson.decode, deliveryRaw)
-      if ok and type(delivery) == "table" and delivery.messageId then
-        claimed[delivery.messageId] = true
+  -- New claims maintain message -> delivery directly. During rolling upgrades,
+  -- old workers do not, so incrementally backfill their live deliveries first.
+  -- A candidate is only reaped after a complete delivery scan since it was
+  -- observed, which prevents a genuine legacy delivery from being requeued.
+  local deliveryCursor = redis.call("HGET", KEYS[12], "deliveryCursor") or "0"
+  local generation = tonumber(redis.call("HGET", KEYS[12], "deliveryGeneration")) or 0
+  local deliveryScan = redis.call("HSCAN", KEYS[4], deliveryCursor, "COUNT", tostring(batch))
+  local nextDeliveryCursor = deliveryScan[1]
+  local deliveryEntries = deliveryScan[2]
+  for i = 1, #deliveryEntries, 2 do
+    local deliveryId = deliveryEntries[i]
+    local ok, delivery = pcall(cjson.decode, deliveryEntries[i + 1])
+    if ok and type(delivery) == "table" and delivery.messageId then
+      redis.call("HSET", KEYS[10], delivery.messageId, deliveryId)
+      redis.call("HDEL", KEYS[11], delivery.messageId)
+    end
+  end
+  if nextDeliveryCursor == "0" then generation = generation + 1 end
+  redis.call("HSET", KEYS[12], "deliveryCursor", nextDeliveryCursor, "deliveryGeneration", tostring(generation))
+
+  -- Old workers can settle a delivery without cleaning the new reverse index.
+  -- Sweep stale index entries incrementally as long as mixed versions coexist.
+  local ownerCursor = redis.call("HGET", KEYS[12], "ownerCursor") or "0"
+  local ownerScan = redis.call("HSCAN", KEYS[10], ownerCursor, "COUNT", tostring(batch))
+  redis.call("HSET", KEYS[12], "ownerCursor", ownerScan[1])
+  local ownerEntries = ownerScan[2]
+  for i = 1, #ownerEntries, 2 do
+    if redis.call("HEXISTS", KEYS[4], ownerEntries[i + 1]) == 0 then
+      redis.call("HDEL", KEYS[10], ownerEntries[i])
+    end
+  end
+
+  local activeLength = tonumber(redis.call("LLEN", KEYS[6])) or 0
+  if activeLength > 0 then
+    local activeOffset = tonumber(redis.call("HGET", KEYS[12], "activeOffset")) or 0
+    if activeOffset >= activeLength then activeOffset = 0 end
+    local activeIds = redis.call("LRANGE", KEYS[6], activeOffset, activeOffset + batch - 1)
+    local nextActiveOffset = activeOffset + #activeIds
+    if nextActiveOffset >= activeLength then nextActiveOffset = 0 end
+    redis.call("HSET", KEYS[12], "activeOffset", tostring(nextActiveOffset))
+
+    for _, messageId in ipairs(activeIds) do
+      local deliveryId = redis.call("HGET", KEYS[10], messageId)
+      if deliveryId and redis.call("HEXISTS", KEYS[4], deliveryId) == 1 then
+        redis.call("HDEL", KEYS[11], messageId)
+      else
+        redis.call("HDEL", KEYS[10], messageId)
+        redis.call("HSETNX", KEYS[11], messageId, tostring(generation))
       end
     end
-    for _, messageId in ipairs(activeIds) do
-      if not claimed[messageId] then
-        redis.call("LREM", KEYS[6], 1, messageId)
-        if redis.call("HEXISTS", KEYS[5], messageId) == 1 then
-          redis.call("LPUSH", KEYS[1], messageId)
-          notifyReady(KEYS[8])
-        end
+  end
+
+  -- Candidates also need their own cursor: an old worker may ack after a
+  -- candidate is recorded, removing it from active before it is sampled again.
+  local candidateCursor = redis.call("HGET", KEYS[12], "candidateCursor") or "0"
+  local candidateScan = redis.call("HSCAN", KEYS[11], candidateCursor, "COUNT", tostring(batch))
+  redis.call("HSET", KEYS[12], "candidateCursor", candidateScan[1])
+  local candidateEntries = candidateScan[2]
+  for i = 1, #candidateEntries, 2 do
+    local messageId = candidateEntries[i]
+    local observedGeneration = tonumber(candidateEntries[i + 1]) or generation
+    local deliveryId = redis.call("HGET", KEYS[10], messageId)
+    if deliveryId and redis.call("HEXISTS", KEYS[4], deliveryId) == 1 then
+      redis.call("HDEL", KEYS[11], messageId)
+    elseif observedGeneration < generation then
+      local removed = redis.call("LREM", KEYS[6], 1, messageId)
+      redis.call("HDEL", KEYS[10], messageId)
+      redis.call("HDEL", KEYS[11], messageId)
+      if removed > 0 and redis.call("HEXISTS", KEYS[5], messageId) == 1 then
+        redis.call("LPUSH", KEYS[1], messageId)
+        notifyReady(KEYS[8])
       end
     end
   end
@@ -268,6 +324,8 @@ const CLAIM_SCRIPT = `
 
   redis.call("HSET", KEYS[2], deliveryId, cjson.encode(delivery))
   redis.call("ZADD", KEYS[3], tostring(leaseUntil), deliveryId)
+  redis.call("HSET", KEYS[6], messageId, deliveryId)
+  redis.call("HDEL", KEYS[7], messageId)
 
   return cjson.encode({
     messageId = messageId,
@@ -300,6 +358,10 @@ const ACK_SCRIPT = `
   redis.call("ZREM", KEYS[2], deliveryId)
   redis.call("LREM", KEYS[4], 1, delivery.messageId)
   redis.call("HDEL", KEYS[3], delivery.messageId)
+  if redis.call("HGET", KEYS[5], delivery.messageId) == deliveryId then
+    redis.call("HDEL", KEYS[5], delivery.messageId)
+  end
+  redis.call("HDEL", KEYS[6], delivery.messageId)
 
   return 1
 `;
@@ -333,6 +395,10 @@ const NACK_SCRIPT = `
   redis.call("HDEL", KEYS[1], deliveryId)
   redis.call("ZREM", KEYS[2], deliveryId)
   redis.call("LREM", KEYS[4], 1, messageId)
+  if redis.call("HGET", KEYS[10], messageId) == deliveryId then
+    redis.call("HDEL", KEYS[10], messageId)
+  end
+  redis.call("HDEL", KEYS[11], messageId)
 
   local messageRaw = redis.call("HGET", KEYS[3], messageId)
   if not messageRaw then
@@ -424,6 +490,9 @@ type QueueKeys = {
   deliveries: string;
   messages: string;
   active: string;
+  deliveryOwners: string;
+  orphanCandidates: string;
+  maintenance: string;
   dlq: string;
   dlqIndex: string;
   idempotencyPrefix: string;
@@ -571,6 +640,9 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
       deliveries: `${base}:deliveries`,
       messages: `${base}:messages`,
       active: `${base}:active`,
+      deliveryOwners: `${base}:delivery-owners`,
+      orphanCandidates: `${base}:orphan-candidates`,
+      maintenance: `${base}:maintenance`,
       dlq: `${base}:dlq`,
       dlqIndex: `${base}:dlq:index`,
       idempotencyPrefix: `${base}:idempotency`,
@@ -582,7 +654,20 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   const runMaintenance = async (keys: QueueKeys, now: number): Promise<void> => {
     await evalScript(
       MAINTENANCE_SCRIPT,
-      [keys.ready, keys.delayed, keys.leases, keys.deliveries, keys.messages, keys.active, keys.dlq, keys.notify, keys.dlqIndex],
+      [
+        keys.ready,
+        keys.delayed,
+        keys.leases,
+        keys.deliveries,
+        keys.messages,
+        keys.active,
+        keys.dlq,
+        keys.notify,
+        keys.dlqIndex,
+        keys.deliveryOwners,
+        keys.orphanCandidates,
+        keys.maintenance,
+      ],
       [now, maxDeliveries, maxMessageAgeMs, MAINTENANCE_BATCH_SIZE, dlqRetentionMs],
     );
   };
@@ -653,7 +738,15 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
           const deliveryId = randomUUID();
           const claimRaw = await evalScript(
             CLAIM_SCRIPT,
-            [keys.messages, keys.deliveries, keys.leases, keys.active, keys.ready],
+            [
+              keys.messages,
+              keys.deliveries,
+              keys.leases,
+              keys.active,
+              keys.ready,
+              keys.deliveryOwners,
+              keys.orphanCandidates,
+            ],
             [deliveryId, Date.now() + leaseMs, CLAIM_MAX_SKIPS, recvCfg.consumerId ?? ""],
           );
 
@@ -677,7 +770,14 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
         const ack = async (): Promise<boolean> => {
           const result = await evalScript(
             ACK_SCRIPT,
-            [keys.deliveries, keys.leases, keys.messages, keys.active],
+            [
+              keys.deliveries,
+              keys.leases,
+              keys.messages,
+              keys.active,
+              keys.deliveryOwners,
+              keys.orphanCandidates,
+            ],
             [claimed.deliveryId],
           );
           return Number(result) > 0;
@@ -691,7 +791,19 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
 
           const result = await evalScript(
             NACK_SCRIPT,
-            [keys.deliveries, keys.leases, keys.messages, keys.active, keys.ready, keys.delayed, keys.dlq, keys.notify, keys.dlqIndex],
+            [
+              keys.deliveries,
+              keys.leases,
+              keys.messages,
+              keys.active,
+              keys.ready,
+              keys.delayed,
+              keys.dlq,
+              keys.notify,
+              keys.dlqIndex,
+              keys.deliveryOwners,
+              keys.orphanCandidates,
+            ],
             [
               claimed.deliveryId,
               Date.now(),

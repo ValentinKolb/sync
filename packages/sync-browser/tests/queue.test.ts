@@ -699,3 +699,39 @@ test("nack and dlq reason strings match the server", async () => {
   expect(await message?.nack()).toBe(true);
   expect((await q.dlq())[0]?.reason).toBe("max_deliveries_exceeded");
 });
+
+test("send snapshots payload and meta with JSON semantics", async () => {
+  const q = queue<{
+    nested: { values: Array<number | null | undefined> };
+    omitted?: string;
+  }>({ id: `send-snapshot-${Date.now()}` });
+  const data = { nested: { values: [1, undefined, 3] }, omitted: undefined };
+  const meta = { nested: { value: "original" }, omitted: undefined };
+
+  await q.send({ data, meta });
+  data.nested.values[0] = 99;
+  meta.nested.value = "mutated";
+
+  const message = await q.recv({ wait: false });
+  expect(message?.data).toEqual({ nested: { values: [1, null, 3] } });
+  expect(message?.meta).toEqual({ nested: { value: "original" } });
+  await message?.ack();
+});
+
+test("consumer mutation cannot change a later redelivery", async () => {
+  const q = queue<{ nested: { values: number[] } }>({ id: `redelivery-snapshot-${Date.now()}` });
+  await q.send({
+    data: { nested: { values: [1, 2] } },
+    meta: { nested: { value: "original" } },
+  });
+
+  const first = await q.recv({ wait: false });
+  first!.data.nested.values.push(3);
+  (first!.meta!.nested as { value: string }).value = "mutated";
+  await first!.nack();
+
+  const second = await q.recv({ wait: false });
+  expect(second?.data).toEqual({ nested: { values: [1, 2] } });
+  expect(second?.meta).toEqual({ nested: { value: "original" } });
+  await second?.ack();
+});

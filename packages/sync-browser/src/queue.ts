@@ -18,6 +18,16 @@ const DEFAULT_MAINTENANCE_INTERVAL_MS = 1_000;
 
 const textEncoder = new TextEncoder();
 
+const parseJson = <T>(value: string | undefined): T | undefined => {
+  if (value === undefined) return undefined;
+  return JSON.parse(value) as T;
+};
+
+const parseMeta = (value: string | undefined): Record<string, unknown> | undefined => {
+  const parsed = parseJson<unknown>(value);
+  return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : undefined;
+};
+
 // ==========================
 // Types
 // ==========================
@@ -102,10 +112,10 @@ export type Queue<T> = QueueReader<T> & {
 // Internal Types
 // ==========================
 
-type StoredMessage<T = unknown> = {
-  data: T;
+type StoredMessage = {
+  dataJson?: string;
   orderingKey?: string;
-  meta?: Record<string, unknown>;
+  metaJson?: string;
   enqueuedAt: number;
   attempt: number;
 };
@@ -119,9 +129,9 @@ type DeliveryMeta = {
 
 type DlqEntry = {
   messageId: string;
-  data: unknown;
+  dataJson?: string;
   orderingKey?: string;
-  meta?: Record<string, unknown>;
+  metaJson?: string;
   attempts: number;
   movedAt: number;
   reason: string;
@@ -262,9 +272,9 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
   ): void => {
     state.dlq.set(messageId, {
       messageId,
-      data: msg.data,
+      dataJson: msg.dataJson,
       orderingKey: msg.orderingKey,
-      meta: msg.meta,
+      metaJson: msg.metaJson,
       attempts: msg.attempt,
       movedAt: Date.now(),
       reason,
@@ -284,13 +294,16 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     // Measure the whole envelope, not just `data`: the server rejects on the
     // envelope, so measuring less here let a message through that the server
     // would refuse.
-    const payloadRaw = JSON.stringify({
-      data: sendCfg.data,
-      attempt: 0,
-      orderingKey: sendCfg.orderingKey,
-      meta: sendCfg.meta,
-      enqueuedAt: Date.now(),
-    });
+    const now = Date.now();
+    const dataJson = sendCfg.data === undefined ? undefined : JSON.stringify(sendCfg.data);
+    const metaJson = sendCfg.meta === undefined ? undefined : JSON.stringify(sendCfg.meta);
+    const logical: string[] = [];
+    if (dataJson !== undefined) logical.push(`"data":${dataJson}`);
+    logical.push(`"attempt":0`);
+    if (sendCfg.orderingKey !== undefined) logical.push(`"orderingKey":${JSON.stringify(sendCfg.orderingKey)}`);
+    if (metaJson !== undefined) logical.push(`"meta":${metaJson}`);
+    logical.push(`"enqueuedAt":${now}`);
+    const payloadRaw = `{${logical.join(",")}}`;
     const payloadBytes = textEncoder.encode(payloadRaw).byteLength;
     if (payloadBytes > maxPayloadBytes) {
       throw new Error(`payload exceeds limit (${maxPayloadBytes} bytes)`);
@@ -305,11 +318,11 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     }
 
     const messageId = String(++state.seq);
-    const msg: StoredMessage<TData> = {
-      data: sendCfg.data,
+    const msg: StoredMessage = {
+      dataJson,
       orderingKey: sendCfg.orderingKey,
-      meta: sendCfg.meta,
-      enqueuedAt: Date.now(),
+      metaJson,
+      enqueuedAt: now,
       attempt: 0,
     };
 
@@ -466,13 +479,13 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
       };
 
       return {
-        data: msg.data as TData,
+        data: parseJson<TData>(msg.dataJson) as TData,
         messageId,
         deliveryId,
         attempt: msg.attempt,
         leaseUntil: delivery.leaseUntil,
         orderingKey: msg.orderingKey,
-        meta: msg.meta,
+        meta: parseMeta(msg.metaJson),
         ack,
         nack,
         touch,
@@ -502,7 +515,16 @@ export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
     return [...state.dlq.values()]
       .sort((a, b) => a.movedAt - b.movedAt)
       .slice(0, limit)
-      .map((entry) => ({ ...entry, data: entry.data as TData }));
+      .map((entry) => ({
+        messageId: entry.messageId,
+        data: parseJson<TData>(entry.dataJson) as TData,
+        attempts: entry.attempts,
+        movedAt: entry.movedAt,
+        reason: entry.reason,
+        orderingKey: entry.orderingKey,
+        meta: parseMeta(entry.metaJson),
+        lastError: entry.lastError,
+      }));
   };
 
   const dlqRemove = async (cfg: { messageId: string; tenantId?: string }): Promise<boolean> => {
