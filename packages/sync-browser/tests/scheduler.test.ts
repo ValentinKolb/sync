@@ -829,3 +829,52 @@ test("handles with different explicit stores do not share a leader lock", async 
   expect(a.metric().isLeader).toBe(true);
   expect(b.metric().isLeader).toBe(true);
 });
+
+// ==========================
+// Tick loop (not runNow)
+// ==========================
+
+test("the tick loop dispatches due schedules itself, with trigger 'cron'", async () => {
+  // Every other dispatch test goes through runNow, so dispatchDue, the due
+  // selection, the batchSize slice, the cron advance and trigger === "cron"
+  // were entirely uncovered: a browser scheduler that never fired on its own
+  // schedule passed the whole suite. One minute-boundary wait covers them all.
+  const s = makeScheduler(uid("tick-cron"), { dispatch: { tickMs: 20, batchSize: 1 } });
+  const seen: Array<{ id: string; trigger: "cron" | "manual" }> = [];
+  const ids = ["a", "b", "c"];
+
+  const before: Record<string, number> = {};
+  for (const id of ids) {
+    await s.create({
+      id,
+      cron: "* * * * *",
+      tz: "UTC",
+      process: async ({ ctx }) => {
+        seen.push({ id, trigger: ctx.trigger });
+        await Bun.sleep(20);
+      },
+    });
+    before[id] = (await s.get({ id }))!.nextRunAt;
+  }
+
+  s.start();
+  await waitFor(() => seen.length >= ids.length, 90_000, 50);
+  // `seen` is pushed at the start of the callback; let every terminal write land.
+  await waitFor(async () => {
+    const infos = await Promise.all(ids.map((id) => s.get({ id })));
+    return infos.every((info) => (info?.runNumber ?? 0) >= 1);
+  }, 15_000, 20);
+
+  // batchSize 1 must not drop the other due schedules, only defer them.
+  expect(new Set(seen.map((e) => e.id))).toEqual(new Set(ids));
+  expect(seen.every((e) => e.trigger === "cron")).toBe(true);
+
+  for (const id of ids) {
+    const after = (await s.get({ id }))!;
+    expect(after.runNumber).toBeGreaterThanOrEqual(1);
+    // The cron advance ran and landed on a later minute boundary. Not compared
+    // against Date.now(): that boundary can arrive while the assertion runs.
+    expect(after.nextRunAt % 60_000).toBe(0);
+    expect(after.nextRunAt).toBeGreaterThanOrEqual(before[id]!);
+  }
+}, 120_000);
