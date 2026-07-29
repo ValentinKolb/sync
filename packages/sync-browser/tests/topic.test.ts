@@ -1,6 +1,8 @@
 import { test, expect } from "bun:test";
-import { topic } from "../src/topic";
+import { TopicPayloadError, topic } from "../src/topic";
 import { createMemoryStore } from "../src/store";
+import { sharedState } from "../src/internal/shared-state";
+import type { EventLog } from "../src/internal/event-log";
 
 // ==========================
 // pub + recv basics
@@ -443,4 +445,105 @@ test("latestCursor does not consume reader messages", async () => {
   expect(message?.cursor).toBe(published.cursor);
   expect(message?.data.value).toBe(42);
   expect(await message?.commit()).toBe(true);
+});
+
+// ==========================
+// Delivery semantics (at-least-once)
+// ==========================
+
+test("an uncommitted delivery is redelivered, not skipped", async () => {
+  const t = topic<{ v: number }>({ id: `uncommitted-${Date.now()}` });
+  await t.pub({ data: { v: 1 } });
+  await t.pub({ data: { v: 2 } });
+
+  const reader = t.reader("workers");
+  const first = await reader.recv({ wait: false });
+  expect(first?.data).toEqual({ v: 1 });
+
+  // Handler failed: nothing was committed. The cursor used to advance at
+  // delivery, so the event was gone and the next recv returned the *next* one.
+  const retry = await reader.reclaim({ minIdleMs: 0 });
+  expect(retry.entries.length).toBe(1);
+  const redelivered = retry.entries[0];
+  expect(redelivered?.kind).toBe("delivery");
+  if (redelivered?.kind === "delivery") {
+    expect(redelivered.delivery.eventId).toBe(first!.eventId);
+    expect(await redelivered.delivery.commit()).toBe(true);
+  }
+
+  const second = await reader.recv({ wait: false });
+  expect(second?.data).toEqual({ v: 2 });
+  expect(await second?.commit()).toBe(true);
+});
+
+test("two readers in one group distribute rather than broadcast", async () => {
+  const t = topic<{ v: number }>({ id: `group-distribute-${Date.now()}` });
+  await t.pub({ data: { v: 1 } });
+
+  const a = t.reader("g");
+  const b = t.reader("g");
+
+  const received = [await a.recv({ wait: false }), await b.recv({ wait: false })];
+  const nonNull = received.filter((m) => m !== null);
+
+  // `group` used to be a display string only, so every worker saw every event
+  // and every side effect ran twice.
+  expect(nonNull.length).toBe(1);
+  expect(nonNull[0]?.data).toEqual({ v: 1 });
+});
+
+test("a recreated reader resumes at the group's committed position", async () => {
+  const id = `group-resume-${Date.now()}`;
+  const t = topic<{ v: number }>({ id });
+  for (const v of [1, 2, 3]) await t.pub({ data: { v } });
+
+  const first = t.reader("g");
+  const one = await first.recv({ wait: false });
+  await one?.commit();
+  await first.close();
+
+  // A route remount or a StrictMode double-mount used to replay the whole log.
+  const second = t.reader("g");
+  const next = await second.recv({ wait: false });
+  expect(next?.data).toEqual({ v: 2 });
+});
+
+test("invalidPayload: 'throw' raises TopicPayloadError on a malformed entry", async () => {
+  const id = `invalid-throw-${Date.now()}`;
+  const t = topic<{ v: number }>({ id });
+  await t.pub({ data: { v: 1 } });
+
+  // Inject a malformed envelope the way a foreign or older writer would.
+  const logs = sharedState(`topic:logs:sync:topic:${id}`, undefined, () => new Map<string, EventLog>());
+  logs.get(`sync:topic:default:${id}`)!.append({ payload: "not-json" });
+
+  const reader = t.reader("g");
+  expect(await reader.recv({ wait: false }))?.data;
+
+  // The option was accepted and never read, so `catch (e) { if (e instanceof
+  // TopicPayloadError) ... }`, written against the documented contract, was
+  // dead code in the browser.
+  await expect(reader.recv({ wait: false, invalidPayload: "throw" })).rejects.toThrow(TopicPayloadError);
+
+  // Default behaviour is still to skip it and keep draining.
+  const skipping = t.reader("g2");
+  expect((await skipping.recv({ wait: false }))?.data).toEqual({ v: 1 });
+  expect(await skipping.recv({ wait: false })).toBeNull();
+});
+
+test("a stale consumer cannot commit a delivery another reader reclaimed", async () => {
+  const t = topic<{ v: number }>({ id: `fenced-commit-${Date.now()}` });
+  await t.pub({ data: { v: 1 } });
+
+  const a = t.reader("g");
+  const b = t.reader("g");
+
+  const delivered = await a.recv({ wait: false });
+  expect(delivered).not.toBeNull();
+
+  const reclaimed = await b.reclaim({ minIdleMs: 0 });
+  expect(reclaimed.entries.length).toBe(1);
+
+  // Mirrors the server's fenced XACK.
+  expect(await delivered!.commit()).toBe(false);
 });

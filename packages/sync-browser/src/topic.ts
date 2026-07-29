@@ -243,61 +243,66 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
   // reader
   // ==========================
 
-  const reader = (group = "default", _readerCfg: TopicReaderConfig = {}): RecoverableTopicReader<TData> => {
-    const consumerId = `consumer:${randomId()}`;
-    const cursors = new Map<string, string>();
-    const getCursor = (tenantId: string): string => cursors.get(tenantId) ?? "0";
-    const setCursor = (tenantId: string, c: string): void => { cursors.set(tenantId, c); };
+  /**
+   * Per-(topic, tenant, group) delivery state, shared by every reader of that
+   * group. `group` used to be a display string: each reader() allocated a
+   * private cursor starting at "0", so same-group readers broadcast instead of
+   * distributing, every side effect ran once per worker, and a reader recreated
+   * after an SPA remount or a React StrictMode double-mount replayed the entire
+   * retained log.
+   */
+  type GroupState = {
+    /** Last committed id. Delivery resumes from here, not from what was handed out. */
+    committed: string;
+    /** Highest id handed out but not yet committed. */
+    delivered: string;
+    /** eventId -> when it was delivered, for reclaim after minIdleMs. */
+    inFlight: Map<string, { at: number; consumerId: string }>;
+  };
 
-    const recv = async (recvCfg: TopicRecvConfig = {}): Promise<TopicDelivery<TData> | null> => {
-      const tenantId = resolveTenant(recvCfg.tenantId);
-      const log = getEventLog(tenantId);
-      const wait = recvCfg.wait ?? true;
-      const timeoutMs = recvCfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const groupState = (tenantId: string, group: string): GroupState =>
+    sharedState(`topic:group:${prefix}:${tenantId}:${config.id}:${group}`, config.store, () => ({
+      committed: "0",
+      delivered: "0",
+      inFlight: new Map<string, { at: number; consumerId: string }>(),
+    }));
 
-      // Try to get the next entry after cursor
-      const entries = log.range(getCursor(tenantId), 1);
-      if (entries.length > 0) {
-        return deliverEntry(entries[0]!, log, tenantId);
-      }
+  const reader = (group = "default", readerCfg: TopicReaderConfig = {}): RecoverableTopicReader<TData> => {
+    const consumerId = readerCfg.consumerId ?? `consumer:${randomId()}`;
 
-      if (!wait) return null;
-
-      // Wait for the next entry with timeout
-      const ac = new AbortController();
-      const timeout = setTimeout(() => ac.abort(), timeoutMs);
-
-      // Combine user signal and timeout signal
-      const onUserAbort = (): void => ac.abort();
-      if (recvCfg.signal) recvCfg.signal.addEventListener("abort", onUserAbort, { once: true });
-
-      try {
-        for await (const entry of log.subscribe(getCursor(tenantId), ac.signal)) {
-          clearTimeout(timeout);
-          if (recvCfg.signal) recvCfg.signal.removeEventListener("abort", onUserAbort);
-          return deliverEntry(entry, log, tenantId);
-        }
-      } catch {
-        // Timeout or abort
-      } finally {
-        clearTimeout(timeout);
-        if (recvCfg.signal) recvCfg.signal.removeEventListener("abort", onUserAbort);
-      }
-
-      return null;
-    };
-
-    const deliverEntry = (entry: EventLogEntry, _log: EventLog, tenantId: string): TopicDelivery<TData> | null => {
+    const deliverEntry = (
+      entry: EventLogEntry,
+      tenantId: string,
+      state: GroupState,
+      invalidPayload: TopicRecvConfig["invalidPayload"],
+    ): TopicDelivery<TData> | null => {
       const stored = parsePayload(entry);
       if (!stored) {
-        setCursor(tenantId, entry.id);
+        // Malformed transport envelope. The server honours invalidPayload:
+        // "throw" here; the browser accepted the option and never read it, so a
+        // catch written against the documented contract was dead code.
+        if (invalidPayload === "throw") {
+          const raw = entry.fields.payload;
+          throw new TopicPayloadError(
+            entry.id,
+            "envelope is not a valid topic payload",
+            typeof raw === "string" ? raw : null,
+          );
+        }
+        state.committed = entry.id;
+        state.delivered = entry.id;
         return null;
       }
 
-      setCursor(tenantId, entry.id);
+      state.delivered = entry.id;
+      state.inFlight.set(entry.id, { at: Date.now(), consumerId });
 
       const commit = async (): Promise<boolean> => {
-        // In-memory: commit is a no-op (cursor already advanced)
+        const held = state.inFlight.get(entry.id);
+        // Mirror the server's fenced XACK: only the current owner may commit.
+        if (!held || held.consumerId !== consumerId) return false;
+        state.inFlight.delete(entry.id);
+        if (Number(entry.id) > Number(state.committed)) state.committed = entry.id;
         return true;
       };
 
@@ -305,12 +310,59 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
         data: stored.data as TData,
         eventId: entry.id,
         cursor: entry.id,
-        deliveryId: `${group}:${entry.id}`,
+        deliveryId: `${group}:${entry.id}:${consumerId}`,
         orderingKey: stored.orderingKey,
         publishedAt: stored.publishedAt,
         meta: stored.meta,
         commit,
       };
+    };
+
+    const nextFromLog = (
+      log: EventLog,
+      tenantId: string,
+      state: GroupState,
+      invalidPayload: TopicRecvConfig["invalidPayload"],
+    ): TopicDelivery<TData> | null => {
+      // Keep draining past malformed entries rather than reporting end-of-log.
+      while (true) {
+        const entries = log.range(state.delivered, 1);
+        if (entries.length === 0) return null;
+        const delivery = deliverEntry(entries[0]!, tenantId, state, invalidPayload);
+        if (delivery) return delivery;
+      }
+    };
+
+    const recv = async (recvCfg: TopicRecvConfig = {}): Promise<TopicDelivery<TData> | null> => {
+      const tenantId = resolveTenant(recvCfg.tenantId);
+      const log = getEventLog(tenantId);
+      const state = groupState(tenantId, group);
+      const wait = recvCfg.wait ?? true;
+      const timeoutMs = recvCfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+
+      const immediate = nextFromLog(log, tenantId, state, recvCfg.invalidPayload);
+      if (immediate) return immediate;
+
+      if (!wait) return null;
+
+      const ac = new AbortController();
+      const timeout = setTimeout(() => ac.abort(), timeoutMs);
+      const onUserAbort = (): void => ac.abort();
+      if (recvCfg.signal) recvCfg.signal.addEventListener("abort", onUserAbort, { once: true });
+
+      try {
+        for await (const _entry of log.subscribe(state.delivered, ac.signal)) {
+          const delivery = nextFromLog(log, tenantId, state, recvCfg.invalidPayload);
+          if (delivery) return delivery;
+        }
+      } catch {
+        // Timeout or abort.
+      } finally {
+        clearTimeout(timeout);
+        if (recvCfg.signal) recvCfg.signal.removeEventListener("abort", onUserAbort);
+      }
+
+      return null;
     };
 
     const stream = async function* (streamCfg: TopicRecvConfig = {}): AsyncIterable<TopicDelivery<TData>> {
@@ -326,6 +378,11 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       }
     };
 
+    /**
+     * Recover deliveries this group handed out and never committed. Previously a
+     * validating stub returning nothing, which satisfied the type but left
+     * uncommitted work unrecoverable — the cursor had already advanced past it.
+     */
     const reclaim = async (reclaimCfg: TopicReclaimConfig = {}): Promise<TopicReclaimResult<TData>> => {
       const minIdleMs = reclaimCfg.minIdleMs ?? 60_000;
       if (!Number.isFinite(minIdleMs) || minIdleMs < 0) throw new Error("minIdleMs must be a non-negative number");
@@ -333,7 +390,68 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       if (!Number.isInteger(count) || count < 1 || count > 1_000) {
         throw new Error("count must be an integer between 1 and 1000");
       }
-      return { nextCursor: "0-0", entries: [] };
+
+      const tenantId = resolveTenant(reclaimCfg.tenantId);
+      const log = getEventLog(tenantId);
+      const state = groupState(tenantId, group);
+      const now = Date.now();
+
+      const stale = [...state.inFlight.entries()]
+        .filter(([, held]) => now - held.at >= minIdleMs)
+        .sort(([a], [b]) => Number(a) - Number(b))
+        .slice(0, count);
+
+      const entries: Array<TopicReclaimedDelivery<TData>> = [];
+      let lastId = "0-0";
+      for (const [eventId] of stale) {
+        const found = log.range(String(Number(eventId) - 1), 1).find((e) => e.id === eventId);
+        if (!found) {
+          state.inFlight.delete(eventId);
+          continue;
+        }
+        // Take ownership, then hand it out again.
+        state.inFlight.set(eventId, { at: now, consumerId });
+        const commit = async (): Promise<boolean> => {
+          const held = state.inFlight.get(found.id);
+          if (!held || held.consumerId !== consumerId) return false;
+          state.inFlight.delete(found.id);
+          if (Number(found.id) > Number(state.committed)) state.committed = found.id;
+          return true;
+        };
+
+        const stored = parsePayload(found);
+        if (!stored) {
+          const raw = found.fields.payload;
+          entries.push({
+            kind: "invalid",
+            eventId: found.id,
+            deliveryId: `${group}:${found.id}:${consumerId}`,
+            cursor: found.id,
+            error: "envelope is not a valid topic payload",
+            rawPayload: typeof raw === "string" ? raw : null,
+            commit,
+          });
+          lastId = found.id;
+          continue;
+        }
+
+        entries.push({
+          kind: "delivery",
+          delivery: {
+            data: stored.data as TData,
+            eventId: found.id,
+            cursor: found.id,
+            deliveryId: `${group}:${found.id}:${consumerId}`,
+            orderingKey: stored.orderingKey,
+            publishedAt: stored.publishedAt,
+            meta: stored.meta,
+            commit,
+          },
+        });
+        lastId = found.id;
+      }
+
+      return { nextCursor: lastId, entries };
     };
 
     const close = async (): Promise<void> => {

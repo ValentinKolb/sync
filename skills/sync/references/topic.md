@@ -172,7 +172,7 @@ for await (const event of t.live({ tenantId, after: startCursor })) {
 - **`idempotencyKey` on pub**: dedupes within `idempotencyTtlMs` (default 7d). Same key returns the same eventId.
 - **`retentionMs`**: events older than this are trimmed during publish. Set carefully for replay requirements.
 - **`tenantId`**: isolates the stream — separate event log per tenant. Browser: `tenantId` also isolates `maxEntries`.
-- **Browser runtime**: it has no leased pending deliveries, so `reclaim()` validates its options and returns `{ nextCursor: "0-0", entries: [] }`.
+- **Browser runtime**: consumer groups behave as documented above. The group's cursor advances on `commit()`, not on delivery, so an uncommitted delivery stays recoverable via `reclaim({ minIdleMs })`; readers of one group distribute rather than broadcast; a recreated reader resumes at the group's committed position; and `commit()` is refused once another reader has reclaimed the delivery. Leader-free and tab-local: state is shared per `{prefix}:{id}` within the tab (or per `store` when one is passed), not across tabs.
 
 ## Redis keys (server)
 
