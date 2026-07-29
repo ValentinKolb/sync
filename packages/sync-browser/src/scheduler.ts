@@ -15,6 +15,8 @@ const DEFAULT_LEASE_MS = 5_000;
 const DEFAULT_HEARTBEAT_MS = 500;
 const DEFAULT_TICK_MS = 500;
 const DEFAULT_BATCH_SIZE = 200;
+const MIN_LEASE_MS = 500;
+const MIN_HEARTBEAT_MS = 100;
 
 // ==========================
 // Types
@@ -187,8 +189,16 @@ const asInfo = (schedule: StoredSchedule): SchedulerInfo => ({
 
 export const scheduler = (config: SchedulerConfig): Scheduler => {
   const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const leaseMs = Math.max(500, config.leader?.leaseMs ?? DEFAULT_LEASE_MS);
-  const heartbeatMs = Math.max(100, config.leader?.heartbeatMs ?? DEFAULT_HEARTBEAT_MS);
+  const configuredLeaseMs = config.leader?.leaseMs ?? DEFAULT_LEASE_MS;
+  const leaseMs = Math.max(MIN_LEASE_MS, Number.isFinite(configuredLeaseMs) ? configuredLeaseMs : DEFAULT_LEASE_MS);
+  const configuredHeartbeatMs = config.leader?.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const heartbeatMs = Math.min(
+    Math.max(
+      MIN_HEARTBEAT_MS,
+      Number.isFinite(configuredHeartbeatMs) ? configuredHeartbeatMs : DEFAULT_HEARTBEAT_MS,
+    ),
+    Math.floor(leaseMs / 3),
+  );
   const tickMs = Math.max(50, config.dispatch?.tickMs ?? DEFAULT_TICK_MS);
   const batchSize = Math.max(1, config.dispatch?.batchSize ?? DEFAULT_BATCH_SIZE);
   const store = config.store ?? createMemoryStore();
@@ -276,6 +286,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
   let running = false;
   let loopPromise: Promise<void> | null = null;
+  let heartbeatPromise: Promise<void> | null = null;
   // Controllers of the callbacks currently running, so stop() can cancel them.
   const activeRuns = new Set<AbortController>();
   let currentLeaderLock: Lock | null = null;
@@ -297,15 +308,26 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   };
 
   const maintainLeadership = async (): Promise<void> => {
-    if (!currentLeaderLock) return;
+    const lock = currentLeaderLock;
+    if (!lock) return;
     const nowMs = Date.now();
     if (nowMs - lastHeartbeatAt < heartbeatMs) return;
-    const ok = await leaderMutex.extend(currentLeaderLock, leaseMs);
     lastHeartbeatAt = nowMs;
-    if (!ok) {
+    const ok = await leaderMutex.extend(lock, leaseMs);
+    if (!ok && currentLeaderLock === lock) {
       currentLeaderLock = null;
       setLeader(false);
     }
+  };
+
+  // One dispatch per schedule at a time in this instance. In particular, a
+  // manual run cannot overlap a cron run and mutate the same schedule record.
+  const dispatchChains = new Map<string, Promise<unknown>>();
+  const serializeDispatch = (scheduleId: string, run: () => Promise<void>): Promise<void> => {
+    const previous = dispatchChains.get(scheduleId) ?? Promise.resolve();
+    const next = previous.then(run, run);
+    dispatchChains.set(scheduleId, next.catch(() => {}));
+    return next;
   };
 
   const relinquishLeadership = async (): Promise<void> => {
@@ -460,7 +482,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         return;
       }
 
-      await dispatchOne(schedule, handler, "cron");
+      await serializeDispatch(schedule.id, () => dispatchOne(schedule, handler, "cron"));
     }
   };
 
@@ -468,7 +490,6 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     while (running) {
       try {
         await tryAcquireLeadership();
-        await maintainLeadership();
         if (currentLeaderLock) {
           await dispatchDue();
         }
@@ -477,6 +498,17 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         metrics.tickErrors += 1;
       }
       await sleep(tickMs);
+    }
+  };
+
+  const heartbeatLoop = async (): Promise<void> => {
+    while (running) {
+      try {
+        await maintainLeadership();
+      } catch {
+        metrics.tickErrors += 1;
+      }
+      await sleep(Math.max(50, Math.floor(heartbeatMs / 2)));
     }
   };
 
@@ -576,7 +608,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
     // Everything that decides acceptance has been checked; the run is now ours.
     onAccepted?.();
-    await dispatchOne(schedule, handler, "manual");
+    await serializeDispatch(cfg.id, () => dispatchOne(schedule, handler, "manual"));
   };
 
   const get = async (cfg: { id: string }): Promise<SchedulerInfo | null> => {
@@ -597,6 +629,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     running = true;
     setBrowserSchedulerControlAvailable({ prefix, schedulerId: config.id, instanceId, available: true });
     loopPromise = loop();
+    heartbeatPromise = heartbeatLoop();
   };
 
   const stop = async (): Promise<void> => {
@@ -606,10 +639,9 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     // cancellation signal instead of something that is always false.
     for (const ac of activeRuns) ac.abort();
     setBrowserSchedulerControlAvailable({ prefix, schedulerId: config.id, instanceId, available: false });
-    if (loopPromise) {
-      await loopPromise;
-      loopPromise = null;
-    }
+    await Promise.all([loopPromise, heartbeatPromise]);
+    loopPromise = null;
+    heartbeatPromise = null;
     await relinquishLeadership();
   };
 

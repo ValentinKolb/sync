@@ -784,6 +784,85 @@ test("schedulerControl runNow reports not found for missing schedules", async ()
   ).rejects.toBeInstanceOf(SchedulerControlNotFoundError);
 });
 
+test("schedulerControl keeps handler availability alive during a long callback", async () => {
+  const prefix = `test:sched:${uid("control-heartbeat-prefix")}`;
+  const schedId = uid("control-heartbeat");
+  const sched = makeScheduler(schedId, { prefix, dispatch: { tickMs: 50 } });
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let started = false;
+
+  await sched.create({
+    id: "slow",
+    cron: "0 3 * * *",
+    process: async () => {
+      started = true;
+      await gate;
+    },
+  });
+  sched.start();
+  const control = schedulerControl({ prefix });
+  await waitFor(async () => {
+    const listed = await control.list();
+    return listed.some((entry) => entry.schedulerId === schedId && entry.scheduleId === "slow" && entry.state === "available");
+  });
+
+  try {
+    await control.runNow({ schedulerId: schedId, scheduleId: "slow", timeoutMs: 2_000 });
+    await waitFor(() => started);
+
+    const members = await redis.send("SMEMBERS", [`${prefix}:${schedId}:control:slow:handlers`]);
+    expect(Array.isArray(members)).toBe(true);
+    expect((members as unknown[]).length).toBe(1);
+    await redis.send("PEXPIRE", [String((members as unknown[])[0]), "100"]);
+
+    await Bun.sleep(2_100);
+    const listed = await control.list();
+    expect(
+      listed.find((entry) => entry.schedulerId === schedId && entry.scheduleId === "slow")?.state,
+    ).toBe("available");
+  } finally {
+    release();
+  }
+});
+
+test("schedulerControl executes one target for a repeated requestId", async () => {
+  const prefix = `test:sched:${uid("control-request-prefix")}`;
+  const schedId = uid("control-request");
+  const sched = makeScheduler(schedId, { prefix, dispatch: { tickMs: 50 } });
+  let runs = 0;
+
+  await sched.create({
+    id: "one",
+    cron: "0 3 * * *",
+    process: async () => {
+      runs += 1;
+      await Bun.sleep(100);
+    },
+  });
+  await sched.create({ id: "two", cron: "0 3 * * *", process: async () => {} });
+  sched.start();
+
+  const control = schedulerControl({ prefix });
+  await waitFor(async () => {
+    const listed = await control.list();
+    return listed.filter((entry) => entry.schedulerId === schedId && entry.state === "available").length === 2;
+  });
+
+  const requestId = uid("request");
+  const request = { schedulerId: schedId, scheduleId: "one", requestId, timeoutMs: 2_000 };
+  await Promise.all([control.runNow(request), control.runNow(request)]);
+  await waitFor(() => runs === 1);
+  await Bun.sleep(200);
+  expect(runs).toBe(1);
+
+  await expect(
+    control.runNow({ schedulerId: schedId, scheduleId: "two", requestId, timeoutMs: 2_000 }),
+  ).rejects.toThrow("already bound to another schedule");
+});
+
 test("schedule meta round-trips byte-equivalent JSON", async () => {
   const sched = scheduler({ id: uid("meta-fidelity"), prefix: "test:sched" });
   const meta = {

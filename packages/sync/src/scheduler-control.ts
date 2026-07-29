@@ -6,6 +6,20 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_HANDLER_TTL_MS = 15_000;
 const DEFAULT_RESPONSE_TTL_MS = 5 * 60_000;
 
+const BIND_REQUEST_SCRIPT = `
+  local current = redis.call("GET", KEYS[1])
+  if not current then
+    redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2])
+    redis.call("DEL", KEYS[2])
+    return 1
+  end
+  if current == ARGV[1] then
+    redis.call("PEXPIRE", KEYS[1], ARGV[2])
+    return 1
+  end
+  return 0
+`;
+
 type StoredSchedule = {
   id: string;
   cron: string;
@@ -95,6 +109,7 @@ const handlerIndexKey = (prefix: string, schedulerId: string, scheduleId: string
 const handlerInstanceKey = (prefix: string, schedulerId: string, scheduleId: string, instanceId: string): string =>
   `${prefix}:${schedulerId}:control:${scheduleId}:handler:${instanceId}`;
 const responseKey = (prefix: string, requestId: string): string => `${prefix}:control:response:${requestId}`;
+const requestKey = (prefix: string, requestId: string): string => `${prefix}:control:request:${requestId}`;
 
 const assertId = (name: string, value: string): void => {
   if (!value) throw new Error(`${name} is required`);
@@ -180,6 +195,29 @@ const writeResponse = async (
   ttlMs = DEFAULT_RESPONSE_TTL_MS,
 ): Promise<void> => {
   await redis.send("SET", [responseKey(prefix, requestId), JSON.stringify(response), "PX", String(ttlMs)]);
+};
+
+const bindRequest = async (
+  prefix: string,
+  requestId: string,
+  schedulerId: string,
+  scheduleId: string,
+  ttlMs: number,
+): Promise<void> => {
+  const target = JSON.stringify([schedulerId, scheduleId]);
+  const bound = Number(
+    await redis.send("EVAL", [
+      BIND_REQUEST_SCRIPT,
+      "2",
+      requestKey(prefix, requestId),
+      responseKey(prefix, requestId),
+      target,
+      String(ttlMs),
+    ]),
+  );
+  if (bound === 0) {
+    throw new Error(`schedulerControl.runNow: requestId ${requestId} is already bound to another schedule`);
+  }
 };
 
 const liveHandlerKeys = async (prefix: string, schedulerId: string, scheduleId: string): Promise<string[]> => {
@@ -307,6 +345,15 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
 
     const timeoutMs = Math.max(1, cfg.timeoutMs ?? defaultTimeoutMs);
     const requestId = cfg.requestId ?? crypto.randomUUID();
+    assertId("requestId", requestId);
+    const requestTtlMs = Math.max(DEFAULT_RESPONSE_TTL_MS, timeoutMs * 2);
+    await bindRequest(prefix, requestId, cfg.schedulerId, cfg.scheduleId, requestTtlMs);
+
+    // An accepted retry is the original request even if the handler went away
+    // after accepting it. Binding first still rejects attempts to retarget the
+    // same request id.
+    const existing = await readResponse(prefix, requestId);
+    if (existing?.status === "accepted") return;
 
     const schedule = parseSchedule(await redis.get(scheduleKey(prefix, cfg.schedulerId, cfg.scheduleId)));
     if (!schedule) {
@@ -321,9 +368,6 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
       );
     }
 
-    const existing = await readResponse(prefix, requestId);
-    if (existing?.status === "accepted") return;
-
     await schedulerControlQueue(prefix, cfg.schedulerId, cfg.scheduleId).send({
       data: {
         requestId,
@@ -332,7 +376,7 @@ export const schedulerControl = (config: SchedulerControlConfig = {}): Scheduler
         requestedAt: Date.now(),
       },
       idempotencyKey: requestId,
-      idempotencyTtlMs: Math.max(DEFAULT_RESPONSE_TTL_MS, timeoutMs * 2),
+      idempotencyTtlMs: requestTtlMs,
     });
 
     const deadline = Date.now() + timeoutMs;

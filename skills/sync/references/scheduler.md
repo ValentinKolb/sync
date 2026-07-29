@@ -190,6 +190,8 @@ try {
 
 **A timeout does not cancel the request.** `SchedulerControlTimeoutError` means no instance accepted within `timeoutMs`; the request stays queued and may still be picked up. Retrying with a fresh `requestId` therefore risks a second execution — pass the *same* `requestId` to retry idempotently. If dispatch keeps failing, the request is reported as unavailable after a few attempts instead of being replayed indefinitely.
 
+A `requestId` is bound to one `{ schedulerId, scheduleId }` target for its idempotency window. Reusing it for another schedule throws instead of triggering ambiguous work.
+
 ## Common pattern: cron + job fanout (batch item retry)
 
 When you need "every N minutes, process all dirty items; each item retries independently":
@@ -245,8 +247,9 @@ Each item has its own `ctx.failureCount`. Already-running items skip duplicate s
 - **`ctx.trigger`**: `"cron"` when dispatched by the tick loop; `"manual"` when invoked via `runNow`. Useful for conditionals like "skip expensive validation on manual runs" or "log admin runs separately". Available in both `process` and `after` ctx.
 - **`ctx.runNumber` is persistent**: preserved across restarts, re-registrations, and (different) cron changes. Only `delete` resets.
 - **`ctx.failureCount` persists across cron slots**: resets to 0 on any successful run. A consistently failing schedule grows this counter indefinitely — use it to decide when to give up in `after`.
-- **Handler missing on the current leader pod**: the scheduler silently advances past the slot. Another pod with the handler will pick up the next slot. All pods should register all schedules on startup.
+- **Handler missing on the current leader pod**: the scheduler steps down without advancing the slot so another pod can serve it. All pods should still register all schedules on startup.
 - **Multiple pods coordinate via leader mutex**: one leader dispatches at a time. Leader lease is 5s by default. Brief overlap during handoff can cause at-least-once slot dispatch — make `process` idempotent.
+- **Leader timing is normalized**: the lease is at least 500ms and the heartbeat is capped at one third of the lease, so an oversized heartbeat cannot silently let leadership expire during a long callback.
 - **`after` errors are swallowed**: don't throw inside `after` — use `ctx.reschedule` to signal intent.
 - **Trace is not an audit log by itself**: it is an in-process callback. Persist events yourself if you need durable audit history.
 

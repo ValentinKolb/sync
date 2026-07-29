@@ -301,7 +301,8 @@ test("a callback longer than the lease neither loses leadership nor clobbers sta
   const mk = (tag: string): Scheduler => {
     const s = scheduler({
       id: schedId,
-      leader: { leaseMs: 600, heartbeatMs: 100 },
+      // A heartbeat larger than the lease is clamped to a safe cadence.
+      leader: { leaseMs: 600, heartbeatMs: 10_000 },
       dispatch: { tickMs: 100 },
     });
     activeSchedulers.push(s);

@@ -22,6 +22,8 @@ const DEFAULT_BATCH_SIZE = 200;
 // How many times one manual-run request may be retried before it is reported as
 // failed instead of replayed indefinitely.
 const CONTROL_MAX_ATTEMPTS = 3;
+const MIN_LEASE_MS = 500;
+const MIN_HEARTBEAT_MS = 100;
 
 // Upsert: creates or updates the schedule record. Preserves runNumber always;
 // preserves nextRunAt/failureCount iff cron/tz unchanged.
@@ -303,10 +305,20 @@ const asInfo = (schedule: StoredSchedule): SchedulerInfo => ({
 
 export const scheduler = (config: SchedulerConfig): Scheduler => {
   const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const leaseMs = Math.max(500, config.leader?.leaseMs ?? DEFAULT_LEASE_MS);
-  const heartbeatMs = Math.max(100, config.leader?.heartbeatMs ?? DEFAULT_HEARTBEAT_MS);
+  const configuredLeaseMs = config.leader?.leaseMs ?? DEFAULT_LEASE_MS;
+  const leaseMs = Math.max(MIN_LEASE_MS, Number.isFinite(configuredLeaseMs) ? configuredLeaseMs : DEFAULT_LEASE_MS);
+  const configuredHeartbeatMs = config.leader?.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const heartbeatMs = Math.min(
+    Math.max(
+      MIN_HEARTBEAT_MS,
+      Number.isFinite(configuredHeartbeatMs) ? configuredHeartbeatMs : DEFAULT_HEARTBEAT_MS,
+    ),
+    Math.floor(leaseMs / 3),
+  );
   const tickMs = Math.max(50, config.dispatch?.tickMs ?? DEFAULT_TICK_MS);
   const batchSize = Math.max(1, config.dispatch?.batchSize ?? DEFAULT_BATCH_SIZE);
+  const controlHandlerTtlMs = Math.max(5_000, tickMs * 4);
+  const controlHeartbeatMs = Math.max(500, Math.floor(controlHandlerTtlMs / 3));
 
   const scheduleKey = (id: string): string => `${prefix}:${config.id}:schedule:${id}`;
   const dueKey = `${prefix}:${config.id}:due`;
@@ -337,6 +349,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   let running = false;
   let loopPromise: Promise<void> | null = null;
   let heartbeatPromise: Promise<void> | null = null;
+  let controlHeartbeatPromise: Promise<void> | null = null;
+  let controlRefreshPromise: Promise<void> | null = null;
   // Controllers of the callbacks currently running, so stop() can cancel them.
   const activeRuns = new Set<AbortController>();
   let currentLeaderLock: Lock | null = null;
@@ -619,7 +633,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
           schedulerId: config.id,
           scheduleId,
           instanceId,
-          ttlMs: Math.max(5_000, tickMs * 4),
+          ttlMs: controlHandlerTtlMs,
         }),
       ),
     );
@@ -709,7 +723,6 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const loop = async (): Promise<void> => {
     while (running) {
       try {
-        await refreshControlHandlers();
         await dispatchControlRequests();
         await tryAcquireLeadership();
         if (currentLeaderLock) {
@@ -720,6 +733,22 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         metrics.tickErrors += 1;
       }
       await sleep(tickMs);
+    }
+  };
+
+  // Handler liveness must not depend on the dispatch loop: that loop awaits
+  // user callbacks, which may legitimately run longer than the presence TTL.
+  const controlHeartbeatLoop = async (): Promise<void> => {
+    while (running) {
+      try {
+        controlRefreshPromise = refreshControlHandlers();
+        await controlRefreshPromise;
+      } catch {
+        metrics.tickErrors += 1;
+      } finally {
+        controlRefreshPromise = null;
+      }
+      await sleep(controlHeartbeatMs);
     }
   };
 
@@ -787,7 +816,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         schedulerId: config.id,
         scheduleId: cfg.id,
         instanceId,
-        ttlMs: Math.max(5_000, tickMs * 4),
+        ttlMs: controlHandlerTtlMs,
       });
     }
 
@@ -808,8 +837,11 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
   const deleteSchedule = async (cfg: { id: string }): Promise<void> => {
     await redis.send("EVAL", [DELETE_SCRIPT, "3", scheduleKey(cfg.id), dueKey, indexKey, cfg.id]);
-    await removeSchedulerControlHandler({ prefix, schedulerId: config.id, scheduleId: cfg.id, instanceId });
     handlers.delete(cfg.id);
+    // A refresh may have captured this handler immediately before deletion.
+    // Wait it out, then make the removal the final Redis write.
+    await controlRefreshPromise?.catch(() => {});
+    await removeSchedulerControlHandler({ prefix, schedulerId: config.id, scheduleId: cfg.id, instanceId });
   };
 
   const runNow = async (cfg: { id: string }): Promise<void> => {
@@ -856,6 +888,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     running = true;
     loopPromise = loop();
     heartbeatPromise = heartbeatLoop();
+    controlHeartbeatPromise = controlHeartbeatLoop();
   };
 
   const stop = async (): Promise<void> => {
@@ -864,9 +897,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     // Cancel in-flight callbacks so `ctx.signal.aborted` is a usable
     // cancellation signal instead of something that is always false.
     for (const ac of activeRuns) ac.abort();
-    await Promise.all([loopPromise, heartbeatPromise]);
+    await Promise.all([loopPromise, heartbeatPromise, controlHeartbeatPromise]);
     loopPromise = null;
     heartbeatPromise = null;
+    controlHeartbeatPromise = null;
     await removeControlHandlers();
     await relinquishLeadership();
   };

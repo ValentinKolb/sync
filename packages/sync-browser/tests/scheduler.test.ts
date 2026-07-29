@@ -707,6 +707,49 @@ test("schedulerControl runNow waits for acceptance rather than returning immedia
   expect(accepted).toBe(true);
 });
 
+test("schedulerControl executes one run for repeated requestId calls", async () => {
+  const prefix = uid("control-idempotent-prefix");
+  const s = makeScheduler(uid("control-idempotent"), { prefix });
+  let runs = 0;
+
+  await s.create({
+    id: "reindex",
+    cron: "0 3 * * *",
+    process: async () => {
+      runs += 1;
+      await Bun.sleep(50);
+    },
+  });
+  s.start();
+
+  const control = schedulerControl({ prefix });
+  const request = {
+    schedulerId: s.id,
+    scheduleId: "reindex",
+    requestId: uid("request"),
+  };
+  await Promise.all([control.runNow(request), control.runNow(request)]);
+  await Bun.sleep(150);
+
+  expect(runs).toBe(1);
+});
+
+test("schedulerControl binds a requestId to one schedule", async () => {
+  const prefix = uid("control-target-prefix");
+  const s = makeScheduler(uid("control-target"), { prefix });
+
+  await s.create({ id: "one", cron: "0 3 * * *", process: async () => {} });
+  await s.create({ id: "two", cron: "0 3 * * *", process: async () => {} });
+  s.start();
+
+  const control = schedulerControl({ prefix });
+  const requestId = uid("request");
+  await control.runNow({ schedulerId: s.id, scheduleId: "one", requestId });
+  await expect(
+    control.runNow({ schedulerId: s.id, scheduleId: "two", requestId }),
+  ).rejects.toThrow("already bound to another schedule");
+});
+
 // ==========================
 // Persistence and leader election across handles
 // ==========================
@@ -828,6 +871,89 @@ test("handles with different explicit stores do not share a leader lock", async 
 
   expect(a.metric().isLeader).toBe(true);
   expect(b.metric().isLeader).toBe(true);
+});
+
+test("leader heartbeat survives a callback longer than the configured lease", async () => {
+  const prefix = uid("leader-long-prefix");
+  const schedulerId = uid("leader-long");
+  const store = createMemoryStore();
+  const options = {
+    prefix,
+    store,
+    leader: { leaseMs: 500, heartbeatMs: 5_000 },
+    dispatch: { tickMs: 20 },
+  };
+  const a = scheduler({ id: schedulerId, ...options });
+  const b = scheduler({ id: schedulerId, ...options });
+  activeSchedulers.push(a, b);
+
+  let cronStarts = 0;
+  const register = async (s: Scheduler): Promise<void> => {
+    await s.create({
+      id: "slow",
+      cron: "0 3 * * *",
+      process: async ({ ctx }) => {
+        if (ctx.trigger === "cron") {
+          cronStarts += 1;
+          await Bun.sleep(900);
+        }
+      },
+      after: async ({ ctx }) => {
+        if (ctx.trigger === "manual") ctx.reschedule({ delayMs: 0 });
+      },
+    });
+  };
+  await register(a);
+  await register(b);
+
+  await a.runNow({ id: "slow" });
+  a.start();
+  await waitFor(() => cronStarts === 1);
+  b.start();
+  await Bun.sleep(700);
+
+  expect(cronStarts).toBe(1);
+});
+
+test("manual and cron runs of one schedule are serialized", async () => {
+  const s = makeScheduler(uid("dispatch-serialized"), {
+    leader: { leaseMs: 500, heartbeatMs: 100 },
+    dispatch: { tickMs: 20 },
+  });
+  let active = 0;
+  let maxActive = 0;
+  let releaseCron = (): void => {};
+  const cronGate = new Promise<void>((resolve) => {
+    releaseCron = resolve;
+  });
+
+  await s.create({
+    id: "serial",
+    cron: "0 3 * * *",
+    process: async ({ ctx }) => {
+      if (ctx.runNumber === 1) return;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      if (ctx.trigger === "cron") await cronGate;
+      active -= 1;
+    },
+    after: async ({ ctx }) => {
+      if (ctx.runNumber === 1) ctx.reschedule({ delayMs: 0 });
+    },
+  });
+
+  await s.runNow({ id: "serial" });
+  s.start();
+  await waitFor(() => active === 1);
+  const manual = s.runNow({ id: "serial" });
+  try {
+    await Bun.sleep(100);
+    expect(maxActive).toBe(1);
+  } finally {
+    releaseCron();
+  }
+  await manual;
+  expect(maxActive).toBe(1);
 });
 
 // ==========================
