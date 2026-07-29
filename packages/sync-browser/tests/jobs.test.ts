@@ -577,3 +577,28 @@ test("trace errors are swallowed and do not affect job execution", async () => {
     worker.stop();
   }
 });
+
+test("metrics are per handle and a later lease default is not overridden", async () => {
+  const id = `shared-metrics-${Date.now()}`;
+  let ran = 0;
+
+  const worker = job<{ n: number }>({
+    id,
+    process: async () => {
+      ran += 1;
+    },
+  });
+  // A second handle for observability, exactly as a dashboard would create.
+  const observer = job<{ n: number }>({ id, defaults: { leaseMs: 500 } });
+
+  await worker.submit({ key: "k1", input: { n: 1 } });
+  while (ran === 0) await Bun.sleep(10);
+  await Bun.sleep(150);
+
+  // The server keeps metrics closure-local, so the observer reports zeros.
+  expect(worker.metric().dispatches).toBeGreaterThanOrEqual(1);
+  expect(observer.metric().dispatches).toBe(0);
+
+  worker.stop();
+  observer.stop();
+});

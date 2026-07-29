@@ -97,16 +97,23 @@ type IdempotencyEntry = {
 type SharedJobState = {
   idempotency: Map<string, IdempotencyEntry>;
   workQueue: Queue<WorkPayload>;
-  metrics: JobMetrics;
   seq: number;
 };
 
 const sharedStates = new Map<string, SharedJobState>();
-const activeWorkers = new Map<string, AbortController>();
-
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
 
-const getSharedState = (id: string, prefix: string, defaultLeaseMs: number): SharedJobState => {
+/**
+ * The queue and the idempotency map are genuinely shared by every handle with
+ * this id, exactly as they are through Redis on the server. Metrics are not:
+ * the server keeps them closure-local, so a dashboard constructing
+ * `job({id:"emails"})` for observability reports zeros there and reported the
+ * worker's cumulative counts here. The lease is not either — it was baked into
+ * the shared work queue by whichever handle happened to construct it first, so
+ * a later `job({id, defaults:{leaseMs}})` silently inherited the first one's.
+ * It is applied per recv instead.
+ */
+const getSharedState = (id: string, prefix: string): SharedJobState => {
   const key = `${prefix}:${id}`;
   let shared = sharedStates.get(key);
   if (!shared) {
@@ -116,15 +123,9 @@ const getSharedState = (id: string, prefix: string, defaultLeaseMs: number): Sha
         id: `${id}:work`,
         prefix: `${prefix}:queue`,
         delivery: {
-          defaultLeaseMs,
           maxDeliveries: Number.MAX_SAFE_INTEGER,
         },
       }),
-      metrics: {
-        dispatches: 0,
-        failures: 0,
-        reschedules: 0,
-      },
       seq: 0,
     };
     sharedStates.set(key, shared);
@@ -140,15 +141,17 @@ export const job = <Input = void, Result = unknown>(
   config: JobConfig<Input, Result>,
 ): JobHandle<Input> => {
   const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const workerId = `${prefix}:${config.id}`;
+  // The worker belongs to this handle, not to the id.
+  let workerAcRef: AbortController | null = null;
   const defaultLeaseMs = Math.max(1, config.defaults?.leaseMs ?? DEFAULT_LEASE_MS);
   const defaultKeyTtlMs = Math.min(
     MAX_KEY_TTL_MS,
     Math.max(1_000, config.defaults?.keyTtlMs ?? DEFAULT_KEY_TTL_MS),
   );
 
-  const shared = getSharedState(config.id, prefix, defaultLeaseMs);
-  const metrics = shared.metrics;
+  const shared = getSharedState(config.id, prefix);
+  // Per handle, matching the server.
+  const metrics: JobMetrics = { dispatches: 0, failures: 0, reschedules: 0 };
 
   const sweepExpiredKeys = (): void => {
     const now = Date.now();
@@ -173,9 +176,9 @@ export const job = <Input = void, Result = unknown>(
   };
 
   const startWorker = (): void => {
-    if (activeWorkers.has(workerId)) return;
+    if (workerAcRef) return;
     const workerAc = new AbortController();
-    activeWorkers.set(workerId, workerAc);
+    workerAcRef = workerAc;
 
     void (async () => {
       try {
@@ -314,9 +317,9 @@ export const job = <Input = void, Result = unknown>(
           }
         }
       } finally {
-        const current = activeWorkers.get(workerId);
+        const current = workerAcRef;
         if (current === workerAc) {
-          activeWorkers.delete(workerId);
+          workerAcRef = null;
         }
       }
     })();
@@ -371,10 +374,10 @@ export const job = <Input = void, Result = unknown>(
   const metric = (): JobMetrics => ({ ...metrics });
 
   const stop = (): void => {
-    const ac = activeWorkers.get(workerId);
+    const ac = workerAcRef;
     if (ac) {
       ac.abort();
-      activeWorkers.delete(workerId);
+      workerAcRef = null;
     }
   };
 
