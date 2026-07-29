@@ -773,6 +773,58 @@ test("schedulerControl runNow is accepted by a live scheduler and does not advan
   expect(events.some((event) => event.type === "started" && event.trigger === "manual")).toBe(true);
 });
 
+test("schedulerControl waits for the cross-handle dispatch lock before acceptance", async () => {
+  const prefix = `test:sched:${uid("control-lock-prefix")}`;
+  const schedulerId = uid("control-lock");
+  const first = makeScheduler(schedulerId, {
+    prefix,
+    leader: { leaseMs: 500, heartbeatMs: 50 },
+    dispatch: { tickMs: 50 },
+  });
+  const second = makeScheduler(schedulerId, {
+    prefix,
+    leader: { leaseMs: 500, heartbeatMs: 50 },
+    dispatch: { tickMs: 50 },
+  });
+  let starts = 0;
+  let releaseFirst = (): void => {};
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const process = async (): Promise<void> => {
+    starts += 1;
+    if (starts === 1) await firstGate;
+  };
+
+  await first.create({ id: "reindex", cron: "0 3 * * *", process });
+  await second.create({ id: "reindex", cron: "0 3 * * *", process });
+
+  const direct = first.runNow({ id: "reindex" });
+  await waitFor(() => starts === 1);
+  second.start();
+  const control = schedulerControl({ prefix });
+  await waitFor(async () => {
+    const listed = await control.list();
+    return listed.some(
+      (entry) => entry.schedulerId === schedulerId && entry.scheduleId === "reindex" && entry.state === "available",
+    );
+  });
+
+  let accepted = false;
+  const remote = control
+    .runNow({ schedulerId, scheduleId: "reindex", timeoutMs: 5_000 })
+    .then(() => {
+      accepted = true;
+    });
+  await Bun.sleep(250);
+  expect(accepted).toBe(false);
+  expect(starts).toBe(1);
+
+  releaseFirst();
+  await Promise.all([direct, remote]);
+  await waitFor(() => starts === 2);
+});
+
 test("schedulerControl runNow reports unavailable when no live handler exists", async () => {
   const s = makeScheduler(uid("control-unavailable"));
   await s.create({ id: "cleanup", cron: "0 3 * * *", tz: "UTC", process: async () => {} });

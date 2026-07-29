@@ -580,6 +580,48 @@ test("schedulerControl runNow executes on a live scheduler and does not advance 
   expect(events.some((event) => event.type === "started" && event.trigger === "manual")).toBe(true);
 });
 
+test("schedulerControl waits for the cross-handle dispatch lock before acceptance", async () => {
+  const prefix = uid("control-lock-prefix");
+  const schedulerId = uid("control-lock");
+  const options = {
+    prefix,
+    leader: { leaseMs: 500, heartbeatMs: 50 },
+    dispatch: { tickMs: 20 },
+  };
+  const first = makeScheduler(schedulerId, options);
+  const second = makeScheduler(schedulerId, options);
+  let starts = 0;
+  let releaseFirst = (): void => {};
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const process = async (): Promise<void> => {
+    starts += 1;
+    if (starts === 1) await firstGate;
+  };
+
+  await first.create({ id: "reindex", cron: "0 3 * * *", process });
+  await second.create({ id: "reindex", cron: "0 3 * * *", process });
+
+  const direct = first.runNow({ id: "reindex" });
+  await waitFor(() => starts === 1);
+  second.start();
+
+  let accepted = false;
+  const remote = schedulerControl({ prefix })
+    .runNow({ schedulerId, scheduleId: "reindex", timeoutMs: 5_000 })
+    .then(() => {
+      accepted = true;
+    });
+  await Bun.sleep(150);
+  expect(accepted).toBe(false);
+  expect(starts).toBe(1);
+
+  releaseFirst();
+  await Promise.all([direct, remote]);
+  await waitFor(() => starts === 2);
+});
+
 test("schedulerControl runNow reports unavailable when no live handler exists", async () => {
   const prefix = uid("control-unavailable-prefix");
   const s = makeScheduler(uid("control-unavailable"), { prefix });
@@ -983,6 +1025,79 @@ test("manual and cron runs of one schedule are serialized", async () => {
   }
   await manual;
   expect(maxActive).toBe(1);
+});
+
+test("manual runs are serialized across default scheduler handles", async () => {
+  const schedulerId = uid("cross-handle-manual");
+  const options = {
+    leader: { leaseMs: 500, heartbeatMs: 50 },
+    dispatch: { tickMs: 20 },
+  };
+  const first = makeScheduler(schedulerId, options);
+  const second = makeScheduler(schedulerId, options);
+  let active = 0;
+  let maxActive = 0;
+  let starts = 0;
+  let releaseFirst = (): void => {};
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const process = async (): Promise<void> => {
+    active += 1;
+    starts += 1;
+    maxActive = Math.max(maxActive, active);
+    if (starts === 1) await firstGate;
+    active -= 1;
+  };
+
+  await first.create({ id: "serial", cron: "0 3 * * *", process });
+  await second.create({ id: "serial", cron: "0 3 * * *", process });
+
+  const firstRun = first.runNow({ id: "serial" });
+  await waitFor(() => starts === 1);
+  const secondRun = second.runNow({ id: "serial" });
+
+  await Bun.sleep(800);
+  expect(starts).toBe(1);
+  expect(maxActive).toBe(1);
+
+  releaseFirst();
+  await Promise.all([firstRun, secondRun]);
+
+  expect(starts).toBe(2);
+  expect(maxActive).toBe(1);
+  expect((await first.get({ id: "serial" }))?.runNumber).toBe(2);
+});
+
+test("losing the dispatch lease aborts the callback and rejects the run", async () => {
+  const prefix = uid("dispatch-lease-prefix");
+  const schedulerId = uid("dispatch-lease-loss");
+  const store = createMemoryStore();
+  const s = makeScheduler(schedulerId, {
+    prefix,
+    store,
+    leader: { leaseMs: 500, heartbeatMs: 50 },
+  });
+  let started = false;
+  let sawAbort = false;
+
+  await s.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async ({ ctx }) => {
+      started = true;
+      while (!ctx.signal.aborted) await Bun.sleep(10);
+      sawAbort = true;
+    },
+  });
+
+  const run = s.runNow({ id: "report" });
+  await waitFor(() => started);
+  store.del(`${prefix}:dispatch:${schedulerId}:dispatch:report`);
+
+  await expect(run).rejects.toThrow("scheduler dispatch lease lost");
+  expect(sawAbort).toBe(true);
+  expect((await s.get({ id: "report" }))?.runNumber).toBe(0);
 });
 
 // ==========================

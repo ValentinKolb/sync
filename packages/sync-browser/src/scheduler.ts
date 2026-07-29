@@ -1,7 +1,8 @@
 import { mutex, type Lock } from "./mutex";
-import { type Store, createMemoryStore } from "./store";
+import { type Store } from "./store";
 import { expBackoff, type BackoffOptions } from "./retry";
 import { sleep } from "./internal/sleep";
+import { resolveStore, sharedState } from "./internal/shared-state";
 import { assertValidTimeZone, nextCronTimestamp } from "./internal/cron";
 import { emitTrace, type TraceHandler } from "./trace";
 import {
@@ -166,11 +167,6 @@ type HandlerEntry = {
   trace?: TraceHandler<SchedulerTraceEvent<unknown>>;
 };
 
-// Module-level shared maps so multiple scheduler() instances with the same id
-// coordinate (mirror Redis shared namespace on server).
-const sharedSchedules = new Map<string, Map<string, StoredSchedule>>();
-const sharedMutexStores = new Map<string, Store>();
-
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
 
 const asInfo = (schedule: StoredSchedule): SchedulerInfo => ({
@@ -199,31 +195,25 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   );
   const tickMs = normalizeMs(config.dispatch?.tickMs, DEFAULT_TICK_MS, 50);
   const batchSize = Math.max(1, config.dispatch?.batchSize ?? DEFAULT_BATCH_SIZE);
-  const store = config.store ?? createMemoryStore();
+  const store = resolveStore(config.store);
   const instanceId = crypto.randomUUID();
 
   const schedulesKey = `${prefix}:${config.id}:schedules`;
-  if (!sharedSchedules.has(schedulesKey)) {
-    sharedSchedules.set(schedulesKey, new Map());
-  }
-  const schedules = sharedSchedules.get(schedulesKey)!;
-
-  // Leader election coordinates through the caller's store when one is given,
-  // so two handles sharing a store also share the lock. It used to always build
-  // its own MemoryStore, so handles sharing schedule state each held their own
-  // leader lock and both dispatched the same slot.
-  const sharedMutexKey = `${prefix}:${config.id}:leader:store`;
-  if (!sharedMutexStores.has(sharedMutexKey)) {
-    sharedMutexStores.set(sharedMutexKey, createMemoryStore());
-  }
-  const leaderStore = config.store ?? sharedMutexStores.get(sharedMutexKey)!;
+  const schedules = sharedState(schedulesKey, store, () => new Map<string, StoredSchedule>());
 
   const leaderMutex = mutex({
     id: `${config.id}:leader`,
     prefix: `${prefix}:leader`,
     defaultTtl: leaseMs,
     retryCount: 0,
-    store: leaderStore,
+    store,
+  });
+  const dispatchMutex = mutex({
+    id: `${config.id}:dispatch`,
+    prefix: `${prefix}:dispatch`,
+    defaultTtl: leaseMs,
+    retryCount: 0,
+    store,
   });
 
   const persistedStateKey = (scheduleId: string): string =>
@@ -346,122 +336,194 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   };
 
   const dispatchOne = async (
-    schedule: StoredSchedule,
+    source: StoredSchedule,
     handler: HandlerEntry,
     trigger: "cron" | "manual",
+    dispatchLock: Lock,
   ): Promise<void> => {
+    const schedule = { ...source };
     const advanceCron = trigger === "cron";
     const slotTs = schedule.nextRunAt;
+    const expectedRunNumber = schedule.runNumber;
     schedule.runNumber += 1;
     const runNumber = schedule.runNumber;
     const failureCountBefore = schedule.failureCount;
     const startedAt = Date.now();
     const jobAc = new AbortController();
     activeRuns.add(jobAc);
+    let dispatchLeaseLost = false;
+    let heartbeatTail = Promise.resolve();
+    const dispatchHeartbeat = setInterval(() => {
+      heartbeatTail = heartbeatTail
+        .then(async () => {
+          if (dispatchLeaseLost || jobAc.signal.aborted) return;
+          if (await dispatchMutex.extend(dispatchLock, leaseMs)) return;
+          dispatchLeaseLost = true;
+          jobAc.abort();
+        })
+        .catch(() => {
+          dispatchLeaseLost = true;
+          jobAc.abort();
+        });
+    }, Math.max(50, Math.floor(heartbeatMs / 2)));
 
-    const makeCtx = (): ScheduleCtx => {
-      const ctx = {
-        scheduleId: schedule.id,
-        slotTs,
-        runNumber,
-        failureCount: failureCountBefore,
-        trigger,
-        signal: jobAc.signal,
-      } as ScheduleCtx;
-      Object.defineProperty(ctx, "duration", {
-        get: () => Date.now() - startedAt,
-        enumerable: true,
-      });
-      return ctx;
-    };
-
-    const ctx = makeCtx();
-
-    await emitTrace(handler.trace, {
-      type: "started",
-      scheduleId: schedule.id,
-      runNumber,
-      trigger,
-      slotTs,
-    });
-
-    let result: unknown;
-    let error: Error | undefined;
     try {
-      result = await Promise.resolve(handler.process({ ctx }));
-    } catch (err) {
-      error = asError(err);
+      const makeCtx = (): ScheduleCtx => {
+        const ctx = {
+          scheduleId: schedule.id,
+          slotTs,
+          runNumber,
+          failureCount: failureCountBefore,
+          trigger,
+          signal: jobAc.signal,
+        } as ScheduleCtx;
+        Object.defineProperty(ctx, "duration", {
+          get: () => Date.now() - startedAt,
+          enumerable: true,
+        });
+        return ctx;
+      };
+
+      const ctx = makeCtx();
+
+      await emitTrace(handler.trace, {
+        type: "started",
+        scheduleId: schedule.id,
+        runNumber,
+        trigger,
+        slotTs,
+      });
+
+      let result: unknown;
+      let error: Error | undefined;
+      try {
+        result = await Promise.resolve(handler.process({ ctx }));
+      } catch (err) {
+        error = asError(err);
+      }
+
+      if (dispatchLeaseLost) {
+        throw new Error(`scheduler dispatch lease lost for ${schedule.id}`);
+      }
+
+      if (error) {
+        await emitTrace(handler.trace, {
+          type: "failed",
+          scheduleId: schedule.id,
+          runNumber,
+          error,
+          durationMs: Date.now() - startedAt,
+        });
+      } else {
+        await emitTrace(handler.trace, {
+          type: "succeeded",
+          scheduleId: schedule.id,
+          runNumber,
+          data: result,
+          durationMs: Date.now() - startedAt,
+        });
+      }
+
+      let rescheduleRequested: { delayMs?: number } | null = null;
+      const afterCtx: ScheduleAfterCtx<unknown> = Object.create(ctx) as ScheduleAfterCtx<unknown>;
+      if (error) afterCtx.error = error;
+      if (!error) afterCtx.data = result;
+      afterCtx.reschedule = (rcfg?: { delayMs?: number }): void => {
+        rescheduleRequested = { delayMs: rcfg?.delayMs };
+      };
+      afterCtx.expBackoff = (bcfg?: BackoffOptions): number => expBackoff(failureCountBefore + 1, bcfg);
+      afterCtx.metric = metrics;
+
+      if (handler.after) {
+        try {
+          await Promise.resolve(handler.after({ ctx: afterCtx }));
+        } catch {
+          // after errors swallowed
+        }
+      }
+
+      if (dispatchLeaseLost) {
+        throw new Error(`scheduler dispatch lease lost for ${schedule.id}`);
+      }
+
+      if (error) {
+        schedule.failureCount += 1;
+        schedule.lastError = error.message;
+      } else {
+        schedule.failureCount = 0;
+        delete schedule.lastError;
+      }
+
+      let traceRescheduled: { delayMs: number } | null = null;
+      if (rescheduleRequested) {
+        const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
+        schedule.nextRunAt = Date.now() + delayMs;
+        traceRescheduled = { delayMs };
+      } else if (advanceCron) {
+        schedule.nextRunAt = nextCronTimestamp(schedule.cron, schedule.tz, Date.now());
+      }
+
+      schedule.updatedAt = Date.now();
+      const current = schedules.get(schedule.id);
+      if (
+        !current
+        || current.runNumber !== expectedRunNumber
+        || !(await dispatchMutex.extend(dispatchLock, leaseMs))
+      ) {
+        metrics.staleWrites += 1;
+        throw new Error(`scheduler dispatch state changed for ${schedule.id}`);
+      }
+      schedules.set(schedule.id, schedule);
+      writePersistedState(schedule);
+      if (error) metrics.failures += 1;
+      else metrics.dispatches += 1;
+      if (traceRescheduled) metrics.reschedules += 1;
+      if (traceRescheduled) {
+        await emitTrace(handler.trace, {
+          type: "rescheduled",
+          scheduleId: schedule.id,
+          runNumber,
+          delayMs: traceRescheduled.delayMs,
+        });
+      }
     } finally {
+      clearInterval(dispatchHeartbeat);
+      await heartbeatTail;
       jobAc.abort();
       activeRuns.delete(jobAc);
     }
+  };
 
-    if (error) {
-      await emitTrace(handler.trace, {
-        type: "failed",
-        scheduleId: schedule.id,
-        runNumber,
-        error,
-        durationMs: Date.now() - startedAt,
-      });
-    } else {
-      await emitTrace(handler.trace, {
-        type: "succeeded",
-        scheduleId: schedule.id,
-        runNumber,
-        data: result,
-        durationMs: Date.now() - startedAt,
-      });
-    }
-
-    let rescheduleRequested: { delayMs?: number } | null = null;
-    const afterCtx: ScheduleAfterCtx<unknown> = Object.create(ctx) as ScheduleAfterCtx<unknown>;
-    if (error) afterCtx.error = error;
-    if (!error) afterCtx.data = result;
-    afterCtx.reschedule = (rcfg?: { delayMs?: number }): void => {
-      rescheduleRequested = { delayMs: rcfg?.delayMs };
-    };
-    afterCtx.expBackoff = (bcfg?: BackoffOptions): number => expBackoff(failureCountBefore + 1, bcfg);
-    afterCtx.metric = metrics;
-
-    if (handler.after) {
-      try {
-        await Promise.resolve(handler.after({ ctx: afterCtx }));
-      } catch {
-        // after errors swallowed
+  const dispatchSchedule = async (
+    scheduleId: string,
+    handler: HandlerEntry,
+    trigger: "cron" | "manual",
+    options?: {
+      onAcquired?: () => Promise<void> | void;
+      shouldContinue?: () => boolean;
+    },
+  ): Promise<void> => {
+    await serializeDispatch(scheduleId, async () => {
+      let dispatchLock = await dispatchMutex.acquire(scheduleId, leaseMs);
+      if (trigger === "cron" && !dispatchLock) return;
+      while (!dispatchLock) {
+        if (options?.shouldContinue && !options.shouldContinue()) {
+          throw new Error(`scheduler dispatch stopped for ${scheduleId}`);
+        }
+        await sleep(Math.max(25, Math.min(100, Math.floor(heartbeatMs / 2))));
+        dispatchLock = await dispatchMutex.acquire(scheduleId, leaseMs);
       }
-    }
 
-    if (error) {
-      schedule.failureCount += 1;
-      schedule.lastError = error.message;
-      metrics.failures += 1;
-    } else {
-      schedule.failureCount = 0;
-      delete schedule.lastError;
-      metrics.dispatches += 1;
-    }
-
-    let traceRescheduled: { delayMs: number } | null = null;
-    if (rescheduleRequested) {
-      const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);
-      schedule.nextRunAt = Date.now() + delayMs;
-      metrics.reschedules += 1;
-      traceRescheduled = { delayMs };
-    } else if (advanceCron) {
-      schedule.nextRunAt = nextCronTimestamp(schedule.cron, schedule.tz, Date.now());
-    }
-
-    schedule.updatedAt = Date.now();
-    writePersistedState(schedule);
-    if (traceRescheduled) {
-      await emitTrace(handler.trace, {
-        type: "rescheduled",
-        scheduleId: schedule.id,
-        runNumber,
-        delayMs: traceRescheduled.delayMs,
-      });
-    }
+      try {
+        const schedule = schedules.get(scheduleId);
+        if (!schedule) throw new Error(`runNow: schedule ${scheduleId} not found`);
+        if (trigger === "cron" && (!currentLeaderLock || schedule.nextRunAt > Date.now())) return;
+        await options?.onAcquired?.();
+        await dispatchOne(schedule, handler, trigger, dispatchLock);
+      } finally {
+        await dispatchMutex.release(dispatchLock);
+      }
+    });
   };
 
   const dispatchDue = async (): Promise<void> => {
@@ -486,7 +548,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         return;
       }
 
-      await serializeDispatch(schedule.id, () => dispatchOne(schedule, handler, "cron"));
+      await dispatchSchedule(schedule.id, handler, "cron");
     }
   };
 
@@ -610,9 +672,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     const handler = handlers.get(cfg.id);
     if (!handler) throw new Error(`runNow: no handler registered for schedule ${cfg.id}`);
 
-    // Everything that decides acceptance has been checked; the run is now ours.
-    onAccepted?.();
-    await serializeDispatch(cfg.id, () => dispatchOne(schedule, handler, "manual"));
+    await dispatchSchedule(cfg.id, handler, "manual", {
+      onAcquired: onAccepted,
+      ...(onAccepted ? { shouldContinue: () => running } : {}),
+    });
   };
 
   const get = async (cfg: { id: string }): Promise<SchedulerInfo | null> => {

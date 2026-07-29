@@ -435,6 +435,75 @@ test("runNow concurrent with cron dispatch never rewinds nextRunAt or runNumber"
   expect(after.nextRunAt).toBeGreaterThan(slot);
 }, 30_000);
 
+test("manual runs are serialized across scheduler handles for the full callback lease", async () => {
+  const schedId = uid("cross-handle-manual");
+  const options = {
+    leader: { leaseMs: 500, heartbeatMs: 50 },
+    dispatch: { tickMs: 50 },
+  };
+  const first = makeScheduler(schedId, options);
+  const second = makeScheduler(schedId, options);
+  let active = 0;
+  let maxActive = 0;
+  let starts = 0;
+  let releaseFirst = (): void => {};
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const process = async (): Promise<void> => {
+    active += 1;
+    starts += 1;
+    maxActive = Math.max(maxActive, active);
+    if (starts === 1) await firstGate;
+    active -= 1;
+  };
+
+  await first.create({ id: "serial", cron: "0 3 * * *", process });
+  await second.create({ id: "serial", cron: "0 3 * * *", process });
+
+  const firstRun = first.runNow({ id: "serial" });
+  await waitFor(() => starts === 1);
+  const secondRun = second.runNow({ id: "serial" });
+
+  await Bun.sleep(800);
+  expect(starts).toBe(1);
+  expect(maxActive).toBe(1);
+
+  releaseFirst();
+  await Promise.all([firstRun, secondRun]);
+
+  expect(starts).toBe(2);
+  expect(maxActive).toBe(1);
+  expect((await first.get({ id: "serial" }))?.runNumber).toBe(2);
+}, 20_000);
+
+test("losing the dispatch lease aborts the callback and rejects the run", async () => {
+  const schedId = uid("dispatch-lease-loss");
+  const s = makeScheduler(schedId, {
+    leader: { leaseMs: 500, heartbeatMs: 50 },
+  });
+  let started = false;
+  let sawAbort = false;
+
+  await s.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async ({ ctx }) => {
+      started = true;
+      while (!ctx.signal.aborted) await Bun.sleep(10);
+      sawAbort = true;
+    },
+  });
+
+  const run = s.runNow({ id: "report" });
+  await waitFor(() => started);
+  await redis.send("DEL", [`sync:scheduler:dispatch:${schedId}:dispatch:report`]);
+
+  await expect(run).rejects.toThrow("scheduler dispatch lease lost");
+  expect(sawAbort).toBe(true);
+  expect((await s.get({ id: "report" }))?.runNumber).toBe(0);
+}, 20_000);
+
 test("a run whose record advanced underneath it cannot overwrite the newer state", async () => {
   const schedId = uid("stale-persist");
   const s = makeScheduler(schedId);
@@ -467,7 +536,7 @@ test("a run whose record advanced underneath it cannot overwrite the newer state
   await redis.set(`${keyPrefix}:schedule:report`, JSON.stringify(newer));
 
   release();
-  await manual;
+  await expect(manual).rejects.toThrow("scheduler dispatch state changed");
 
   // The parked run's terminal write was derived from runNumber = 0, so it must
   // be refused rather than rewinding the record to its own stale snapshot.
