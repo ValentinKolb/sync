@@ -39,6 +39,15 @@ const PUB_SCRIPT = `
   return eventId
 `;
 
+// XACK only if the entry is still pending for this consumer. XPENDING with an
+// explicit consumer returns that consumer's pending entries in the range, so an
+// empty reply means the claim was lost.
+const COMMIT_SCRIPT = `
+  local pending = redis.call("XPENDING", KEYS[1], ARGV[1], ARGV[2], ARGV[2], 1, ARGV[3])
+  if not pending or #pending == 0 then return 0 end
+  return redis.call("XACK", KEYS[1], ARGV[1], ARGV[2])
+`;
+
 const ENSURED_GROUPS_MAX = 10_000;
 
 const textEncoder = new TextEncoder();
@@ -175,6 +184,17 @@ export type TopicReader<T> = {
   recv(cfg?: TopicRecvConfig): Promise<TopicDelivery<T> | null>;
   reclaim?(cfg?: TopicReclaimConfig): Promise<TopicReclaimResult<T>>;
   stream(cfg?: TopicRecvConfig): AsyncIterable<TopicDelivery<T>>;
+  /** Release the reader's blocking connection. Idempotent. */
+  close(): Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
+};
+
+export type TopicReaderConfig = {
+  /**
+   * Stable consumer name. Defaults to a fresh per-reader name, which Redis
+   * retains in the group registry until the consumer is deleted.
+   */
+  consumerId?: string;
 };
 
 export type RecoverableTopicReader<T> = TopicReader<T> & {
@@ -184,12 +204,12 @@ export type RecoverableTopicReader<T> = TopicReader<T> & {
 export type Topic<T> = {
   pub(cfg: TopicPubConfig<T>): Promise<{ eventId: string; cursor: string }>;
   latestCursor(cfg?: TopicCursorConfig): Promise<string | null>;
-  reader(group?: string): TopicReader<T>;
+  reader(group?: string, cfg?: TopicReaderConfig): TopicReader<T>;
   live(cfg?: TopicLiveConfig): AsyncIterable<TopicLiveEvent<T>>;
 };
 
 export type RecoverableTopic<T> = Omit<Topic<T>, "reader"> & {
-  reader(group?: string): RecoverableTopicReader<T>;
+  reader(group?: string, cfg?: TopicReaderConfig): RecoverableTopicReader<T>;
 };
 
 type StoredEvent<T> = {
@@ -240,6 +260,18 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
   const streamKey = (tenantId: string): string => `${prefix}:${tenantId}:${config.id}:stream`;
   const idempotencyKey = (tenantId: string, key: string): string => `${prefix}:${tenantId}:${config.id}:idempotency:${key}`;
   const ensuredGroups = new Set<string>();
+
+  const forgetGroup = (key: string, group: string): void => {
+    ensuredGroups.delete(`${key}:${group}`);
+  };
+
+  /**
+   * A NOGROUP means the group vanished under us — a Redis restart without
+   * persistence, an eviction, a FLUSHDB. The cache still claimed it existed, and
+   * NOGROUP is not a retryable transport error, so every later read failed and
+   * the reader stayed broken until the process restarted.
+   */
+  const isNoGroupError = (error: unknown): boolean => asError(error).message.includes("NOGROUP");
 
   const ensureGroup = async (key: string, group: string): Promise<void> => {
     const ensuredKey = `${key}:${group}`;
@@ -325,9 +357,16 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     return parseFirstRangeEntry(raw)?.id ?? null;
   };
 
-  const reader = (group = "default"): RecoverableTopicReader<TData> => {
-    const consumer = `consumer:${process.pid}:${randomUUID()}`;
+  const reader = (group = "default", readerCfg: TopicReaderConfig = {}): RecoverableTopicReader<TData> => {
+    // A fresh name per reader() call leaves a consumer record behind in the
+    // group registry forever, because nothing ever issues XGROUP DELCONSUMER.
+    // Callers with a stable identity can supply one; close() cleans up the rest.
+    const consumer = readerCfg.consumerId ?? `consumer:${process.pid}:${randomUUID()}`;
     let blockingClient: RedisClient | null = null;
+    // Number of stream() loops currently using the blocking client. Without it,
+    // the first loop to exit closed the socket a concurrent loop was blocked on.
+    let blockingUsers = 0;
+    let closed = false;
 
     const resetBlockingClient = (): void => {
       if (!blockingClient) return;
@@ -335,12 +374,46 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       blockingClient = null;
     };
 
+    const releaseBlockingClient = (): void => {
+      blockingUsers = Math.max(0, blockingUsers - 1);
+      if (blockingUsers === 0) resetBlockingClient();
+    };
+
     const ensureBlockingClient = async (): Promise<RedisClient> => {
       if (blockingClient?.connected) return blockingClient;
       resetBlockingClient();
-      blockingClient = new RedisClient();
-      await blockingClient.connect();
-      return blockingClient;
+      const client = new RedisClient();
+      blockingClient = client;
+      await client.connect();
+      // Return the local handle: a concurrent reset may already have cleared the
+      // slot while this connect was in flight, which made callers see null and
+      // throw an opaque TypeError no transport-error check could match.
+      return client;
+    };
+
+    /**
+     * Release this reader's dedicated blocking connection, and drop its consumer
+     * record when it holds nothing. Without it, `const m = await topic
+     * .reader("g").recv({ timeoutMs })` in a request handler leaked one Redis
+     * connection per request until the process hit its fd or maxclients limit.
+     *
+     * A consumer with pending entries is deliberately left in place: deleting it
+     * would remove those entries from the group PEL, where they can never be
+     * redelivered or reclaimed again.
+     */
+    const close = async (): Promise<void> => {
+      if (closed) return;
+      closed = true;
+      blockingUsers = 0;
+      resetBlockingClient();
+      try {
+        const key = streamKey(resolveTenant());
+        const pending = await redis.send("XPENDING", [key, group, "-", "+", "1", consumer]);
+        if (Array.isArray(pending) && pending.length > 0) return;
+        await redis.send("XGROUP", ["DELCONSUMER", key, group, consumer]);
+      } catch {
+        // Best effort: the group or stream may be gone already.
+      }
     };
 
     const blockingReadGroup = async (args: string[], signal?: AbortSignal): Promise<unknown> => {
@@ -363,8 +436,20 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       }
     };
 
-    const createCommit = (key: string, eventId: string) => async (): Promise<boolean> => {
-      const acked = await redis.send("XACK", [key, group, eventId]);
+    // A bare XACK let a stalled consumer acknowledge an entry another consumer
+    // had already reclaimed: the entry left the group PEL entirely, so if the
+    // new owner then died it was in nobody's PEL, could never be redelivered and
+    // could never be reclaimed. The commit is refused unless this consumer still
+    // owns the pending entry.
+    const createCommit = (key: string, eventId: string, owner: string) => async (): Promise<boolean> => {
+      const acked = await redis.send("EVAL", [
+        COMMIT_SCRIPT,
+        "1",
+        key,
+        group,
+        eventId,
+        owner,
+      ]);
       return Number(acked) > 0;
     };
 
@@ -376,10 +461,10 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       orderingKey: stored.orderingKey,
       publishedAt: stored.publishedAt,
       meta: stored.meta,
-      commit: createCommit(key, entry.id),
+      commit: createCommit(key, entry.id, consumer),
     });
 
-    const recv = async (recvCfg: TopicRecvConfig = {}): Promise<TopicDelivery<TData> | null> => {
+    const recv = async (recvCfg: TopicRecvConfig = {}, retriedAfterNoGroup = false): Promise<TopicDelivery<TData> | null> => {
       const tenantId = resolveTenant(recvCfg.tenantId);
       const key = streamKey(tenantId);
       await ensureGroup(key, group);
@@ -387,23 +472,30 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       const wait = recvCfg.wait ?? true;
       const timeoutMs = recvCfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-      const result = wait
-        ? await blockingReadGroup(
-            [
-              "GROUP",
-              group,
-              consumer,
-              "COUNT",
-              "1",
-              "BLOCK",
-              timeoutMs.toString(),
-              "STREAMS",
-              key,
-              ">",
-            ],
-            recvCfg.signal,
-          )
-        : await redis.send("XREADGROUP", ["GROUP", group, consumer, "COUNT", "1", "STREAMS", key, ">"]);
+      let result: unknown;
+      try {
+        result = wait
+          ? await blockingReadGroup(
+              [
+                "GROUP",
+                group,
+                consumer,
+                "COUNT",
+                "1",
+                "BLOCK",
+                timeoutMs.toString(),
+                "STREAMS",
+                key,
+                ">",
+              ],
+              recvCfg.signal,
+            )
+          : await redis.send("XREADGROUP", ["GROUP", group, consumer, "COUNT", "1", "STREAMS", key, ">"]);
+      } catch (error) {
+        if (retriedAfterNoGroup || !isNoGroupError(error)) throw error;
+        forgetGroup(key, group);
+        return await recv(recvCfg, true);
+      }
 
       const entry = parseFirstStreamEntry(result);
       if (!entry) return null;
@@ -411,8 +503,12 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       const stored = parsePayload(entry);
       if (!stored.ok) {
         if (recvCfg.invalidPayload === "throw") throw new TopicPayloadError(entry.id, stored.error, stored.rawPayload);
-        await createCommit(key, entry.id)();
-        return null;
+        // Acknowledge and keep draining. Returning null here conflated "poison,
+        // skipped" with "nothing available", so a non-waiting stream() treated
+        // one bad envelope as end-of-drain and yielded nothing at all — making
+        // exactly one message of progress per run on a 500-message backlog.
+        await createCommit(key, entry.id, consumer)();
+        return await recv(recvCfg, retriedAfterNoGroup);
       }
       return createDelivery(entry, stored.value, key);
     };
@@ -449,7 +545,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
             deliveryId: `${group}:${entry.id}`,
             error: stored.error,
             rawPayload: stored.rawPayload,
-            commit: createCommit(key, entry.id),
+            commit: createCommit(key, entry.id, consumer),
           };
         }
         return {
@@ -462,6 +558,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
 
     const stream = async function* (streamCfg: TopicRecvConfig = {}): AsyncIterable<TopicDelivery<TData>> {
       const wait = streamCfg.wait ?? true;
+      blockingUsers += 1;
       try {
         while (!streamCfg.signal?.aborted) {
           const message = wait
@@ -482,7 +579,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
           if (!wait) break;
         }
       } finally {
-        resetBlockingClient();
+        releaseBlockingClient();
       }
     };
 
@@ -491,6 +588,8 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       recv,
       reclaim,
       stream,
+      close,
+      [Symbol.asyncDispose]: close,
     };
   };
 

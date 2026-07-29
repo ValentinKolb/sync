@@ -2,6 +2,11 @@ import { beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
 import { TopicPayloadError, topic } from "../index";
 
+const connectedClients = async (): Promise<number> => {
+  const info = (await redis.send("INFO", ["clients"])) as string;
+  return Number(/connected_clients:(\d+)/.exec(info)?.[1] ?? 0);
+};
+
 beforeEach(async () => {
   const keys = await redis.send("KEYS", ["test:t:*"]);
   if (Array.isArray(keys) && keys.length > 0) {
@@ -642,4 +647,109 @@ test("a topic retention longer than the epoch does not break pub", async () => {
   const reader = t.reader("clamp");
   const message = await reader.recv({ wait: false });
   expect(message?.data).toEqual({ v: 1 });
+});
+
+// ==========================
+// Delivery ownership and reader lifecycle
+// ==========================
+
+test("a stale consumer cannot commit an entry another consumer reclaimed", async () => {
+  const t = topic<{ v: number }>({ id: `fenced-commit-${Date.now()}`, prefix: "test:t" });
+
+  await t.pub({ data: { v: 1 } });
+
+  const a = t.reader("workers", { consumerId: "consumer-a" });
+  const b = t.reader("workers", { consumerId: "consumer-b" });
+
+  const delivered = await a.recv({ wait: false });
+  expect(delivered).not.toBeNull();
+
+  // B takes the stalled delivery over.
+  const reclaimed = await b.reclaim({ minIdleMs: 0 });
+  expect(reclaimed.entries.length).toBe(1);
+
+  // A wakes and commits. A bare XACK succeeded here and removed the entry from
+  // the group PEL entirely, so if B then died it was in nobody's PEL and could
+  // never be redelivered or reclaimed again.
+  expect(await delivered!.commit()).toBe(false);
+
+  // Still owned by B, so still recoverable.
+  const stillThere = await b.reclaim({ minIdleMs: 0 });
+  expect(stillThere.entries.length).toBe(1);
+
+  await a.close();
+  await b.close();
+});
+
+test("stream({ wait: false }) drains past a poison payload instead of stopping", async () => {
+  const id = `poison-drain-${Date.now()}`;
+  const t = topic<{ v: number }>({ id, prefix: "test:t" });
+  const key = `test:t:default:${id}:stream`;
+
+  // A malformed envelope at the head of a backlog.
+  await redis.send("XADD", [key, "*", "payload", "not-json"]);
+  for (const v of [1, 2, 3]) await t.pub({ data: { v } });
+
+  const reader = t.reader("drain");
+  const seen: number[] = [];
+  for await (const message of reader.stream({ wait: false })) {
+    seen.push(message.data.v);
+    await message.commit();
+  }
+  await reader.close();
+
+  // One bad envelope used to end the drain, yielding nothing at all.
+  expect(seen).toEqual([1, 2, 3]);
+});
+
+test("reader.close releases the blocking connection", async () => {
+  const t = topic<{ v: number }>({ id: `close-conn-${Date.now()}`, prefix: "test:t" });
+
+  const clientsBefore = await connectedClients();
+  const readers = Array.from({ length: 6 }, (_, i) => t.reader(`g${i}`));
+  for (const reader of readers) {
+    await reader.recv({ wait: true, timeoutMs: 50 });
+  }
+  const clientsDuring = await connectedClients();
+  expect(clientsDuring).toBeGreaterThan(clientsBefore);
+
+  await Promise.all(readers.map((reader) => reader.close()));
+  await Bun.sleep(200);
+
+  // Without close() there was no way to reach the socket at all, so a reader
+  // created per request leaked one connection per request.
+  expect(await connectedClients()).toBeLessThan(clientsDuring);
+});
+
+test("two concurrent streams from one reader do not close each other's connection", async () => {
+  const id = `shared-stream-${Date.now()}`;
+  const t = topic<{ v: number }>({ id, prefix: "test:t" });
+  const reader = t.reader("shared");
+
+  const firstAc = new AbortController();
+  const collected: number[] = [];
+
+  const consume = async (signal?: AbortSignal): Promise<void> => {
+    for await (const message of reader.stream({ wait: true, timeoutMs: 200, signal })) {
+      collected.push(message.data.v);
+      await message.commit();
+    }
+  };
+
+  const first = consume(firstAc.signal);
+  const secondAc = new AbortController();
+  const second = consume(secondAc.signal);
+
+  await Bun.sleep(100);
+  firstAc.abort();
+  await first;
+
+  // The surviving loop must keep working on a socket the other one closed.
+  await t.pub({ data: { v: 42 } });
+  await Bun.sleep(400);
+  secondAc.abort();
+  await second;
+  await reader.close();
+
+  expect(collected).toContain(42);
 });

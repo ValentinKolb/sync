@@ -117,6 +117,14 @@ export type TopicReader<T> = {
   recv(cfg?: TopicRecvConfig): Promise<TopicDelivery<T> | null>;
   reclaim?(cfg?: TopicReclaimConfig): Promise<TopicReclaimResult<T>>;
   stream(cfg?: TopicRecvConfig): AsyncIterable<TopicDelivery<T>>;
+  /** Release reader resources. Idempotent. In-memory readers hold no connection. */
+  close(): Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
+};
+
+export type TopicReaderConfig = {
+  /** Stable consumer name. Accepted for parity; in-memory readers keep no registry. */
+  consumerId?: string;
 };
 
 export type RecoverableTopicReader<T> = TopicReader<T> & {
@@ -126,12 +134,12 @@ export type RecoverableTopicReader<T> = TopicReader<T> & {
 export type Topic<T> = {
   pub(cfg: TopicPubConfig<T>): Promise<{ eventId: string; cursor: string }>;
   latestCursor(cfg?: TopicCursorConfig): Promise<string | null>;
-  reader(group?: string): TopicReader<T>;
+  reader(group?: string, cfg?: TopicReaderConfig): TopicReader<T>;
   live(cfg?: TopicLiveConfig): AsyncIterable<TopicLiveEvent<T>>;
 };
 
 export type RecoverableTopic<T> = Omit<Topic<T>, "reader"> & {
-  reader(group?: string): RecoverableTopicReader<T>;
+  reader(group?: string, cfg?: TopicReaderConfig): RecoverableTopicReader<T>;
 };
 
 // ==========================
@@ -234,7 +242,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
   // reader
   // ==========================
 
-  const reader = (group = "default"): RecoverableTopicReader<TData> => {
+  const reader = (group = "default", _readerCfg: TopicReaderConfig = {}): RecoverableTopicReader<TData> => {
     const consumerId = `consumer:${randomId()}`;
     const cursors = new Map<string, string>();
     const getCursor = (tenantId: string): string => cursors.get(tenantId) ?? "0";
@@ -327,7 +335,12 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       return { nextCursor: "0-0", entries: [] };
     };
 
-    return { group, recv, reclaim, stream };
+    const close = async (): Promise<void> => {
+      // No connection to release in memory; present so the same teardown code
+      // works on both runtimes.
+    };
+
+    return { group, recv, reclaim, stream, close, [Symbol.asyncDispose]: close };
   };
 
   // ==========================

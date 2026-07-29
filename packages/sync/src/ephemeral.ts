@@ -404,6 +404,9 @@ export type EphemeralEvent<T> =
 export type EphemeralReader<T> = {
   recv(cfg?: EphemeralRecvConfig): Promise<EphemeralEvent<T> | null>;
   stream(cfg?: EphemeralRecvConfig): AsyncIterable<EphemeralEvent<T>>;
+  /** Release the reader's blocking connection. Idempotent. */
+  close(): Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
 };
 
 export type EphemeralStore<T> = {
@@ -782,12 +785,35 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       blockingClient = null;
     };
 
+    // Number of stream() loops currently using the blocking client. Without it,
+    // the first loop to exit closed the socket a concurrent loop was blocked on.
+    let blockingUsers = 0;
+
+    const releaseBlockingClient = (): void => {
+      blockingUsers = Math.max(0, blockingUsers - 1);
+      if (blockingUsers === 0) resetBlockingClient();
+    };
+
     const ensureBlockingClient = async (): Promise<RedisClient> => {
       if (blockingClient?.connected) return blockingClient;
       resetBlockingClient();
-      blockingClient = new RedisClient();
-      await blockingClient.connect();
-      return blockingClient;
+      const client = new RedisClient();
+      blockingClient = client;
+      await client.connect();
+      // Return the local handle: a concurrent reset may already have cleared the
+      // slot while this connect was in flight.
+      return client;
+    };
+
+    /**
+     * Release this reader's dedicated blocking connection. Without it, a reader
+     * created per request leaked one Redis connection per request until the
+     * process hit its fd or maxclients limit, and every other Redis user in the
+     * process started failing far from the code that caused it.
+     */
+    const close = async (): Promise<void> => {
+      blockingUsers = 0;
+      resetBlockingClient();
     };
 
     /**
@@ -881,6 +907,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
 
     const stream = async function* (cfg: EphemeralRecvConfig = {}): AsyncIterable<EphemeralEvent<TData>> {
       const wait = cfg.wait ?? true;
+      blockingUsers += 1;
       try {
         while (!cfg.signal?.aborted) {
           const event = wait
@@ -901,11 +928,11 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
           if (!wait) break;
         }
       } finally {
-        resetBlockingClient();
+        releaseBlockingClient();
       }
     };
 
-    return { recv, stream };
+    return { recv, stream, close, [Symbol.asyncDispose]: close };
   };
 
   return {

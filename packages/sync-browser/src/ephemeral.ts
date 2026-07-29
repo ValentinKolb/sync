@@ -92,6 +92,9 @@ export type EphemeralEvent<T> =
 export type EphemeralReader<T> = {
   recv(cfg?: EphemeralRecvConfig): Promise<EphemeralEvent<T> | null>;
   stream(cfg?: EphemeralRecvConfig): AsyncIterable<EphemeralEvent<T>>;
+  /** Release reader resources. Idempotent. In-memory readers hold no connection. */
+  close(): Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
 };
 
 export type EphemeralStore<T> = {
@@ -544,7 +547,12 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       }
     };
 
-    return { recv, stream };
+    const close = async (): Promise<void> => {
+      // No connection to release in memory; present so the same teardown code
+      // works on both runtimes.
+    };
+
+    return { recv, stream, close, [Symbol.asyncDispose]: close };
   };
 
   return { upsert, touch, remove, snapshot, reader };
