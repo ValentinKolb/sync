@@ -181,6 +181,7 @@ test("isRetryableTransportError catches common transport errors by code", () => 
   expect(isRetryableTransportError({ code: "ETIMEDOUT" })).toBe(true);
   expect(isRetryableTransportError({ code: "ECONNREFUSED" })).toBe(true);
   expect(isRetryableTransportError({ code: "ENOTFOUND" })).toBe(true);
+  expect(isRetryableTransportError({ code: "LOADING" })).toBe(true);
   expect(isRetryableTransportError({ code: "EOTHER" })).toBe(false);
 });
 
@@ -190,6 +191,7 @@ test("isRetryableTransportError catches common transport errors by message", () 
   expect(isRetryableTransportError(new Error("LOADING Redis is starting"))).toBe(true);
   expect(isRetryableTransportError(new Error("TRYAGAIN"))).toBe(true);
   expect(isRetryableTransportError(new Error("CLUSTERDOWN"))).toBe(true);
+  expect(isRetryableTransportError(new Error("MASTERDOWN unavailable"))).toBe(true);
   expect(isRetryableTransportError(new Error("some logic error"))).toBe(false);
 });
 
@@ -218,6 +220,10 @@ test("isRetryableTransportError does not misclassify application errors", () => 
   // so a user error was replayed silently as a transport blip.
   expect(isRetryableTransportError(new Error("invalid connection string in config"))).toBe(false);
   expect(isRetryableTransportError(new Error("error loading user profile"))).toBe(false);
+  expect(isRetryableTransportError(new Error("Loading user profile failed"))).toBe(false);
+  expect(isRetryableTransportError(new Error("TRYAGAINLater is an application error"))).toBe(false);
+  expect(isRetryableTransportError(new Error("CLUSTERDOWNSTREAM failed"))).toBe(false);
+  expect(isRetryableTransportError(new Error("MASTERDOWNSTREAM failed"))).toBe(false);
   expect(isRetryableTransportError(new Error("socket must be a string"))).toBe(false);
   expect(isRetryableTransportError(new Error("network policy denied"))).toBe(false);
 

@@ -9,6 +9,11 @@ export interface Store {
   keys(prefix?: string): string[];
 }
 
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+const nextTimerDelay = (expiresAt: number): number =>
+  Math.min(MAX_TIMER_DELAY_MS, Math.max(0, expiresAt - Date.now()));
+
 // ==========================
 // MemoryStore
 // ==========================
@@ -52,6 +57,24 @@ export class MemoryStore implements Store {
   private data = new Map<string, Entry>();
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
 
+  private scheduleExpiry(key: string, expiresAt: number): void {
+    const timer = setTimeout(() => {
+      if (this.timers.get(key) !== timer) return;
+
+      const entry = this.data.get(key);
+      if (!entry || entry.expiresAt !== expiresAt) {
+        this.timers.delete(key);
+        return;
+      }
+      if (Date.now() < expiresAt) {
+        this.scheduleExpiry(key, expiresAt);
+        return;
+      }
+      this.del(key);
+    }, nextTimerDelay(expiresAt));
+    this.timers.set(key, timer);
+  }
+
   get(key: string): unknown | undefined {
     const entry = this.data.get(key);
     if (!entry) return undefined;
@@ -76,12 +99,7 @@ export class MemoryStore implements Store {
     const expiresAt = ttlMs != null && ttlMs > 0 ? Date.now() + ttlMs : null;
     this.data.set(key, { value: snapshot(value), expiresAt });
 
-    if (ttlMs != null && ttlMs > 0) {
-      this.timers.set(
-        key,
-        setTimeout(() => this.del(key), ttlMs),
-      );
-    }
+    if (expiresAt !== null) this.scheduleExpiry(key, expiresAt);
   }
 
   del(key: string): void {
@@ -142,6 +160,36 @@ export class LocalStorageStore implements Store {
     return `${this.prefix}:${key}`;
   }
 
+  private scheduleExpiry(key: string, expiresAt: number): void {
+    const timer = setTimeout(() => {
+      if (this.timers.get(key) !== timer) return;
+
+      const raw = localStorage.getItem(this.storageKey(key));
+      if (raw === null) {
+        this.timers.delete(key);
+        return;
+      }
+
+      try {
+        const entry = JSON.parse(raw) as StoredValue;
+        if (entry.expiresAt !== expiresAt) {
+          this.timers.delete(key);
+          return;
+        }
+      } catch {
+        this.timers.delete(key);
+        return;
+      }
+
+      if (Date.now() < expiresAt) {
+        this.scheduleExpiry(key, expiresAt);
+        return;
+      }
+      this.del(key);
+    }, nextTimerDelay(expiresAt));
+    this.timers.set(key, timer);
+  }
+
   get(key: string): unknown | undefined {
     const raw = localStorage.getItem(this.storageKey(key));
     if (raw === null) return undefined;
@@ -181,12 +229,7 @@ export class LocalStorageStore implements Store {
       throw new StoreWriteError(key, error);
     }
 
-    if (ttlMs != null && ttlMs > 0) {
-      this.timers.set(
-        key,
-        setTimeout(() => this.del(key), ttlMs),
-      );
-    }
+    if (expiresAt !== null) this.scheduleExpiry(key, expiresAt);
   }
 
   del(key: string): void {

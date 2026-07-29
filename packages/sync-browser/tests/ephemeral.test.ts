@@ -234,9 +234,8 @@ describe("payload size limit", () => {
 describe("reader", () => {
   test("receives upsert events", async () => {
     const store = makeStore();
-
-    // Create reader before any writes so it captures everything from cursor "0"
-    const reader = store.reader({ after: "0" });
+    await store.upsert({ key: "anchor", value: { status: "offline" } });
+    const reader = store.reader({ after: (await store.snapshot()).cursor });
 
     await store.upsert({ key: "user1", value: { status: "online" } });
     await store.upsert({ key: "user2", value: { status: "away" } });
@@ -291,8 +290,8 @@ describe("reader", () => {
 
   test("receives expire events after TTL", async () => {
     const store = makeStore({ id: "expire-reader", ttlMs: 100 });
-
-    const reader = store.reader({ after: "0" });
+    await store.upsert({ key: "anchor", value: { status: "stable" }, ttlMs: 5_000 });
+    const reader = store.reader({ after: (await store.snapshot()).cursor });
 
     await store.upsert({ key: "temp", value: { status: "ephemeral" } });
 
@@ -381,9 +380,44 @@ test("reader receives overflow event when cursor falls behind", async () => {
   const reader = store.reader({ after: oldCursor });
   const event = await reader.recv({ wait: false });
 
-  // Depending on whether the log trimmed the cursor,
-  // we should either get an overflow event or the next available event
-  expect(event).not.toBeNull();
+  expect(event?.type).toBe("overflow");
+});
+
+test("origin cursor emits overflow for an untrimmed stream", async () => {
+  const store = ephemeral<{ status: string }>({
+    id: `overflow-origin-full-${Date.now()}`,
+    ttlMs: 60_000,
+  });
+  await store.upsert({ key: "a", value: { status: "on" } });
+
+  const reader = store.reader({ after: "0-0" });
+  const event = await reader.recv({ wait: false });
+
+  expect(event?.type).toBe("overflow");
+  if (event?.type === "overflow") {
+    expect(event.after).toBe("0-0");
+    expect(event.firstAvailable).toBe("1");
+  }
+  expect(await reader.recv({ wait: false })).toBeNull();
+});
+
+test("origin cursor emits overflow for a trimmed stream", async () => {
+  const store = ephemeral<{ n: number }>({
+    id: `overflow-origin-trimmed-${Date.now()}`,
+    ttlMs: 60_000,
+    limits: { eventMaxLen: 2 },
+  });
+  await store.upsert({ key: "a", value: { n: 1 } });
+  await store.upsert({ key: "b", value: { n: 2 } });
+  await store.upsert({ key: "c", value: { n: 3 } });
+
+  const event = await store.reader({ after: "0-0" }).recv({ wait: false });
+
+  expect(event?.type).toBe("overflow");
+  if (event?.type === "overflow") {
+    expect(event.after).toBe("0-0");
+    expect(event.firstAvailable).toBe("2");
+  }
 });
 
 test("empty key throws", async () => {
@@ -429,12 +463,27 @@ test("fractional ttlMs is rejected at the factory and call sites", async () => {
   ).toThrow(/positive integer/);
 });
 
+test("ttl beyond the native timer limit does not expire early", async () => {
+  const store = ephemeral<{ v: number }>({
+    id: `large-timer-${Date.now()}`,
+    ttlMs: 2_147_483_648,
+  });
+  await store.upsert({ key: "k", value: { v: 1 } });
+
+  await Bun.sleep(10);
+
+  expect((await store.snapshot()).entries[0]?.value).toEqual({ v: 1 });
+  await store.remove({ key: "k" });
+});
+
 test("stored and returned values are isolated JSON snapshots", async () => {
   const store = ephemeral<{ nested: { value: number } }>({
     id: `json-snapshot-${Date.now()}`,
     ttlMs: 5_000,
   });
-  const reader = store.reader({ after: "0" });
+  await store.upsert({ key: "anchor", value: { nested: { value: 0 } } });
+  await store.remove({ key: "anchor" });
+  const reader = store.reader({ after: (await store.snapshot()).cursor });
   const input = { nested: { value: 1 } };
   const returned = await store.upsert({ key: "k", value: input });
 
@@ -452,6 +501,23 @@ test("stored and returned values are isolated JSON snapshots", async () => {
   expect(first.entries[0]?.value.nested.value).toBe(1);
   first.entries[0]!.value.nested.value = 5;
   expect((await store.snapshot()).entries[0]?.value.nested.value).toBe(1);
+});
+
+test("payload errors take precedence over capacity errors", async () => {
+  const store = ephemeral<unknown>({
+    id: `payload-precedence-${Date.now()}`,
+    ttlMs: 5_000,
+    limits: { maxEntries: 1, maxPayloadBytes: 16 },
+  });
+  await store.upsert({ key: "full", value: 1 });
+
+  await expect(store.upsert({ key: "large", value: "x".repeat(100) })).rejects.toBeInstanceOf(
+    EphemeralPayloadTooLargeError,
+  );
+
+  const cyclic: { self?: unknown } = {};
+  cyclic.self = cyclic;
+  await expect(store.upsert({ key: "cyclic", value: cyclic })).rejects.toBeInstanceOf(TypeError);
 });
 
 // ==========================
@@ -662,11 +728,11 @@ test("a reader that falls behind after a healthy read gets overflow", async () =
     ttlMs: 60_000,
     limits: { eventMaxLen: 2 },
   });
-  const reader = store.reader();
-
-  expect(await reader.recv({ wait: false })).toBeNull();
+  await store.upsert({ key: "seed", value: { n: 0 } });
+  const reader = store.reader({ after: (await store.snapshot()).cursor });
   await store.upsert({ key: "a", value: { n: 1 } });
-  expect((await reader.recv({ wait: false }))?.type).toBe("upsert");
+  const consumed = await reader.recv({ wait: false });
+  expect(consumed?.type).toBe("upsert");
 
   await store.upsert({ key: "b", value: { n: 2 } });
   await store.upsert({ key: "c", value: { n: 3 } });
@@ -674,5 +740,5 @@ test("a reader that falls behind after a healthy read gets overflow", async () =
 
   const event = await reader.recv({ wait: false });
   expect(event?.type).toBe("overflow");
-  if (event?.type === "overflow") expect(event.after).toBe("1");
+  if (event?.type === "overflow") expect(event.after).toBe(consumed?.cursor);
 });

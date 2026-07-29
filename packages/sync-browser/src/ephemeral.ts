@@ -7,6 +7,7 @@ const DEFAULT_EVENT_RETENTION_MS = 5 * 60 * 1000;
 const DEFAULT_EVENT_MAXLEN = 50_000;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_KEY_BYTES = 512;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 const textEncoder = new TextEncoder();
 
@@ -229,29 +230,37 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     }
   };
 
-  const scheduleExpiry = (state: TenantState<TData>, logicalKey: string, ttlMs: number): void => {
-    // Clear existing timer
+  const armExpiry = (state: TenantState<TData>, logicalKey: string, expiresAt: number): void => {
+    const delayMs = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, expiresAt - Date.now()));
+    const timer = setTimeout(() => {
+      if (state.timers.get(logicalKey) !== timer) return;
+
+      const entry = state.entries.get(logicalKey);
+      if (!entry || entry.expiresAt !== expiresAt) {
+        state.timers.delete(logicalKey);
+        return;
+      }
+      if (Date.now() < expiresAt) {
+        armExpiry(state, logicalKey, expiresAt);
+        return;
+      }
+
+      state.entries.delete(logicalKey);
+      state.timers.delete(logicalKey);
+      state.eventLog.append({
+        type: "expire",
+        key: logicalKey,
+        version: String(++state.seq),
+        expiredAt: Date.now(),
+      });
+    }, delayMs);
+    state.timers.set(logicalKey, timer);
+  };
+
+  const scheduleExpiry = (state: TenantState<TData>, logicalKey: string, expiresAt: number): void => {
     const existing = state.timers.get(logicalKey);
     if (existing) clearTimeout(existing);
-
-    state.timers.set(
-      logicalKey,
-      setTimeout(() => {
-        const entry = state.entries.get(logicalKey);
-        if (!entry) return;
-
-        state.entries.delete(logicalKey);
-        state.timers.delete(logicalKey);
-
-        const version = String(++state.seq);
-        state.eventLog.append({
-          type: "expire",
-          key: logicalKey,
-          version,
-          expiredAt: Date.now(),
-        });
-      }, ttlMs),
-    );
+    armExpiry(state, logicalKey, expiresAt);
   };
 
   // ==========================
@@ -268,15 +277,14 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     const ttlMs = cfg.ttlMs ?? config.ttlMs;
     assertTtlMs(ttlMs);
 
-    // Capacity check
-    if (!state.entries.has(cfg.key) && state.entries.size >= maxEntries) {
-      throw new EphemeralCapacityError(`maxEntries (${maxEntries}) reached`);
-    }
-
     const payloadRaw = serializeValue(cfg.value);
     const payloadBytes = textEncoder.encode(payloadRaw).byteLength;
     if (payloadBytes > maxPayloadBytes) {
       throw new EphemeralPayloadTooLargeError(`payload exceeds limit (${maxPayloadBytes} bytes)`);
+    }
+
+    if (!state.entries.has(cfg.key) && state.entries.size >= maxEntries) {
+      throw new EphemeralCapacityError(`maxEntries (${maxEntries}) reached`);
     }
 
     const now = Date.now();
@@ -297,7 +305,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     };
 
     state.entries.set(cfg.key, stored);
-    scheduleExpiry(state, cfg.key, ttlMs);
+    scheduleExpiry(state, cfg.key, expiresAt);
 
     state.eventLog.append({
       type: "upsert",
@@ -344,7 +352,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     existing.updatedAt = now;
     existing.expiresAt = expiresAt;
 
-    scheduleExpiry(state, cfg.key, ttlMs);
+    scheduleExpiry(state, cfg.key, expiresAt);
 
     state.eventLog.append({
       type: "touch",
@@ -462,11 +470,10 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       const earliest = state.eventLog.earliest();
       if (!earliest) return;
 
-      // "0" and the documented "0-0" both mean "replay everything", which is an
-      // overflow whenever the log has already been trimmed. Number("0-0") is
-      // NaN, so the old comparison silently read from the beginning instead.
+      // Match the server's origin-cursor contract: "0" and "0-0" request a
+      // snapshot reset and therefore emit overflow for every non-empty log.
       const replayAll = after === "0" || after === "0-0";
-      if (replayAll ? Number(earliest) > 1 : !state.eventLog.has(after) && Number(after) < Number(earliest)) {
+      if (replayAll || (!state.eventLog.has(after) && Number(after) < Number(earliest))) {
         const liveCursor = state.eventLog.latest();
         overflowPending = {
           type: "overflow",

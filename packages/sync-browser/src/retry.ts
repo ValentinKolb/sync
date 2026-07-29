@@ -45,6 +45,8 @@ const parseCode = (error: unknown): string => {
   return typeof code === "string" ? code.toUpperCase() : "";
 };
 
+const RETRYABLE_REDIS_CODES = new Set(["LOADING", "TRYAGAIN", "CLUSTERDOWN", "MASTERDOWN"]);
+
 export const isRetryableTransportError = (error: unknown): boolean => {
   const code = parseCode(error);
   if (
@@ -54,12 +56,15 @@ export const isRetryableTransportError = (error: unknown): boolean => {
     code === "ENOTFOUND" ||
     code === "EPIPE" ||
     code === "EHOSTUNREACH" ||
-    code === "ECONNABORTED"
+    code === "ECONNABORTED" ||
+    RETRYABLE_REDIS_CODES.has(code)
   ) {
     return true;
   }
 
-  const message = asError(error).message.toLowerCase();
+  const rawMessage = asError(error).message;
+  const message = rawMessage.toLowerCase();
+  const responseCode = rawMessage.trimStart().split(/\s+/, 1)[0] ?? "";
   return (
     message.includes("econnreset") ||
     message.includes("econnrefused") ||
@@ -73,10 +78,7 @@ export const isRetryableTransportError = (error: unknown): boolean => {
     message.includes("socket hang up") ||
     message.includes("broken pipe") ||
     message.includes("network error") ||
-    message.startsWith("loading") ||
-    message.startsWith("tryagain") ||
-    message.startsWith("clusterdown") ||
-    message.startsWith("masterdown")
+    RETRYABLE_REDIS_CODES.has(responseCode)
   );
 };
 

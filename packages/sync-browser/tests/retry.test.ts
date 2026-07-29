@@ -153,12 +153,20 @@ test("isRetryableTransportError catches common codes", () => {
 test("isRetryableTransportError catches common messages", () => {
   expect(isRetryableTransportError(new Error("Connection reset"))).toBe(true);
   expect(isRetryableTransportError(new Error("LOADING"))).toBe(true);
+  expect(isRetryableTransportError(new Error("TRYAGAIN later"))).toBe(true);
+  expect(isRetryableTransportError(new Error("CLUSTERDOWN unavailable"))).toBe(true);
+  expect(isRetryableTransportError(new Error("MASTERDOWN unavailable"))).toBe(true);
+  expect(isRetryableTransportError({ code: "LOADING" })).toBe(true);
   expect(isRetryableTransportError(new Error("random"))).toBe(false);
 });
 
 test("isRetryableTransportError does not match broad application vocabulary", () => {
   expect(isRetryableTransportError(new Error("invalid connection string in config"))).toBe(false);
   expect(isRetryableTransportError(new Error("error loading user profile"))).toBe(false);
+  expect(isRetryableTransportError(new Error("Loading user profile failed"))).toBe(false);
+  expect(isRetryableTransportError(new Error("TRYAGAINLater is an application error"))).toBe(false);
+  expect(isRetryableTransportError(new Error("CLUSTERDOWNSTREAM failed"))).toBe(false);
+  expect(isRetryableTransportError(new Error("MASTERDOWNSTREAM failed"))).toBe(false);
   expect(isRetryableTransportError(new Error("socket must be a string"))).toBe(false);
   expect(isRetryableTransportError(new Error("network policy denied"))).toBe(false);
 });

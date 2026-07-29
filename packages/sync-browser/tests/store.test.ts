@@ -181,6 +181,13 @@ describe("TTL", () => {
     await Bun.sleep(30);
     expect(store.get("k")).toBe("value");
   });
+
+  test("ttl beyond the native timer limit does not expire early", async () => {
+    store.set("k", "value", 2_147_483_648);
+    await Bun.sleep(10);
+    expect(store.get("k")).toBe("value");
+    store.clear();
+  });
 });
 
 // ==========================
@@ -310,6 +317,19 @@ test("LocalStorageStore: TTL expiry works", async () => {
     expect(store.get("ttl-key")).toBe("value");
     await Bun.sleep(200);
     expect(store.get("ttl-key")).toBeUndefined();
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("LocalStorageStore: TTL beyond the native timer limit does not expire early", async () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const store = new LocalStorageStore("test");
+    store.set("ttl-key", "value", 2_147_483_648);
+    await Bun.sleep(10);
+    expect(store.get("ttl-key")).toBe("value");
+    store.clear();
   } finally {
     globalThis.localStorage = originalLocalStorage;
   }

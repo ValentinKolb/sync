@@ -393,6 +393,21 @@ test("windowSecs must be a positive integer", () => {
   ).not.toThrow();
 });
 
+test("large windows retain their counter beyond the native timer clamp", async () => {
+  const store = createMemoryStore();
+  const limiter = ratelimit({
+    id: `large-window-${Date.now()}`,
+    limit: 1,
+    windowSecs: 1_073_742,
+    store,
+  });
+
+  expect((await limiter.check("user")).limited).toBe(false);
+  await Bun.sleep(10);
+  expect((await limiter.check("user")).limited).toBe(true);
+  store.clear();
+});
+
 test("long identifiers do not collide at a practical scale", async () => {
   const { simpleHash } = await import("../src/internal/id");
   const seen = new Set<string>();
