@@ -23,6 +23,7 @@ export {
   type TopicConfig,
   type TopicCursorConfig,
   type TopicReader,
+  type TopicReaderConfig,
   type RecoverableTopicReader,
   type TopicReclaimConfig,
   type TopicReclaimResult,

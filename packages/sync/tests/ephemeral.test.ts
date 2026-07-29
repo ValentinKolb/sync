@@ -626,6 +626,31 @@ test("entries written in the 5.8.0 record format are still readable", async () =
   expect(snap.entries.find((e) => e.key === "apps/legacy")?.value).toEqual({ endpoints: ["a"] });
 });
 
+test("snapshot omits expired rows even when reconciliation cannot remove them", async () => {
+  const id = testId("snapshot-expired");
+  const store = ephemeral<{ v: number }>({ id, ttlMs: 60_000 });
+  const stateKey = `sync:e:default:${id}:state`;
+  const now = Date.now();
+
+  await redis.send("HSET", [
+    stateKey,
+    "expired",
+    JSON.stringify({
+      v: 2,
+      key: "expired",
+      dataJson: JSON.stringify({ v: 1 }),
+      version: "1",
+      createdAt: now - 2_000,
+      updatedAt: now - 2_000,
+      expiresAt: now - 1_000,
+    }),
+  ]);
+
+  // The row intentionally has no expiration-index member, as can happen with
+  // legacy or partially migrated state. Snapshot filtering is the final guard.
+  expect(await store.snapshot()).toEqual({ entries: [], cursor: "0-0" });
+});
+
 test("a retention longer than the epoch does not break writes", async () => {
   const store = ephemeral<{ v: number }>({
     id: testId("huge-retention"),

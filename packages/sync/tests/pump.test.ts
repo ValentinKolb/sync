@@ -42,6 +42,23 @@ afterEach(async () => {
   await cleanup();
 });
 
+test("rejects non-finite numeric configuration", () => {
+  const base = {
+    id: uid("finite-config"),
+    pull: () => ({ items: [], nextCursor: null }),
+    dispatch: () => {},
+  };
+
+  expect(() => pump({ ...base, batchSize: Number.NaN })).toThrow(/batchSize must be finite/);
+  expect(() => pump({ ...base, defaults: { leaseMs: Number.POSITIVE_INFINITY } })).toThrow(
+    /defaults\.leaseMs must be finite/,
+  );
+  expect(() => pump({ ...base, limits: { pageBytes: Number.NaN } })).toThrow(/limits\.pageBytes must be finite/);
+  expect(() => pump({ ...base, retry: { maxAttempts: Number.POSITIVE_INFINITY } })).toThrow(
+    /retry\.maxAttempts must be finite/,
+  );
+});
+
 test("processes pages sequentially and exposes durable progress", async () => {
   const values = [1, 2, 3, 4, 5];
   const pulledFrom: Array<number | null> = [];

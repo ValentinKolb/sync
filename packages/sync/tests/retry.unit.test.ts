@@ -172,6 +172,35 @@ test("retry honors abort signal before run", async () => {
   await expect(retry({ run: () => "ok", signal: ac.signal })).rejects.toThrow(/aborted/i);
 });
 
+test("retry honors abort while run is active", async () => {
+  const ac = new AbortController();
+  const pending = retry({
+    signal: ac.signal,
+    run: async () => {
+      await Bun.sleep(20);
+      return "late success";
+    },
+  });
+
+  ac.abort();
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+});
+
+test("retry honors abort while after is active", async () => {
+  const ac = new AbortController();
+  const pending = retry({
+    signal: ac.signal,
+    run: () => "ok",
+    after: async () => {
+      await Bun.sleep(20);
+    },
+  });
+
+  await Bun.sleep(5);
+  ac.abort();
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+});
+
 // ==========================
 // isRetryableTransportError
 // ==========================

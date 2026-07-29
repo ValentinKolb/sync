@@ -149,6 +149,7 @@ export const retry = async <T>(config: RetryConfig<T>): Promise<T> => {
     } catch (err) {
       error = asError(err);
     }
+    if (config.signal?.aborted) throw createAbortError();
 
     let rescheduleRequested: { delayMs?: number } | null = null;
     const afterCtx: RetryAfterCtx<T> = Object.create(ctx) as RetryAfterCtx<T>;
@@ -166,6 +167,7 @@ export const retry = async <T>(config: RetryConfig<T>): Promise<T> => {
         // after errors swallowed — fall through to terminal decision
       }
     }
+    if (config.signal?.aborted) throw createAbortError();
 
     if (rescheduleRequested) {
       const delayMs = Math.max(0, (rescheduleRequested as { delayMs?: number }).delayMs ?? 0);

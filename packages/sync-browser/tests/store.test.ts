@@ -248,10 +248,15 @@ const createLocalStorageMock = () => {
 };
 
 import { LocalStorageStore, StoreWriteError, createLocalStorageStore } from "../src/store";
+import { StoreWriteError as PublicStoreWriteError } from "../index";
 import { mutex } from "../src/mutex";
 
 // We need to polyfill localStorage for Bun
 const originalLocalStorage = globalThis.localStorage;
+
+test("StoreWriteError is exported from the browser entrypoint", () => {
+  expect(PublicStoreWriteError).toBe(StoreWriteError);
+});
 
 test("LocalStorageStore: get returns undefined for missing key", () => {
   globalThis.localStorage = createLocalStorageMock();

@@ -25,13 +25,17 @@ const t = topic<{ type: string; orderId: string }>({
 type Topic<T> = {
   pub(cfg: TopicPubConfig<T>): Promise<{ eventId: string; cursor: string }>;
   latestCursor(cfg?: TopicCursorConfig): Promise<string | null>;
-  reader(group?: string): TopicReader<T>;
+  reader(group?: string, cfg?: TopicReaderConfig): TopicReader<T>;
   live(cfg?: TopicLiveConfig): AsyncIterable<TopicLiveEvent<T>>;
 };
 
 // topic() returns this concrete extension of Topic<T>.
 type RecoverableTopic<T> = Omit<Topic<T>, "reader"> & {
-  reader(group?: string): RecoverableTopicReader<T>;
+  reader(group?: string, cfg?: TopicReaderConfig): RecoverableTopicReader<T>;
+};
+
+type TopicReaderConfig = {
+  consumerId?: string; // stable server consumer name; optional
 };
 
 type TopicCursorConfig = {
@@ -170,13 +174,13 @@ for await (const event of t.live({ tenantId, after: startCursor })) {
 - **`reclaim()`**: claims pending deliveries that have been idle for at least `minIdleMs` (default 60s). Run it before starting a long-lived reader or periodically. Continue with `nextCursor` until it returns `"0-0"`; this advances past pending entries that are not idle long enough.
 - **`close()`**: permanently closes that reader handle, stops its active blocking read, and releases its resources. It is idempotent; create a new reader handle instead of calling `recv()` or `reclaim()` after closing. On the server it removes the consumer record from every tenant used by that reader only when the consumer has no pending deliveries; pending deliveries remain reclaimable.
 - **Malformed payloads**: by default, `recv()` and `stream()` acknowledge malformed transport envelopes and continue. Pass `invalidPayload: "throw"` to receive a `TopicPayloadError` and leave the entry pending. `reclaim()` reports those entries as `{ kind: "invalid" }` so the application can record or dead-letter them before `commit()`.
-- **`live()`**: best-effort fan-out to every listener. Not acked. Missed events by slow/disconnected listeners may trigger an `overflow` signal (browser) or cursor reset (server). Use for ephemeral updates (presence, UI sync).
+- **`live()`**: best-effort fan-out to every listener. Not acked, and retention gaps are not signaled. Persist cursors only when the configured retention window is sufficient for replay; use a consumer-group reader for durable work.
 - **`latestCursor()`**: reads the current head cursor for a tenant without consuming or acknowledging anything. Returns `null` when the tenant stream has no entries.
 - **`after: "0-0"`**: start from the earliest retained event. Useful for replay.
 - **`idempotencyKey` on pub**: dedupes within `idempotencyTtlMs` (default 7d). Same key returns the same eventId.
 - **`retentionMs`**: events older than this are trimmed during publish. Set carefully for replay requirements.
-- **`tenantId`**: isolates the stream — separate event log per tenant. Browser: `tenantId` also isolates `maxEntries`.
-- **Browser runtime**: consumer groups behave as documented above. The group's cursor advances on `commit()`, not on delivery, so an uncommitted delivery stays recoverable via `reclaim({ minIdleMs, cursor, count })`; pass each returned cursor into the next call until it returns `"0-0"`. Readers of one group distribute rather than broadcast; a recreated reader resumes at the group's committed position; and `commit()` is refused once another reader has reclaimed the delivery. Leader-free and tab-local: state is shared per `{prefix}:{id}` within the tab (or per `store` when one is passed), not across tabs.
+- **`tenantId`**: isolates the event log and consumer-group state per tenant.
+- **Browser runtime**: consumer groups behave as documented above. The group's cursor advances on `commit()`, not on delivery, so an uncommitted delivery stays recoverable via `reclaim({ minIdleMs, cursor, count })`; pass each returned cursor into the next call until it returns `"0-0"`. Readers of one group distribute rather than broadcast; a recreated reader resumes at the group's committed position; and `commit()` is refused once another reader has reclaimed the delivery. Without `store`, state is tab-local. A persistent `store` checkpoints events and group state across reloads. Use one active writer per persisted topic: browser storage has no atomic compare-and-set, so concurrent tabs or independent Store handles can overwrite each other's topic snapshots.
 
 ## Redis keys (server)
 

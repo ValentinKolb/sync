@@ -157,6 +157,12 @@ const assertIdentifier = (value: string, label: string): void => {
   if (value.length > 256) throw new Error(`${label} too long (max 256 chars)`);
 };
 
+const finiteConfig = (value: number | undefined, fallback: number, label: string): number => {
+  const resolved = value ?? fallback;
+  if (!Number.isFinite(resolved)) throw new Error(`${label} must be finite`);
+  return resolved;
+};
+
 const assertKey = (key: string): void => {
   if (!key) throw new Error("key must be non-empty");
   if (textEncoder.encode(key).byteLength > MAX_KEY_BYTES) {
@@ -225,23 +231,33 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   const baseKey = `${prefix}:${config.id}`;
   const runPrefix = `${baseKey}:run:`;
   const store = resolveStore(config.store);
-  const batchSize = Math.max(1, Math.floor(config.batchSize ?? DEFAULT_BATCH_SIZE));
-  const delayMs = Math.max(0, config.delayMs ?? DEFAULT_DELAY_MS);
-  const leaseMs = Math.max(50, config.defaults?.leaseMs ?? DEFAULT_LEASE_MS);
+  const batchSize = Math.max(1, Math.floor(finiteConfig(config.batchSize, DEFAULT_BATCH_SIZE, "batchSize")));
+  const delayMs = Math.max(0, finiteConfig(config.delayMs, DEFAULT_DELAY_MS, "delayMs"));
+  const leaseMs = Math.max(50, finiteConfig(config.defaults?.leaseMs, DEFAULT_LEASE_MS, "defaults.leaseMs"));
   const heartbeatMs = Math.max(
     10,
-    Math.min(config.defaults?.heartbeatMs ?? Math.floor(leaseMs / 3), Math.max(10, Math.floor(leaseMs / 2))),
+    Math.min(
+      finiteConfig(config.defaults?.heartbeatMs, Math.floor(leaseMs / 3), "defaults.heartbeatMs"),
+      Math.max(10, Math.floor(leaseMs / 2)),
+    ),
   );
   const terminalRetentionMs = Math.max(
     1,
-    config.defaults?.terminalRetentionMs ?? DEFAULT_TERMINAL_RETENTION_MS,
+    finiteConfig(
+      config.defaults?.terminalRetentionMs,
+      DEFAULT_TERMINAL_RETENTION_MS,
+      "defaults.terminalRetentionMs",
+    ),
   );
-  const pageBytes = Math.max(1, config.limits?.pageBytes ?? DEFAULT_PAGE_BYTES);
-  const maxAttempts = Math.max(1, Math.floor(config.retry?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS));
+  const pageBytes = Math.max(1, finiteConfig(config.limits?.pageBytes, DEFAULT_PAGE_BYTES, "limits.pageBytes"));
+  const maxAttempts = Math.max(
+    1,
+    Math.floor(finiteConfig(config.retry?.maxAttempts, DEFAULT_MAX_ATTEMPTS, "retry.maxAttempts")),
+  );
   const retryBackoff: BackoffOptions = {
-    baseMs: config.retry?.baseMs ?? DEFAULT_RETRY_BASE_MS,
-    maxMs: config.retry?.maxMs ?? DEFAULT_RETRY_MAX_MS,
-    jitter: config.retry?.jitter ?? DEFAULT_RETRY_JITTER,
+    baseMs: finiteConfig(config.retry?.baseMs, DEFAULT_RETRY_BASE_MS, "retry.baseMs"),
+    maxMs: finiteConfig(config.retry?.maxMs, DEFAULT_RETRY_MAX_MS, "retry.maxMs"),
+    jitter: finiteConfig(config.retry?.jitter, DEFAULT_RETRY_JITTER, "retry.jitter"),
   };
 
   // The worker belongs to this handle, not to its Store or its id.

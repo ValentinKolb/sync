@@ -23,6 +23,7 @@ export {
   type TopicConfig,
   type TopicCursorConfig,
   type TopicReader,
+  type TopicReaderConfig,
   type RecoverableTopicReader,
   type TopicReclaimConfig,
   type TopicReclaimResult,
@@ -113,5 +114,6 @@ export {
   createLocalStorageStore,
   MemoryStore,
   LocalStorageStore,
+  StoreWriteError,
   type Store,
 } from "./src/store";

@@ -1,8 +1,36 @@
 import { test, expect } from "bun:test";
 import { TopicPayloadError, topic } from "../src/topic";
-import { createMemoryStore } from "../src/store";
+import { createMemoryStore, type Store } from "../src/store";
 import { sharedState } from "../src/internal/shared-state";
 import type { EventLog } from "../src/internal/event-log";
+
+const jsonStore = (backing: Map<string, string>): Store => ({
+  get(key) {
+    const raw = backing.get(key);
+    if (!raw) return undefined;
+    const entry = JSON.parse(raw) as { value: unknown; expiresAt: number | null };
+    if (entry.expiresAt !== null && entry.expiresAt <= Date.now()) {
+      backing.delete(key);
+      return undefined;
+    }
+    return entry.value;
+  },
+  set(key, value, ttlMs) {
+    backing.set(
+      key,
+      JSON.stringify({
+        value,
+        expiresAt: ttlMs === undefined ? null : Date.now() + ttlMs,
+      }),
+    );
+  },
+  del(key) {
+    backing.delete(key);
+  },
+  keys(prefix) {
+    return [...backing.keys()].filter((key) => prefix === undefined || key.startsWith(prefix));
+  },
+});
 
 // ==========================
 // pub + recv basics
@@ -45,6 +73,16 @@ test("reader recv with wait: false returns null when empty", async () => {
 
   const message = await t.reader("none").recv({ wait: false });
   expect(message).toBeNull();
+});
+
+test("reader recv returns promptly for an already-aborted signal", async () => {
+  const reader = topic({ id: `pre-aborted-${Date.now()}` }).reader("none");
+  const ac = new AbortController();
+  ac.abort();
+  const startedAt = Date.now();
+
+  expect(await reader.recv({ wait: true, timeoutMs: 10_000, signal: ac.signal })).toBeNull();
+  expect(Date.now() - startedAt).toBeLessThan(100);
 });
 
 test("reader reclaim is empty when the group has no pending deliveries", async () => {
@@ -271,6 +309,142 @@ test("idempotency key prevents duplicate publishing", async () => {
   }
 
   expect(events.length).toBe(1);
+});
+
+test("invalid idempotency TTL is rejected before publishing", async () => {
+  const t = topic<{ v: number }>({
+    id: `invalid-idem-ttl-${Date.now()}`,
+    store: createMemoryStore(),
+  });
+
+  await expect(
+    t.pub({ data: { v: 1 }, idempotencyKey: "same", idempotencyTtlMs: Number.NaN }),
+  ).rejects.toThrow(/idempotencyTtlMs must be a positive integer/);
+  expect(await t.latestCursor()).toBeNull();
+});
+
+test("store persists events, idempotency, and group recovery across reloads", async () => {
+  const backing = new Map<string, string>();
+  const id = `persisted-${Date.now()}`;
+  const firstTopic = topic<{ value: number }>({
+    id,
+    prefix: "test:bt",
+    store: jsonStore(backing),
+  });
+  const first = await firstTopic.pub({
+    data: { value: 1 },
+    idempotencyKey: "first",
+  });
+  const second = await firstTopic.pub({ data: { value: 2 } });
+  const original = firstTopic.reader("workers", { consumerId: "before-reload" });
+  expect(await (await original.recv({ wait: false }))?.commit()).toBe(true);
+  expect((await original.recv({ wait: false }))?.eventId).toBe(second.eventId);
+
+  // A distinct Store object gives sharedState a fresh scope, matching a reload.
+  const reloaded = topic<{ value: number }>({
+    id,
+    prefix: "test:bt",
+    store: jsonStore(backing),
+  });
+  expect(await reloaded.latestCursor()).toBe(second.cursor);
+  expect(await reloaded.pub({ data: { value: 999 }, idempotencyKey: "first" })).toEqual(first);
+
+  const recovered = await reloaded
+    .reader("workers", { consumerId: "after-reload" })
+    .reclaim({ minIdleMs: 0 });
+  expect(recovered.entries).toHaveLength(1);
+  expect(
+    recovered.entries[0]?.kind === "delivery" && recovered.entries[0].delivery.data,
+  ).toEqual({ value: 2 });
+});
+
+test("same handle and reload replace an idempotency key whose retained event expired", async () => {
+  const backing = new Map<string, string>();
+  const id = `stale-idempotency-${Date.now()}`;
+  const firstTopic = topic<{ value: number }>({
+    id,
+    prefix: "test:bt",
+    retentionMs: 200,
+    store: jsonStore(backing),
+  });
+  const first = await firstTopic.pub({ data: { value: 1 }, idempotencyKey: "same" });
+  await Bun.sleep(250);
+  const fresh = await firstTopic.pub({ data: { value: 2 }, idempotencyKey: "same" });
+  expect(fresh.eventId).not.toBe(first.eventId);
+
+  const reloaded = topic<{ value: number }>({
+    id,
+    prefix: "test:bt",
+    retentionMs: 200,
+    store: jsonStore(backing),
+  });
+
+  expect(await reloaded.latestCursor()).toBe(fresh.cursor);
+  expect(await reloaded.pub({ data: { value: 999 }, idempotencyKey: "same" })).toEqual(fresh);
+  expect((await reloaded.reader("check").recv({ wait: false }))?.data).toEqual({ value: 2 });
+});
+
+test("failed event persistence is rolled back before readers can observe it", async () => {
+  const backing = new Map<string, string>();
+  const base = jsonStore(backing);
+  let failWrite = true;
+  const store: Store = {
+    ...base,
+    set(key, value, ttlMs) {
+      if (key.endsWith(":browser:event-log") && failWrite) {
+        failWrite = false;
+        throw new Error("storage full");
+      }
+      base.set(key, value, ttlMs);
+    },
+  };
+  const t = topic<{ value: number }>({
+    id: `failed-persistence-${Date.now()}`,
+    prefix: "test:bt",
+    store,
+  });
+
+  await expect(
+    t.pub({ data: { value: 1 }, idempotencyKey: "same" }),
+  ).rejects.toThrow("storage full");
+  expect([...backing.keys()].some((key) => key.includes(":idempotency:"))).toBe(false);
+  expect(await t.latestCursor()).toBeNull();
+  expect(await t.reader("check").recv({ wait: false })).toBeNull();
+
+  const published = await t.pub({ data: { value: 1 }, idempotencyKey: "same" });
+  expect((await t.reader("retry").recv({ wait: false }))?.eventId).toBe(published.eventId);
+  expect(await t.reader("retry").recv({ wait: false })).toBeNull();
+});
+
+test("failed idempotency persistence rolls the event snapshot back", async () => {
+  const backing = new Map<string, string>();
+  const base = jsonStore(backing);
+  let failKeyWrite = true;
+  const store: Store = {
+    ...base,
+    set(key, value, ttlMs) {
+      if (key.includes(":idempotency:") && failKeyWrite) {
+        failKeyWrite = false;
+        throw new Error("key write failed");
+      }
+      base.set(key, value, ttlMs);
+    },
+  };
+  const t = topic<{ value: number }>({
+    id: `failed-idempotency-${Date.now()}`,
+    prefix: "test:bt",
+    store,
+  });
+
+  await expect(
+    t.pub({ data: { value: 1 }, idempotencyKey: "same" }),
+  ).rejects.toThrow("key write failed");
+  expect(await t.latestCursor()).toBeNull();
+
+  const published = await t.pub({ data: { value: 1 }, idempotencyKey: "same" });
+  const reader = t.reader("check");
+  expect((await reader.recv({ wait: false }))?.eventId).toBe(published.eventId);
+  expect(await reader.recv({ wait: false })).toBeNull();
 });
 
 // ==========================

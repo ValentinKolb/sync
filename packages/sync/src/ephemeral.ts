@@ -740,10 +740,15 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
     const rawEntries = await redis.hvals(keys.state);
     const entries: EphemeralEntry<TData>[] = [];
     const prefix = cfg.prefix;
+    const now = Date.now();
 
     for (const raw of rawEntries) {
       const parsed = parseStoredEntry(String(raw));
       if (!parsed) continue;
+      // Reconciliation is deliberately batched. A very large expired backlog,
+      // or a legacy row missing its expiration index, must still never leak into
+      // a point-in-time snapshot.
+      if (parsed.expiresAt <= now) continue;
       if (prefix && !parsed.key.startsWith(prefix)) continue;
       entries.push(parsed);
     }
@@ -983,7 +988,7 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
                 })
               : await recv(cfg);
           } catch (error) {
-            if (closed) break;
+            if (closed || cfg.signal?.aborted) break;
             throw error;
           }
           if (event) {

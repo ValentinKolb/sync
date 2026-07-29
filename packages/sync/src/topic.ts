@@ -48,11 +48,27 @@ const COMMIT_SCRIPT = `
   return redis.call("XACK", KEYS[1], ARGV[1], ARGV[2])
 `;
 
+// Check and remove an idle consumer atomically. A separate XPENDING followed by
+// DELCONSUMER could delete a pending entry delivered to a replacement reader
+// with the same stable consumer id between those two commands.
+const CLOSE_CONSUMER_SCRIPT = `
+  local pending = redis.call("XPENDING", KEYS[1], ARGV[1], "-", "+", 1, ARGV[2])
+  if pending and #pending > 0 then return 0 end
+  redis.call("XGROUP", "DELCONSUMER", KEYS[1], ARGV[1], ARGV[2])
+  return 1
+`;
+
 const ENSURED_GROUPS_MAX = 10_000;
 
 const textEncoder = new TextEncoder();
 
 const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
+
+const assertTtlMs = (ttlMs: number): void => {
+  if (!Number.isInteger(ttlMs) || ttlMs <= 0 || ttlMs > Number.MAX_SAFE_INTEGER) {
+    throw new Error("idempotencyTtlMs must be a positive integer number of milliseconds");
+  }
+};
 
 const safeClose = (client: RedisClient): void => {
   if (!client.connected) return;
@@ -61,6 +77,28 @@ const safeClose = (client: RedisClient): void => {
   } catch {
     // ignore close races
   }
+};
+
+const raceWithAbort = async <T>(operation: Promise<T>, signal: AbortSignal): Promise<T | null> => {
+  if (signal.aborted) return null;
+
+  return await new Promise<T | null>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(null);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    operation.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 };
 
 const evalScript = async (script: string, keys: string[], args: Array<string | number>): Promise<unknown> => {
@@ -84,8 +122,19 @@ const blockingReadWithTemporaryClient = async (
   }
 
   try {
-    if (!client.connected) await client.connect();
-    return await client.send(command, args);
+    if (!client.connected) {
+      const connect = client.connect();
+      const connected = signal ? await raceWithAbort(connect, signal) : await connect;
+      if (connected === null) {
+        void connect.then(() => safeClose(client), () => {});
+        return null;
+      }
+    }
+    if (signal?.aborted) return null;
+
+    const read = client.send(command, args);
+    if (!signal) return await read;
+    return await raceWithAbort(read, signal);
   } catch (error) {
     if (signal?.aborted) return null;
     throw asError(error);
@@ -319,6 +368,10 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
   const pub = async (pubCfg: TopicPubConfig<TData>): Promise<{ eventId: string; cursor: string }> => {
     const tenantId = resolveTenant(pubCfg.tenantId);
     const key = streamKey(tenantId);
+    const idempotencyTtlMs = pubCfg.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS;
+    if (pubCfg.idempotencyKey || pubCfg.idempotencyTtlMs !== undefined) {
+      assertTtlMs(idempotencyTtlMs);
+    }
 
     const payload: StoredEvent<TData> = {
       data: pubCfg.data,
@@ -343,7 +396,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     const rawId = await evalScript(
       PUB_SCRIPT,
       [key],
-      [payloadRaw, pubCfg.idempotencyKey ? idempotencyKey(tenantId, pubCfg.idempotencyKey) : "", pubCfg.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS, trimMinId],
+      [payloadRaw, pubCfg.idempotencyKey ? idempotencyKey(tenantId, pubCfg.idempotencyKey) : "", idempotencyTtlMs, trimMinId],
     );
 
     const eventId = typeof rawId === "string" ? rawId : String(rawId);
@@ -367,6 +420,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     // Number of stream() loops currently using the blocking client. Without it,
     // the first loop to exit closed the socket a concurrent loop was blocked on.
     let blockingUsers = 0;
+    const closeController = new AbortController();
     let closed = false;
     let closePromise: Promise<void> | null = null;
     let activeOperations = 0;
@@ -408,11 +462,25 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     };
 
     const ensureBlockingClient = async (): Promise<RedisClient> => {
+      assertOpen();
       if (blockingClient?.connected) return blockingClient;
       resetBlockingClient();
       const client = new RedisClient();
       blockingClient = client;
-      await client.connect();
+      const connect = client.connect();
+      const connected = await raceWithAbort(connect, closeController.signal);
+      if (connected === null) {
+        void connect.then(() => safeClose(client), () => {});
+        throw new Error("topic reader is closed");
+      }
+      if (closed) {
+        safeClose(client);
+        throw new Error("topic reader is closed");
+      }
+      if (blockingClient !== client) {
+        safeClose(client);
+        throw new Error("connection closed");
+      }
       // Return the local handle: a concurrent reset may already have cleared the
       // slot while this connect was in flight, which made callers see null and
       // throw an opaque TypeError no transport-error check could match.
@@ -432,16 +500,14 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     const close = (): Promise<void> => {
       if (closePromise) return closePromise;
       closed = true;
+      closeController.abort();
       blockingUsers = 0;
       resetBlockingClient();
       closePromise = (async () => {
         await operationsIdle;
         for (const key of usedKeys) {
           try {
-            const pending = await redis.send("XPENDING", [key, group, "-", "+", "1", consumer]);
-            if (Array.isArray(pending) && pending.length === 0) {
-              await redis.send("XGROUP", ["DELCONSUMER", key, group, consumer]);
-            }
+            await evalScript(CLOSE_CONSUMER_SCRIPT, [key], [group, consumer]);
           } catch {
             // Best effort: the group or stream may be gone already.
           }
@@ -507,6 +573,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       const key = streamKey(tenantId);
       usedKeys.add(key);
       await ensureGroup(key, group);
+      if (closed) return null;
 
       const wait = recvCfg.wait ?? true;
       const timeoutMs = recvCfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -564,6 +631,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       const key = streamKey(tenantId);
       usedKeys.add(key);
       await ensureGroup(key, group);
+      if (closed) return { nextCursor: "0-0", entries: [] };
 
       const minIdleMs = reclaimCfg.minIdleMs ?? 60_000;
       if (!Number.isFinite(minIdleMs) || minIdleMs < 0) throw new Error("minIdleMs must be a non-negative number");
@@ -632,7 +700,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
                 })
               : await recv(streamCfg);
           } catch (error) {
-            if (closed) break;
+            if (closed || streamCfg.signal?.aborted) break;
             throw error;
           }
           if (message) {
@@ -679,30 +747,36 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
 
     try {
       while (!liveCfg.signal?.aborted) {
-        const result = await retry<unknown>({
-          run: () =>
-            liveCfg.signal
-              ? blockingReadWithTemporaryClient(
-                  "XREAD",
-                  ["COUNT", "1", "BLOCK", timeoutMs.toString(), "STREAMS", key, cursor],
-                  liveCfg.signal,
-                )
-              : (async (): Promise<unknown> => {
-                  try {
-                    const client = await ensureBlockingClient();
-                    return await client.send("XREAD", ["COUNT", "1", "BLOCK", timeoutMs.toString(), "STREAMS", key, cursor]);
-                  } catch (error) {
-                    resetBlockingClient();
-                    throw asError(error);
-                  }
-                })(),
-          after: ({ ctx }) => {
-            if (ctx.error && isRetryableTransportError(ctx.error)) {
-              ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
-            }
-          },
-          signal: liveCfg.signal,
-        });
+        let result: unknown;
+        try {
+          result = await retry<unknown>({
+            run: () =>
+              liveCfg.signal
+                ? blockingReadWithTemporaryClient(
+                    "XREAD",
+                    ["COUNT", "1", "BLOCK", timeoutMs.toString(), "STREAMS", key, cursor],
+                    liveCfg.signal,
+                  )
+                : (async (): Promise<unknown> => {
+                    try {
+                      const client = await ensureBlockingClient();
+                      return await client.send("XREAD", ["COUNT", "1", "BLOCK", timeoutMs.toString(), "STREAMS", key, cursor]);
+                    } catch (error) {
+                      resetBlockingClient();
+                      throw asError(error);
+                    }
+                  })(),
+            after: ({ ctx }) => {
+              if (ctx.error && isRetryableTransportError(ctx.error)) {
+                ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
+              }
+            },
+            signal: liveCfg.signal,
+          });
+        } catch (error) {
+          if (liveCfg.signal?.aborted) break;
+          throw error;
+        }
 
         const entry = parseFirstStreamEntry(result);
         if (!entry) continue;

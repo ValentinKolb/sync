@@ -21,7 +21,9 @@ const RATE_LIMIT_SCRIPT = `
 
   local weightedCount = previousCount * (1 - elapsedRatio) + currentCount
 
-  return {currentCount, previousCount, weightedCount}
+  -- Redis converts Lua numbers returned directly to integers. Return the
+  -- weighted value as text so fractional carry-over is not truncated.
+  return {currentCount, previousCount, tostring(weightedCount)}
 `;
 
 const normalizeIdentifier = (identifier: string): string => {
@@ -112,9 +114,9 @@ export const ratelimit = (config: RateLimitConfig): RateLimiter => {
       windowSecs.toString(),
       limit.toString(),
       elapsedRatio.toString(),
-    ])) as [number, number, number];
+    ])) as [number, number, string];
 
-    const [, , weightedCount] = result;
+    const weightedCount = Number(result[2]);
 
     // Fail closed on a non-comparable count: an abuse-control primitive must
     // never allow everything because arithmetic went sideways.

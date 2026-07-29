@@ -122,6 +122,27 @@ test("sliding window applies the weighted previous-window count", async () => {
   expect(result).toMatchObject({ limited: true, remaining: 0 });
 });
 
+test("sliding window preserves fractional carry-over from Redis Lua", async () => {
+  const id = "sliding-fraction";
+  const identifier = "user:fraction";
+  const windowSecs = 60;
+  const windowMs = windowSecs * 1_000;
+  const limiter = ratelimit({ id, limit: 1, windowSecs, prefix: "test:rl" });
+
+  let now = Date.now();
+  const remainingInWindow = windowMs - (now % windowMs);
+  if (remainingInWindow < 1_000) {
+    await Bun.sleep(remainingInWindow + 10);
+    now = Date.now();
+  }
+  const previousWindow = Math.floor(now / windowMs) - 1;
+  await redis.set(`test:rl:${id}:${identifier}:${previousWindow}`, "1");
+
+  // Current count 1 plus any positive carry-over exceeds the limit. Returning
+  // the Lua number directly used to truncate it to 1 and fail open.
+  expect(await limiter.check(identifier)).toMatchObject({ limited: true, remaining: 0 });
+});
+
 test("long identifiers are hashed", async () => {
   const limiter = ratelimit({
     id: "hash",

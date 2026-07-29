@@ -37,6 +37,7 @@ import type {
   TopicConfig as S_TopicConfig,
   TopicCursorConfig as S_TopicCursorConfig,
   TopicReader as S_TopicReader,
+  TopicReaderConfig as S_TopicReaderConfig,
   RecoverableTopicReader as S_RecoverableTopicReader,
   TopicReclaimConfig as S_TopicReclaimConfig,
   TopicReclaimResult as S_TopicReclaimResult,
@@ -138,6 +139,7 @@ import type {
   TopicConfig as B_TopicConfig,
   TopicCursorConfig as B_TopicCursorConfig,
   TopicReader as B_TopicReader,
+  TopicReaderConfig as B_TopicReaderConfig,
   RecoverableTopicReader as B_RecoverableTopicReader,
   TopicReclaimConfig as B_TopicReclaimConfig,
   TopicReclaimResult as B_TopicReclaimResult,
@@ -274,6 +276,7 @@ assertEqual<Equal<Omit<B_TopicConfig<{ foo: string }>, "store">, S_TopicConfig<{
 assertEqual<Equal<S_RecoverableTopic<{ foo: string }>, B_RecoverableTopic<{ foo: string }>>>(true);
 // TopicConfig differs: browser has optional `store?` additive field
 assertEqual<Equal<S_TopicReader<{ foo: string }>, B_TopicReader<{ foo: string }>>>(true);
+assertEqual<Equal<S_TopicReaderConfig, B_TopicReaderConfig>>(true);
 assertEqual<Equal<S_RecoverableTopicReader<{ foo: string }>, B_RecoverableTopicReader<{ foo: string }>>>(true);
 assertEqual<Equal<S_TopicCursorConfig, B_TopicCursorConfig>>(true);
 assertEqual<Equal<S_TopicRecvConfig, B_TopicRecvConfig>>(true);
@@ -380,17 +383,24 @@ assertEqual<Equal<S_RetryConfig<number>, B_RetryConfig<number>>>(true);
 // Public surface (entrypoints)
 // ==========================
 
-// The assertions above import from `packages/*/src/*`, so the actual published
-// surface was never compared: an export could be missing, renamed, or a value
-// (an error class, a factory) could diverge without failing here. These compare
-// the two `index.ts` entrypoints as values, which subsumes error classes and
-// factory signatures.
+// The assertions above compare source types. The entrypoint checks below cover
+// every runtime export plus public types that previously went missing.
 
 import * as ServerApi from "../packages/sync/index";
 import * as BrowserApi from "../packages/sync-browser/index";
+import type { TopicReaderConfig as S_PublicTopicReaderConfig } from "../packages/sync/index";
+import type { TopicReaderConfig as B_PublicTopicReaderConfig } from "../packages/sync-browser/index";
+
+assertEqual<Equal<S_PublicTopicReaderConfig, S_TopicReaderConfig>>(true);
+assertEqual<Equal<B_PublicTopicReaderConfig, B_TopicReaderConfig>>(true);
 
 /** Exports that exist only in the browser build. */
-type BrowserOnlyKeys = "createMemoryStore" | "createLocalStorageStore" | "MemoryStore" | "LocalStorageStore";
+type BrowserOnlyKeys =
+  | "createMemoryStore"
+  | "createLocalStorageStore"
+  | "MemoryStore"
+  | "LocalStorageStore"
+  | "StoreWriteError";
 
 type ServerKeys = keyof typeof ServerApi;
 type BrowserSharedKeys = Exclude<keyof typeof BrowserApi, BrowserOnlyKeys>;

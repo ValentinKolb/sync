@@ -670,6 +670,20 @@ test("a topic retention longer than the epoch does not break pub", async () => {
   expect(message?.data).toEqual({ v: 1 });
 });
 
+test("invalid idempotency TTL is rejected before publishing", async () => {
+  const id = `invalid-idem-ttl-${Date.now()}`;
+  const key = `test:t:default:${id}:stream`;
+  const t = topic<{ v: number }>({ id, prefix: "test:t" });
+
+  await expect(
+    t.pub({ data: { v: 1 }, idempotencyKey: "same", idempotencyTtlMs: 0 }),
+  ).rejects.toThrow(/idempotencyTtlMs must be a positive integer/);
+  await expect(
+    t.pub({ data: { v: 2 }, idempotencyTtlMs: Number.POSITIVE_INFINITY }),
+  ).rejects.toThrow(/idempotencyTtlMs must be a positive integer/);
+  expect(await redis.send("EXISTS", [key])).toBe(0);
+});
+
 // ==========================
 // Delivery ownership and reader lifecycle
 // ==========================
@@ -742,6 +756,15 @@ test("reader.close releases the blocking connection", async () => {
   expect(await connectedClients()).toBeLessThan(clientsDuring);
 });
 
+test("reader.close can interrupt a read while its connection is starting", async () => {
+  const t = topic<{ v: number }>({ id: `close-connect-${Date.now()}`, prefix: "test:t" });
+  const reader = t.reader("workers");
+  const pending = reader.recv({ wait: true, timeoutMs: 10_000 });
+
+  await reader.close();
+  await expect(pending).resolves.toBeNull();
+});
+
 test("reader.close cleans every used tenant without deleting pending consumers", async () => {
   const id = "close-tenants";
   const group = "workers";
@@ -772,6 +795,35 @@ test("reader.close cleans every used tenant without deleting pending consumers",
   expect(pendingConsumers).toEqual([
     expect.objectContaining({ name: consumerId, pending: 1 }),
   ]);
+});
+
+test("reader.close cannot delete a replacement consumer's pending delivery", async () => {
+  const id = `close-handover-${Date.now()}`;
+  const group = "workers";
+  const consumerId = "stable-consumer";
+  const t = topic<{ value: number }>({ id, prefix: "test:t" });
+  const original = t.reader(group, { consumerId });
+
+  await t.pub({ data: { value: 1 } });
+  const committed = await original.recv({ wait: false });
+  expect(await committed?.commit()).toBe(true);
+  const published = await t.pub({ data: { value: 2 } });
+
+  const replacement = t.reader(group, { consumerId });
+  const [, delivered] = await Promise.all([
+    original.close(),
+    replacement.recv({ wait: false }),
+  ]);
+  expect(delivered?.eventId).toBe(published.eventId);
+
+  const recovery = t.reader(group, { consumerId: "recovery" });
+  const reclaimed = await recovery.reclaim({ minIdleMs: 0 });
+  expect(reclaimed.entries).toHaveLength(1);
+  expect(reclaimed.entries[0]?.kind === "delivery" && reclaimed.entries[0].delivery.eventId).toBe(
+    published.eventId,
+  );
+  await replacement.close();
+  await recovery.close();
 });
 
 test("close is terminal for a reader", async () => {

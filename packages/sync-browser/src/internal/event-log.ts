@@ -13,6 +13,12 @@ export type EventLogEntry = {
 export type EventLogConfig = {
   maxLen?: number;
   retentionMs?: number;
+  initialEntries?: EventLogEntry[];
+};
+
+type AppendHooks = {
+  beforeEmit?(entry: EventLogEntry): void;
+  rollback?(): void;
 };
 
 // ==========================
@@ -34,20 +40,41 @@ export class EventLog {
     // does, via its documented eventMaxLen — pass one.
     this.maxLen = config.maxLen ?? Number.POSITIVE_INFINITY;
     this.retentionMs = config.retentionMs ?? 5 * 60 * 1000;
+    this.entries = (config.initialEntries ?? []).map((entry) => ({
+      ...entry,
+      fields: { ...entry.fields },
+    }));
+    this.seq = this.entries.reduce((max, entry) => Math.max(max, Number(entry.id) || 0), 0);
+    this.trim();
   }
 
   /** Append an entry and return its cursor ID. */
-  append(fields: Record<string, unknown>): string {
+  append(fields: Record<string, unknown>, hooks?: AppendHooks): string {
+    const previousEntries = [...this.entries];
+    const previousSeq = this.seq;
     const id = String(++this.seq);
     const entry: EventLogEntry = { id, ts: Date.now(), fields };
     this.entries.push(entry);
     this.trim();
+    try {
+      hooks?.beforeEmit?.(entry);
+    } catch (error) {
+      this.entries = previousEntries;
+      this.seq = previousSeq;
+      try {
+        hooks?.rollback?.();
+      } catch {
+        // Preserve the original write error.
+      }
+      throw error;
+    }
     this.emitter.emit(entry);
     return id;
   }
 
   /** Get entries after a cursor, optionally limited by count. */
   range(after: string, count?: number): EventLogEntry[] {
+    this.trim();
     const afterNum = Number(after) || 0;
     const result: EventLogEntry[] = [];
 
@@ -62,18 +89,21 @@ export class EventLog {
 
   /** Get the latest cursor, or "0" if empty. */
   latest(): string {
+    this.trim();
     if (this.entries.length === 0) return "0";
     return this.entries[this.entries.length - 1]!.id;
   }
 
   /** Get the earliest available cursor, or null if empty. */
   earliest(): string | null {
+    this.trim();
     if (this.entries.length === 0) return null;
     return this.entries[0]!.id;
   }
 
   /** Check whether a specific cursor still exists in the log. */
   has(cursor: string): boolean {
+    this.trim();
     const num = Number(cursor);
     return this.entries.some((e) => Number(e.id) === num);
   }
@@ -135,6 +165,13 @@ export class EventLog {
 
   /** Number of entries currently in the log. */
   get size(): number {
+    this.trim();
     return this.entries.length;
+  }
+
+  /** Serializable snapshot used by browser primitives with a persistent Store. */
+  snapshot(): EventLogEntry[] {
+    this.trim();
+    return this.entries.map((entry) => ({ ...entry, fields: { ...entry.fields } }));
   }
 }

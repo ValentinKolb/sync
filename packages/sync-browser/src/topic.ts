@@ -12,6 +12,12 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 
 const textEncoder = new TextEncoder();
 
+const assertTtlMs = (ttlMs: number): void => {
+  if (!Number.isInteger(ttlMs) || ttlMs <= 0 || ttlMs > Number.MAX_SAFE_INTEGER) {
+    throw new Error("idempotencyTtlMs must be a positive integer number of milliseconds");
+  }
+};
+
 // ==========================
 // Types
 // ==========================
@@ -154,6 +160,67 @@ type StoredEvent<T> = {
   publishedAt: number;
 };
 
+type GroupState = {
+  committed: string;
+  delivered: string;
+  inFlight: Map<string, { at: number; consumerId: string }>;
+};
+
+type PersistedGroupState = Omit<GroupState, "inFlight"> & {
+  inFlight: Array<[string, { at: number; consumerId: string }]>;
+};
+
+const persistedEntries = (value: unknown): EventLogEntry[] => {
+  if (!value || typeof value !== "object") return [];
+  const entries = (value as { entries?: unknown }).entries;
+  if (!Array.isArray(entries)) return [];
+
+  return entries.flatMap((entry): EventLogEntry[] => {
+    if (!entry || typeof entry !== "object") return [];
+    const candidate = entry as Partial<EventLogEntry>;
+    if (
+      typeof candidate.id !== "string"
+      || typeof candidate.ts !== "number"
+      || !Number.isFinite(candidate.ts)
+      || !candidate.fields
+      || typeof candidate.fields !== "object"
+      || Array.isArray(candidate.fields)
+    ) {
+      return [];
+    }
+    return [{ id: candidate.id, ts: candidate.ts, fields: { ...candidate.fields } }];
+  });
+};
+
+const persistedGroup = (value: unknown): GroupState | null => {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<PersistedGroupState>;
+  if (
+    typeof candidate.committed !== "string"
+    || typeof candidate.delivered !== "string"
+    || !Array.isArray(candidate.inFlight)
+  ) {
+    return null;
+  }
+
+  const inFlight = new Map<string, { at: number; consumerId: string }>();
+  for (const item of candidate.inFlight) {
+    if (!Array.isArray(item) || item.length !== 2 || typeof item[0] !== "string") continue;
+    const held = item[1];
+    if (
+      !held
+      || typeof held !== "object"
+      || typeof held.at !== "number"
+      || !Number.isFinite(held.at)
+      || typeof held.consumerId !== "string"
+    ) {
+      continue;
+    }
+    inFlight.set(item[0], { at: held.at, consumerId: held.consumerId });
+  }
+  return { committed: candidate.committed, delivered: candidate.delivered, inFlight };
+};
+
 // ==========================
 // Topic Factory
 // ==========================
@@ -168,17 +235,26 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
   const store = resolveStore(config.store);
 
   const resolveTenant = (tenantId?: string): string => tenantId ?? defaultTenant;
+  const eventLogMapKey = (tenantId: string): string => `${prefix}:${tenantId}:${config.id}`;
+  const eventLogStoreKey = (tenantId: string): string =>
+    `${prefix}:${encodeURIComponent(tenantId)}:${config.id}:browser:event-log`;
+  const groupStoreKey = (tenantId: string, group: string): string =>
+    `${prefix}:${encodeURIComponent(tenantId)}:${config.id}:browser:group:${encodeURIComponent(group)}`;
 
   // One EventLog per tenant, shared by every handle in this scope.
   const eventLogs = sharedState(`topic:logs:${prefix}:${config.id}`, config.store, () => new Map<string, EventLog>());
   const getEventLog = (tenantId: string): EventLog => {
-    const key = `${prefix}:${tenantId}:${config.id}`;
+    const key = eventLogMapKey(tenantId);
     let log = eventLogs.get(key);
     if (!log) {
-      log = new EventLog({ retentionMs });
+      const initialEntries = config.store ? persistedEntries(store.get(eventLogStoreKey(tenantId))) : [];
+      log = new EventLog({ retentionMs, initialEntries });
       eventLogs.set(key, log);
     }
     return log;
+  };
+  const persistEventLog = (tenantId: string, log: EventLog): void => {
+    if (config.store) store.set(eventLogStoreKey(tenantId), { entries: log.snapshot() });
   };
 
   const idempotencyKey = (tenantId: string, key: string): string =>
@@ -201,6 +277,10 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
 
   const pub = async (pubCfg: TopicPubConfig<TData>): Promise<{ eventId: string; cursor: string }> => {
     const tenantId = resolveTenant(pubCfg.tenantId);
+    const idempotencyTtlMs = pubCfg.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS;
+    if (pubCfg.idempotencyKey || pubCfg.idempotencyTtlMs !== undefined) {
+      assertTtlMs(idempotencyTtlMs);
+    }
     const log = getEventLog(tenantId);
 
     const payload: StoredEvent<TData> = {
@@ -220,22 +300,45 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     if (pubCfg.idempotencyKey) {
       const idemKey = idempotencyKey(tenantId, pubCfg.idempotencyKey);
       const existing = store.get(idemKey) as string | undefined;
-      if (existing) {
+      if (existing && log.has(existing)) {
         return { eventId: existing, cursor: existing };
       }
+      if (existing) store.del(idemKey);
 
-      const eventId = log.append({ payload: payloadRaw });
-      store.set(idemKey, eventId, pubCfg.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS);
+      const eventId = log.append(
+        { payload: payloadRaw },
+        {
+          beforeEmit: (entry) => {
+            persistEventLog(tenantId, log);
+            store.set(idemKey, entry.id, idempotencyTtlMs);
+          },
+          rollback: () => {
+            persistEventLog(tenantId, log);
+            store.del(idemKey);
+          },
+        },
+      );
       return { eventId, cursor: eventId };
     }
 
-    const eventId = log.append({ payload: payloadRaw });
+    const eventId = log.append(
+      { payload: payloadRaw },
+      { beforeEmit: () => persistEventLog(tenantId, log) },
+    );
     return { eventId, cursor: eventId };
   };
 
   const latestCursor = async (cursorCfg: TopicCursorConfig = {}): Promise<string | null> => {
     const tenantId = resolveTenant(cursorCfg.tenantId);
-    const cursor = getEventLog(tenantId).latest();
+    const existing = eventLogs.get(eventLogMapKey(tenantId));
+    const cursor = existing
+      ? existing.latest()
+      : config.store
+        ? new EventLog({
+            retentionMs,
+            initialEntries: persistedEntries(store.get(eventLogStoreKey(tenantId))),
+          }).latest()
+        : "0";
     return cursor === "0" ? null : cursor;
   };
 
@@ -251,21 +354,20 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
    * after an SPA remount or a React StrictMode double-mount replayed the entire
    * retained log.
    */
-  type GroupState = {
-    /** Last committed id. Delivery resumes from here, not from what was handed out. */
-    committed: string;
-    /** Highest id handed out but not yet committed. */
-    delivered: string;
-    /** eventId -> when it was delivered, for reclaim after minIdleMs. */
-    inFlight: Map<string, { at: number; consumerId: string }>;
-  };
-
   const groupState = (tenantId: string, group: string): GroupState =>
-    sharedState(`topic:group:${prefix}:${tenantId}:${config.id}:${group}`, config.store, () => ({
-      committed: "0",
-      delivered: "0",
-      inFlight: new Map<string, { at: number; consumerId: string }>(),
-    }));
+    sharedState(`topic:group:${prefix}:${tenantId}:${config.id}:${group}`, config.store, () => {
+      const restored = config.store ? persistedGroup(store.get(groupStoreKey(tenantId, group))) : null;
+      return restored ?? { committed: "0", delivered: "0", inFlight: new Map() };
+    });
+  const persistGroup = (tenantId: string, group: string, state: GroupState): void => {
+    if (!config.store) return;
+    const persisted: PersistedGroupState = {
+      committed: state.committed,
+      delivered: state.delivered,
+      inFlight: [...state.inFlight.entries()],
+    };
+    store.set(groupStoreKey(tenantId, group), persisted);
+  };
 
   const reader = (group = "default", readerCfg: TopicReaderConfig = {}): RecoverableTopicReader<TData> => {
     const consumerId = readerCfg.consumerId ?? `consumer:${randomId()}`;
@@ -297,11 +399,13 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
         }
         state.committed = entry.id;
         state.delivered = entry.id;
+        persistGroup(tenantId, group, state);
         return null;
       }
 
       state.delivered = entry.id;
       state.inFlight.set(entry.id, { at: Date.now(), consumerId });
+      persistGroup(tenantId, group, state);
 
       const commit = async (): Promise<boolean> => {
         const held = state.inFlight.get(entry.id);
@@ -309,6 +413,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
         if (!held || held.consumerId !== consumerId) return false;
         state.inFlight.delete(entry.id);
         if (Number(entry.id) > Number(state.committed)) state.committed = entry.id;
+        persistGroup(tenantId, group, state);
         return true;
       };
 
@@ -341,6 +446,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
 
     const recv = async (recvCfg: TopicRecvConfig = {}): Promise<TopicDelivery<TData> | null> => {
       assertOpen();
+      if (recvCfg.signal?.aborted) return null;
       const tenantId = resolveTenant(recvCfg.tenantId);
       const log = getEventLog(tenantId);
       const state = groupState(tenantId, group);
@@ -415,20 +521,24 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
 
       const entries: Array<TopicReclaimedDelivery<TData>> = [];
       let lastId = "0-0";
+      let groupChanged = false;
       for (const [eventId] of stale) {
         lastId = eventId;
         const found = log.range(String(Number(eventId) - 1), 1).find((e) => e.id === eventId);
         if (!found) {
           state.inFlight.delete(eventId);
+          groupChanged = true;
           continue;
         }
         // Take ownership, then hand it out again.
         state.inFlight.set(eventId, { at: now, consumerId });
+        groupChanged = true;
         const commit = async (): Promise<boolean> => {
           const held = state.inFlight.get(found.id);
           if (!held || held.consumerId !== consumerId) return false;
           state.inFlight.delete(found.id);
           if (Number(found.id) > Number(state.committed)) state.committed = found.id;
+          persistGroup(tenantId, group, state);
           return true;
         };
 
@@ -461,6 +571,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
           },
         });
       }
+      if (groupChanged) persistGroup(tenantId, group, state);
 
       return { nextCursor: candidates.length > stale.length ? lastId : "0-0", entries };
     };
