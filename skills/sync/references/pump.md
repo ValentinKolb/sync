@@ -195,7 +195,7 @@ const externalImport = pump<
 `delayMs` paces successful pages. Provider request budgets still belong in the
 API client or a shared rate limiter; pump pacing is not a rate limiter.
 
-An empty page that returns the current non-terminal cursor has made no progress.
+A page that returns the current non-terminal cursor has made no durable progress.
 Pump retries it with the configured retry backoff and marks the run failed after
 `maxAttempts`. Return `nextCursor: null` when the source is exhausted.
 
