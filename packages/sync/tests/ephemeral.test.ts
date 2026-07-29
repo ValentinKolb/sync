@@ -535,3 +535,52 @@ test("a ttlMs Redis cannot express is rejected at the call site", async () => {
   // A large but expressible TTL still works.
   await store.upsert({ key: "ok", value: { v: 1 }, ttlMs: 1_000_000_000_000 });
 });
+
+test("a reader that falls behind after a healthy start gets an overflow", async () => {
+  const id = testId("overflow-live");
+  const store = ephemeral<{ n: number }>({ id, ttlMs: 60_000 });
+  const eventsKey = `sync:e:default:${id}:events`;
+
+  // Start healthy: anchor on a real cursor and consume one event without gaps.
+  await store.upsert({ key: "seed", value: { n: 0 } });
+  const anchor = await store.snapshot({});
+  const reader = store.reader({ after: anchor.cursor });
+
+  await store.upsert({ key: "a", value: { n: 1 } });
+  expect((await reader.recv({ wait: false }))?.type).toBe("upsert");
+
+  // Now stall while writers keep going, until retention discards the reader's
+  // cursor. Trimmed exactly here, because production trims approximately and
+  // would not drop anything in a stream this small.
+  for (let i = 0; i < 5; i++) {
+    await store.upsert({ key: `k${i}`, value: { n: i } });
+  }
+  await redis.send("XTRIM", [eventsKey, "MAXLEN", "2"]);
+
+  // The gap check was a one-shot latch over the constructor cursor, so this
+  // silently returned the oldest surviving entry as an ordinary upsert and the
+  // consumer's materialised view stayed permanently wrong.
+  const next = await reader.recv({ wait: false });
+  expect(next?.type).toBe("overflow");
+});
+
+test("a reader that keeps up never sees a spurious overflow", async () => {
+  const store = ephemeral<{ n: number }>({
+    id: testId("overflow-none"),
+    ttlMs: 60_000,
+    limits: { eventMaxLen: 1_000 },
+  });
+
+  await store.upsert({ key: "seed", value: { n: 0 } });
+  const anchor = await store.snapshot({});
+  const reader = store.reader({ after: anchor.cursor });
+
+  const types: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    await store.upsert({ key: `k${i}`, value: { n: i } });
+    const event = await reader.recv({ wait: false });
+    if (event) types.push(event.type);
+  }
+
+  expect(types).toEqual(["upsert", "upsert", "upsert", "upsert", "upsert"]);
+});

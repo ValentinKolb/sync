@@ -790,22 +790,33 @@ export const ephemeral = <T>(config: EphemeralConfig<T>): EphemeralStore<T> => {
       return blockingClient;
     };
 
+    /**
+     * Overflow is a property of the reader, not of its first read. This used to
+     * be a one-shot latch over the constructor-supplied cursor, so a reader that
+     * started healthy and then fell behind — a GC pause, a slow handler, a long
+     * redeploy — silently resumed at the oldest surviving entry with no signal.
+     * Every event in the trimmed range was dropped from the consumer's
+     * materialised view permanently, because the corrective event was gone too.
+     *
+     * It now runs against the live cursor before every read.
+     */
     const checkReplayGap = async (): Promise<void> => {
-      if (replayChecked) return;
+      const from = replayChecked ? cursor : (readerCfg.after ?? cursor);
       replayChecked = true;
 
-      const after = readerCfg.after;
-      if (!after || after === "$") return;
+      if (!from || from === "$") return;
 
-      const firstAtOrAfter = await firstAtOrAfterCursor(keys.events, after);
+      const firstAtOrAfter = await firstAtOrAfterCursor(keys.events, from);
       if (!firstAtOrAfter) return;
 
-      if (after === "0-0" || firstAtOrAfter !== after) {
+      // `0-0` means "replay everything", which is an overflow by definition
+      // whenever the stream has already been trimmed at all.
+      if (from === "0-0" || firstAtOrAfter !== from) {
         const liveCursor = await latestCursor(keys.events);
         overflowPending = {
           type: "overflow",
           cursor: liveCursor,
-          after,
+          after: from,
           firstAvailable: firstAtOrAfter,
         };
         cursor = liveCursor;
