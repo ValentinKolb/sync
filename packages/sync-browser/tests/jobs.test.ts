@@ -562,6 +562,40 @@ test("a failed heartbeat aborts the attempt without false completion", async () 
   expect(events).toEqual(["submitted", "started"]);
 });
 
+test("a rejected reschedule does not increment the reschedule metric", async () => {
+  const id = uid("lost-reschedule");
+  let started = false;
+  let afterCalled = false;
+
+  const worker = job({
+    id,
+    defaults: { leaseMs: 50 },
+    process: async () => {
+      started = true;
+      await Bun.sleep(120);
+    },
+    after: async ({ ctx }) => {
+      afterCalled = true;
+      ctx.reschedule();
+    },
+  });
+
+  await worker.submit({ key: "lost-reschedule" });
+  await waitFor(() => started);
+  await Bun.sleep(70);
+
+  const competitor = queue({ id: `${id}:work`, prefix: "sync:job:queue" });
+  const stolen = await competitor.recv({ wait: false });
+  expect(stolen).not.toBeNull();
+
+  await waitFor(() => afterCalled);
+  await Bun.sleep(20);
+  expect(worker.metric().reschedules).toBe(0);
+
+  worker.stop();
+  expect(await stolen?.ack()).toBe(true);
+});
+
 // ==========================
 // after error swallow
 // ==========================

@@ -309,8 +309,8 @@ export const job = <Input = void, Result = unknown>(
                 reason: "reschedule",
                 error: error?.message,
               });
-              metrics.reschedules += 1;
               if (!nacked) continue;
+              metrics.reschedules += 1;
               await emitTrace(config.trace, {
                 type: "rescheduled",
                 jobId: payload.jobId,

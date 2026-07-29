@@ -104,6 +104,6 @@ const msg2 = await reader.recv({ signal });
 - `{prefix}:{tenantId}:{id}:delayed` — sorted set of delayed messages
 - `{prefix}:{tenantId}:{id}:deliveries` + `:leases` + `:active`
 - `{prefix}:{tenantId}:{id}:delivery-owners` — messageId → deliveryId reverse index
-- `{prefix}:{tenantId}:{id}:orphan-candidates` + `:maintenance` — bounded rolling-upgrade recovery state
+- `{prefix}:{tenantId}:{id}:orphan-candidates` + `:maintenance` — incremental rolling-upgrade recovery state
 - `{prefix}:{tenantId}:{id}:dlq` — dead-letter list
 - `{prefix}:{tenantId}:{id}:idempotency:{key}` — messageId with TTL

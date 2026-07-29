@@ -426,8 +426,9 @@ test("a message orphaned between dequeue and claim is recovered, not lost", asyn
   expect(await redis.send("HLEN", [`${base}:deliveries`])).toBe(0);
   expect(await redis.send("LLEN", [`${base}:ready`])).toBe(0);
 
-  // The first bounded pass only records the suspicion. Requeueing immediately
+  // The first pass only records the suspicion. Requeueing immediately
   // would race an older worker between its LMOVE and delivery write.
+  expect(await q.recv({ wait: false })).toBeNull();
   expect(await q.recv({ wait: false })).toBeNull();
   const recovered = await q.recv({ wait: false });
   expect(recovered).not.toBeNull();
@@ -476,6 +477,81 @@ test("maintenance backfills a legacy in-flight delivery before orphan recovery",
   expect(await held?.ack()).toBe(true);
 });
 
+test("a legacy delivery inserted mid-scan survives the overlapping generation", async () => {
+  const id = uid("orphan-mid-scan-claim");
+  const q = queue<{ v: number }>({ id, prefix: "test:fq" });
+  const base = `test:fq:default:${id}`;
+  const deliveriesKey = `${base}:deliveries`;
+  const future = Date.now() + 60_000;
+
+  const orphan = await q.send({ data: { v: 1 } });
+  expect(await redis.send("LMOVE", [`${base}:ready`, `${base}:active`, "RIGHT", "LEFT"])).toBe(orphan.messageId);
+
+  const dummyDeliveries: string[] = [deliveriesKey];
+  for (let i = 0; i < 1_000; i++) {
+    dummyDeliveries.push(
+      `dummy-${i}`,
+      JSON.stringify({ messageId: `dummy-message-${i}`, leaseUntil: future, attempt: 1 }),
+    );
+  }
+  await redis.send("HSET", dummyDeliveries);
+
+  // Records the orphan candidate while the first delivery scan is still open.
+  expect(await q.recv({ wait: false })).toBeNull();
+  const initialCursor = String(await redis.send("HGET", [`${base}:maintenance`, "deliveryCursor"]));
+  expect(initialCursor).not.toBe("0");
+
+  const appearsBeforeWrap = async (deliveryId: string): Promise<boolean> => {
+    let cursor = initialCursor;
+    do {
+      const result = (await redis.send("HSCAN", [deliveriesKey, cursor, "COUNT", "200"])) as [string, string[]];
+      cursor = String(result[0]);
+      for (let i = 0; i < result[1].length; i += 2) {
+        if (result[1][i] === deliveryId) return true;
+      }
+    } while (cursor !== "0");
+    return false;
+  };
+
+  // Pick a field in the already-visited part of the hash. Replaying HSCAN from
+  // the persisted cursor then deterministically misses this late insertion.
+  let legacyDeliveryId: string | undefined;
+  for (let i = 0; i < 100; i++) {
+    const candidate = `late-delivery-${i}`;
+    await redis.send("HSET", [
+      deliveriesKey,
+      candidate,
+      JSON.stringify({ messageId: orphan.messageId, leaseUntil: future, attempt: 1 }),
+    ]);
+    if (!(await appearsBeforeWrap(candidate))) {
+      legacyDeliveryId = candidate;
+      break;
+    }
+    await redis.send("HDEL", [deliveriesKey, candidate]);
+  }
+  expect(legacyDeliveryId).toBeDefined();
+  await redis.send("ZADD", [`${base}:leases`, String(future), legacyDeliveryId!]);
+
+  // Finishing the overlapping scan must not recover the message. The delivery
+  // was inserted after observation and may legitimately be absent from it.
+  let generation = 0;
+  while (generation < 1) {
+    expect(await q.recv({ wait: false })).toBeNull();
+    generation = Number(await redis.send("HGET", [`${base}:maintenance`, "deliveryGeneration"]));
+  }
+  expect(await redis.send("HGET", [`${base}:delivery-owners`, orphan.messageId])).toBeNull();
+  expect(await redis.send("LLEN", [`${base}:ready`])).toBe(0);
+
+  // The next scan starts after observation and must backfill the live owner.
+  let owner: unknown = null;
+  for (let i = 0; i < 20 && owner === null; i++) {
+    expect(await q.recv({ wait: false })).toBeNull();
+    owner = await redis.send("HGET", [`${base}:delivery-owners`, orphan.messageId]);
+  }
+  expect(owner).toBe(legacyDeliveryId);
+  expect(await redis.send("LLEN", [`${base}:ready`])).toBe(0);
+});
+
 test("an orphan is recovered without requeueing an unrelated live delivery", async () => {
   const id = uid("orphan-with-live-delivery");
   const q = queue<{ v: number }>({ id, prefix: "test:fq" });
@@ -488,8 +564,8 @@ test("an orphan is recovered without requeueing an unrelated live delivery", asy
   const orphan = await q.send({ data: { v: 1 } });
   expect(await redis.send("LMOVE", [`${base}:ready`, `${base}:active`, "RIGHT", "LEFT"])).toBe(orphan.messageId);
 
-  // First pass records the missing owner. The next completed delivery scan
-  // proves that only the parked message is orphaned.
+  // The candidate waits until a scan started after observation has completed.
+  expect(await q.reader().recv({ wait: false })).toBeNull();
   expect(await q.reader().recv({ wait: false })).toBeNull();
   const recovered = await q.reader().recv({ wait: false });
 
@@ -498,27 +574,6 @@ test("an orphan is recovered without requeueing an unrelated live delivery", asy
   expect(await redis.send("LLEN", [`${base}:ready`])).toBe(0);
   expect(await held?.ack()).toBe(true);
   expect(await recovered?.ack()).toBe(true);
-});
-
-test("legacy delivery indexing is incremental instead of scanning the full hash", async () => {
-  const id = uid("orphan-bounded-scan");
-  const q = queue<{ v: number }>({ id, prefix: "test:fq" });
-  const base = `test:fq:default:${id}`;
-  const future = Date.now() + 60_000;
-  const deliveries: string[] = [`${base}:deliveries`];
-
-  for (let i = 0; i < 1_000; i++) {
-    deliveries.push(
-      `delivery-${i}`,
-      JSON.stringify({ messageId: `message-${i}`, leaseUntil: future, attempt: 1 }),
-    );
-  }
-  await redis.send("HSET", deliveries);
-
-  expect(await q.recv({ wait: false })).toBeNull();
-  const indexed = Number(await redis.send("HLEN", [`${base}:delivery-owners`]));
-  expect(indexed).toBeGreaterThan(0);
-  expect(indexed).toBeLessThan(1_000);
 });
 
 // ==========================

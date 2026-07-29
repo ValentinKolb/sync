@@ -230,45 +230,57 @@ const MAINTENANCE_SCRIPT = `
   end
 
   local activeLength = tonumber(redis.call("LLEN", KEYS[6])) or 0
-  if activeLength > 0 then
-    local activeOffset = tonumber(redis.call("HGET", KEYS[12], "activeOffset")) or 0
-    if activeOffset >= activeLength then activeOffset = 0 end
-    local activeIds = redis.call("LRANGE", KEYS[6], activeOffset, activeOffset + batch - 1)
-    local nextActiveOffset = activeOffset + #activeIds
-    if nextActiveOffset >= activeLength then nextActiveOffset = 0 end
-    redis.call("HSET", KEYS[12], "activeOffset", tostring(nextActiveOffset))
+  local inspectCount = math.min(activeLength, batch)
+  for _ = 1, inspectCount do
+    -- Claims enter at the head. Rotating from the tail guarantees that old
+    -- entries are inspected even while new claims arrive continuously.
+    local messageId = redis.call("RPOPLPUSH", KEYS[6], KEYS[6])
+    if not messageId then break end
 
-    for _, messageId in ipairs(activeIds) do
-      local deliveryId = redis.call("HGET", KEYS[10], messageId)
-      if deliveryId and redis.call("HEXISTS", KEYS[4], deliveryId) == 1 then
+    local deliveryId = redis.call("HGET", KEYS[10], messageId)
+    if deliveryId and redis.call("HEXISTS", KEYS[4], deliveryId) == 1 then
+      redis.call("HDEL", KEYS[11], messageId)
+    else
+      redis.call("HDEL", KEYS[10], messageId)
+      local candidate = redis.call("HGET", KEYS[11], messageId)
+      local observedGeneration = candidate and tonumber(string.match(candidate, "^([^:]+)"))
+      local observedAttempt = candidate and tonumber(string.match(candidate, ":(.+)$"))
+      local messageRaw = redis.call("HGET", KEYS[5], messageId)
+      local message = messageRaw and readMessage(messageRaw)
+      if not message then
+        redis.call("LPOP", KEYS[6])
         redis.call("HDEL", KEYS[11], messageId)
-      else
-        redis.call("HDEL", KEYS[10], messageId)
-        redis.call("HSETNX", KEYS[11], messageId, tostring(generation))
+      elseif not observedGeneration or observedAttempt ~= (tonumber(message.attempt) or 0) then
+        -- A legacy nack + claim increments the attempt without touching this
+        -- hash. Treat that as a new active incarnation and observe it afresh.
+        redis.call(
+          "HSET",
+          KEYS[11],
+          messageId,
+          tostring(generation) .. ":" .. tostring(tonumber(message.attempt) or 0)
+        )
+      elseif observedGeneration + 2 <= generation then
+        -- RPOPLPUSH put this entry at the head, so removal is O(1).
+        redis.call("LPOP", KEYS[6])
+        redis.call("HDEL", KEYS[11], messageId)
+        if redis.call("HEXISTS", KEYS[5], messageId) == 1 then
+          redis.call("LPUSH", KEYS[1], messageId)
+          notifyReady(KEYS[8])
+        end
       end
     end
   end
 
-  -- Candidates also need their own cursor: an old worker may ack after a
-  -- candidate is recorded, removing it from active before it is sampled again.
+  -- A legacy worker can ack after a candidate was recorded. Clean terminal
+  -- candidates incrementally; nacked candidates are cleared by the next claim.
   local candidateCursor = redis.call("HGET", KEYS[12], "candidateCursor") or "0"
   local candidateScan = redis.call("HSCAN", KEYS[11], candidateCursor, "COUNT", tostring(batch))
   redis.call("HSET", KEYS[12], "candidateCursor", candidateScan[1])
   local candidateEntries = candidateScan[2]
   for i = 1, #candidateEntries, 2 do
     local messageId = candidateEntries[i]
-    local observedGeneration = tonumber(candidateEntries[i + 1]) or generation
-    local deliveryId = redis.call("HGET", KEYS[10], messageId)
-    if deliveryId and redis.call("HEXISTS", KEYS[4], deliveryId) == 1 then
+    if redis.call("HEXISTS", KEYS[5], messageId) == 0 then
       redis.call("HDEL", KEYS[11], messageId)
-    elseif observedGeneration < generation then
-      local removed = redis.call("LREM", KEYS[6], 1, messageId)
-      redis.call("HDEL", KEYS[10], messageId)
-      redis.call("HDEL", KEYS[11], messageId)
-      if removed > 0 and redis.call("HEXISTS", KEYS[5], messageId) == 1 then
-        redis.call("LPUSH", KEYS[1], messageId)
-        notifyReady(KEYS[8])
-      end
     end
   end
 
