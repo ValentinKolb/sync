@@ -731,22 +731,40 @@ test("schedulerControl runNow times out when nothing accepts", async () => {
 
 test("schedulerControl runNow waits for acceptance rather than returning immediately", async () => {
   const prefix = uid("control-accept-prefix");
-  const s = makeScheduler(uid("control-accept"), { prefix });
-
+  const schedulerId = uid("control-accept");
+  const instanceId = uid("control-instance");
   let accepted = false;
-  await s.create({
-    id: "slow",
-    cron: "0 3 * * *",
-    tz: "UTC",
-    process: async () => {
+  registerBrowserSchedulerControl({
+    prefix,
+    schedulerId,
+    scheduleId: "slow",
+    instanceId,
+    getInfo: () => ({
+      id: "slow",
+      cron: "0 3 * * *",
+      tz: "UTC",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      nextRunAt: Date.now() + 60_000,
+      runNumber: 0,
+      failureCount: 0,
+    }),
+    runNow: async (onAccepted) => {
+      await Bun.sleep(50);
       accepted = true;
-      await Bun.sleep(200);
+      onAccepted?.();
     },
   });
-  s.start();
+  setBrowserSchedulerControlAvailable({ prefix, schedulerId, instanceId, available: true });
 
-  await schedulerControl({ prefix }).runNow({ schedulerId: s.id, scheduleId: "slow", timeoutMs: 5_000 });
-  expect(accepted).toBe(true);
+  try {
+    const startedAt = Date.now();
+    await schedulerControl({ prefix }).runNow({ schedulerId, scheduleId: "slow", timeoutMs: 5_000 });
+    expect(accepted).toBe(true);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(40);
+  } finally {
+    unregisterBrowserSchedulerControl({ prefix, schedulerId, scheduleId: "slow", instanceId });
+  }
 });
 
 test("schedulerControl executes one run for repeated requestId calls", async () => {
