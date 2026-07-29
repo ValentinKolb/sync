@@ -83,7 +83,7 @@ const apps = ephemeral<{ version: string; endpoints: string[] }>({
 await apps.upsert({ key: "apps/backend", value: { ... } });
 await apps.upsert({ key: "services/cache", value: { ... } });
 
-// Snapshot just the "apps/" prefix (server: ZRANGEBYLEX; browser: startsWith)
+// Snapshot just the "apps/" prefix (both runtimes: read all, filter by startsWith)
 const allApps = await apps.snapshot({ prefix: "apps/" });
 
 // Admin-UI: show uptime per app

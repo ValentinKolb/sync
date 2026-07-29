@@ -59,17 +59,29 @@ export const isRetryableTransportError = (error: unknown): boolean => {
     return true;
   }
 
+  // Anchored on transport vocabulary rather than bare words: "connection" and
+  // "loading" match plenty of application error messages, and misclassifying a
+  // user error as retryable replays it silently.
   const message = asError(error).message.toLowerCase();
   return (
     message.includes("econnreset") ||
+    message.includes("econnrefused") ||
+    message.includes("epipe") ||
     message.includes("etimedout") ||
-    message.includes("connection") ||
-    message.includes("socket") ||
+    message.includes("connection closed") ||
+    message.includes("connection refused") ||
+    message.includes("connection reset") ||
+    message.includes("connection lost") ||
+    message.includes("socket closed") ||
+    message.includes("socket hang up") ||
     message.includes("broken pipe") ||
-    message.includes("network") ||
-    message.includes("loading") ||
-    message.includes("tryagain") ||
-    message.includes("clusterdown")
+    message.includes("network error") ||
+    // Redis error replies lead with their code, so anchor on the prefix rather
+    // than matching the bare word anywhere in an application message.
+    message.startsWith("loading") ||
+    message.startsWith("tryagain") ||
+    message.startsWith("clusterdown") ||
+    message.startsWith("masterdown")
   );
 };
 
@@ -89,7 +101,12 @@ export const expBackoff = (attempt: number, cfg?: BackoffOptions): number => {
 };
 
 const sleepWithSignal = async (delayMs: number, signal?: AbortSignal): Promise<void> => {
-  if (delayMs <= 0) return;
+  // Yield to the macrotask queue even at zero, so a synchronous run() with an
+  // unconditional reschedule cannot starve timers by draining microtasks only.
+  if (delayMs <= 0) {
+    await sleep(0);
+    return;
+  }
   if (!signal) {
     await sleep(delayMs);
     return;

@@ -27,16 +27,24 @@ For every shared public type exported from both packages, `Equal<A, B>` asserts 
 
 ### What's explicitly additive (not equality)
 
-Some browser configs accept an optional `store?: Store` field that the server does not need (Redis handles persistence). These are flagged with a one-way assignability check — server config must be assignable to browser config, not the reverse. This is *additive*: browser-specific extras don't break the shared contract.
+Some browser configs accept an optional `store?: Store` field that the server does not need (Redis handles persistence). These are asserted with `Equal<Omit<BrowserConfig, "store">, ServerConfig>` — equality in both directions once the additive field is removed. A one-way assignability check was used before and still compiled if the browser *removed* a field, which is exactly the divergence this harness exists to catch.
 
 Types that currently have additive fields:
 - `MutexConfig`
-- `QueueConfig` *(not currently — check code)*
 - `TopicConfig`
-- `EphemeralConfig` *(not currently — check code)*
+- `EphemeralConfig`
 - `SchedulerConfig`
 - `RateLimitConfig`
 - `PumpConfig`
+
+## What this harness does NOT catch
+
+It is a *type* check. Behavioural divergence compiles clean here: at the time of
+the 2026-07 robustness review, browser mutex and ratelimit not sharing state
+across same-id handles, browser topic being at-most-once, and browser
+`schedulerControl.runNow` never waiting all passed this file. Type parity is a
+floor, not evidence that the two runtimes behave alike — that is what the
+parallel test suites below are for.
 
 ## Behavior parity
 

@@ -238,21 +238,21 @@ const assertEqual = <T extends true>(_: T): void => {
 
 assertEqual<Equal<S_RateLimiter, B_RateLimiter>>(true);
 assertEqual<Equal<S_RateLimitResult, B_RateLimitResult>>(true);
-// RateLimitConfig differs: browser has optional `store?: Store` additive
-const _rlCfgAdditive: B_RateLimitConfig = {} as unknown as S_RateLimitConfig;
-void _rlCfgAdditive;
+// The browser adds `store?`. Everything else must be equal in BOTH directions:
+// the old one-way assignability check still compiled if the browser *removed* a
+// field, which is precisely the divergence the harness exists to catch.
+assertEqual<Equal<Omit<B_RateLimitConfig, "store">, S_RateLimitConfig>>(true);
 
 // ==========================
 // Mutex
 // ==========================
 
 assertEqual<Equal<S_Mutex, B_Mutex>>(true);
+assertEqual<Equal<Omit<B_MutexConfig, "store">, S_MutexConfig>>(true);
 assertEqual<Equal<S_Lock, B_Lock>>(true);
 // MutexConfig differs: browser has additional `store?: Store` additive field.
 // Assert instead that S_MutexConfig is assignable to B_MutexConfig
 // (server config is valid on browser).
-const _mutexCfgAdditive: B_MutexConfig = {} as unknown as S_MutexConfig;
-void _mutexCfgAdditive;
 
 // ==========================
 // Queue
@@ -270,10 +270,9 @@ assertEqual<Equal<S_QueueReceived<{ foo: string }>, B_QueueReceived<{ foo: strin
 // ==========================
 
 assertEqual<Equal<S_Topic<{ foo: string }>, B_Topic<{ foo: string }>>>(true);
+assertEqual<Equal<Omit<B_TopicConfig<{ foo: string }>, "store">, S_TopicConfig<{ foo: string }>>>(true);
 assertEqual<Equal<S_RecoverableTopic<{ foo: string }>, B_RecoverableTopic<{ foo: string }>>>(true);
 // TopicConfig differs: browser has optional `store?` additive field
-const _topicCfgAdditive: B_TopicConfig<{ foo: string }> = {} as unknown as S_TopicConfig<{ foo: string }>;
-void _topicCfgAdditive;
 assertEqual<Equal<S_TopicReader<{ foo: string }>, B_TopicReader<{ foo: string }>>>(true);
 assertEqual<Equal<S_RecoverableTopicReader<{ foo: string }>, B_RecoverableTopicReader<{ foo: string }>>>(true);
 assertEqual<Equal<S_TopicCursorConfig, B_TopicCursorConfig>>(true);
@@ -336,6 +335,7 @@ assertEqual<Equal<S_PumpPullResult<PumpCursor, PumpData>, B_PumpPullResult<PumpC
 assertEqual<Equal<S_PumpRetryConfig, B_PumpRetryConfig>>(true);
 assertEqual<Equal<S_PumpTraceEvent<PumpInput, PumpCursor>, B_PumpTraceEvent<PumpInput, PumpCursor>>>(true);
 // PumpConfig differs: browser has optional `store?` additive.
+assertEqual<Equal<Omit<B_PumpConfig<PumpInput, PumpCursor, PumpData>, "store">, S_PumpConfig<PumpInput, PumpCursor, PumpData>>>(true);
 const _pumpCfgAdditive: B_PumpConfig<PumpInput, PumpCursor, PumpData> =
   {} as unknown as S_PumpConfig<PumpInput, PumpCursor, PumpData>;
 void _pumpCfgAdditive;
@@ -349,8 +349,6 @@ assertEqual<Equal<S_PumpHandle<PumpInput, PumpCursor>, B_PumpHandle<PumpInput, P
 
 assertEqual<Equal<S_Scheduler, B_Scheduler>>(true);
 // SchedulerConfig differs: browser has optional `store?` additive
-const _schedCfgAdditive: B_SchedulerConfig = {} as unknown as S_SchedulerConfig;
-void _schedCfgAdditive;
 assertEqual<Equal<S_SchedulerInfo, B_SchedulerInfo>>(true);
 assertEqual<Equal<S_SchedulerMetrics, B_SchedulerMetrics>>(true);
 assertEqual<Equal<S_SchedulerTraceEvent<number>, B_SchedulerTraceEvent<number>>>(true);
@@ -377,3 +375,41 @@ assertEqual<Equal<S_BackoffOptions, B_BackoffOptions>>(true);
 assertEqual<Equal<S_RetryCtx, B_RetryCtx>>(true);
 assertEqual<Equal<S_RetryAfterCtx<number>, B_RetryAfterCtx<number>>>(true);
 assertEqual<Equal<S_RetryConfig<number>, B_RetryConfig<number>>>(true);
+
+// ==========================
+// Public surface (entrypoints)
+// ==========================
+
+// The assertions above import from `packages/*/src/*`, so the actual published
+// surface was never compared: an export could be missing, renamed, or a value
+// (an error class, a factory) could diverge without failing here. These compare
+// the two `index.ts` entrypoints as values, which subsumes error classes and
+// factory signatures.
+
+import * as ServerApi from "../packages/sync/index";
+import * as BrowserApi from "../packages/sync-browser/index";
+
+/** Exports that exist only in the browser build. */
+type BrowserOnlyKeys = "createMemoryStore" | "createLocalStorageStore" | "MemoryStore" | "LocalStorageStore";
+
+type ServerKeys = keyof typeof ServerApi;
+type BrowserSharedKeys = Exclude<keyof typeof BrowserApi, BrowserOnlyKeys>;
+
+// Same set of shared exports, in both directions.
+assertEqual<Equal<Exclude<ServerKeys, BrowserSharedKeys>, never>>(true);
+assertEqual<Equal<Exclude<BrowserSharedKeys, ServerKeys>, never>>(true);
+
+// Error classes are values, so they were compared nowhere before.
+assertEqual<Equal<typeof ServerApi.RateLimitError, typeof BrowserApi.RateLimitError>>(true);
+assertEqual<Equal<typeof ServerApi.LockError, typeof BrowserApi.LockError>>(true);
+assertEqual<Equal<typeof ServerApi.TopicPayloadError, typeof BrowserApi.TopicPayloadError>>(true);
+assertEqual<Equal<typeof ServerApi.SchedulerControlNotFoundError, typeof BrowserApi.SchedulerControlNotFoundError>>(true);
+assertEqual<Equal<typeof ServerApi.SchedulerControlUnavailableError, typeof BrowserApi.SchedulerControlUnavailableError>>(true);
+assertEqual<Equal<typeof ServerApi.SchedulerControlTimeoutError, typeof BrowserApi.SchedulerControlTimeoutError>>(true);
+
+// Factory signatures. Factories whose config carries the additive `store?` are
+// covered by the Omit-based config assertions above instead; comparing them
+// here would just re-report that difference.
+assertEqual<Equal<typeof ServerApi.retry, typeof BrowserApi.retry>>(true);
+assertEqual<Equal<typeof ServerApi.expBackoff, typeof BrowserApi.expBackoff>>(true);
+assertEqual<Equal<typeof ServerApi.isRetryableTransportError, typeof BrowserApi.isRetryableTransportError>>(true);

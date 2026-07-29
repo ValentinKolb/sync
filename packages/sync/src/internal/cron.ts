@@ -1,5 +1,3 @@
-export type MisfirePolicy = "skip" | "catch_up_one" | "catch_up_all";
-
 type CronField = {
   any: boolean;
   values: Set<number>;

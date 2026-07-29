@@ -212,3 +212,16 @@ test("errors in after are swallowed and terminal decision applies", async () => 
   ).rejects.toThrow("original");
   expect(runs).toBe(1);
 });
+
+test("isRetryableTransportError does not misclassify application errors", () => {
+  // These used to match on the bare substrings "connection" and "loading",
+  // so a user error was replayed silently as a transport blip.
+  expect(isRetryableTransportError(new Error("invalid connection string in config"))).toBe(false);
+  expect(isRetryableTransportError(new Error("error loading user profile"))).toBe(false);
+  expect(isRetryableTransportError(new Error("socket must be a string"))).toBe(false);
+  expect(isRetryableTransportError(new Error("network policy denied"))).toBe(false);
+
+  // Genuine transport failures still match.
+  expect(isRetryableTransportError(new Error("Connection reset by peer"))).toBe(true);
+  expect(isRetryableTransportError(new Error("LOADING Redis is loading the dataset in memory"))).toBe(true);
+});

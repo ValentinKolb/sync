@@ -112,7 +112,9 @@ export const mutex = (config: MutexConfig): Mutex => {
 
   const extend = async (lock: Lock, ttl: number = defaultTtl): Promise<boolean> => {
     const result = await redis.send("EVAL", [EXTEND_SCRIPT, "1", lock.resource, lock.value, ttl.toString()]);
-    if (result === 1) {
+    // `Number(result) > 0` is what the rest of the package uses; a strict === 1
+    // silently returns false if the driver ever hands back a string.
+    if (Number(result) > 0) {
       lock.ttl = ttl;
       lock.expiration = Date.now() + ttl;
       return true;

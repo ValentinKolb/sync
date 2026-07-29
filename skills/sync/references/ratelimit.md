@@ -60,5 +60,5 @@ try {
 
 ## Redis keys (server)
 
-- `{prefix}:{id}:{identifier}` — sorted set of request timestamps
+- `{prefix}:{id}:{identifier}:{window}` — counter per fixed window, expired automatically. The sliding window is computed by weighting the previous window's counter against elapsed time; no sorted set of timestamps is kept.
 - Auto-expires past-window entries during each `check`
