@@ -177,6 +177,31 @@ test("scheduler dispatches via tick loop when nextRunAt is past", async () => {
   expect(runs).toBe(1);
 });
 
+test("a leader without the handler yields long enough for the owner to run a due slot", async () => {
+  const schedulerId = uid("handler-handoff");
+  const owner = makeScheduler(schedulerId);
+  let runs = 0;
+
+  await owner.create({
+    id: "due",
+    cron: "0 3 * * *",
+    process: async ({ ctx }) => {
+      if (ctx.trigger === "cron") runs += 1;
+    },
+    after: async ({ ctx }) => {
+      if (ctx.trigger === "manual") ctx.reschedule({ delayMs: 0 });
+    },
+  });
+  await owner.runNow({ id: "due" });
+
+  const handlerless = makeScheduler(schedulerId);
+  handlerless.start();
+  owner.start();
+
+  await waitFor(() => runs === 1, 5_000);
+  expect(handlerless.metric().unservedSlots).toBeGreaterThan(0);
+});
+
 // ==========================
 // ctx.reschedule
 // ==========================

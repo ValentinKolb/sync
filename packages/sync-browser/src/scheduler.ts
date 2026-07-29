@@ -299,6 +299,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const activeRuns = new Set<AbortController>();
   let currentLeaderLock: Lock | null = null;
   let lastHeartbeatAt = 0;
+  let nextLeadershipAttemptAt = 0;
 
   const setLeader = (next: boolean): void => {
     if (metrics.isLeader === next) return;
@@ -308,6 +309,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
   const tryAcquireLeadership = async (): Promise<void> => {
     if (currentLeaderLock) return;
+    if (Date.now() < nextLeadershipAttemptAt) return;
     const acquired = await leaderMutex.acquire("active", leaseMs);
     if (!acquired) return;
     currentLeaderLock = acquired;
@@ -609,7 +611,10 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
       if (!handler) {
         // Mirror the server: do not advance a slot this instance cannot serve,
         // or the schedule silently never runs while its record looks healthy.
+        // Avoid immediately reacquiring the released lock on the same tick
+        // cadence and starving an instance that does own the handler.
         metrics.unservedSlots += 1;
+        nextLeadershipAttemptAt = Date.now() + leaseMs;
         await relinquishLeadership();
         return;
       }

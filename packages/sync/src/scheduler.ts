@@ -385,6 +385,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   const activeRuns = new Set<AbortController>();
   let currentLeaderLock: Lock | null = null;
   let lastHeartbeatAt = 0;
+  let nextLeadershipAttemptAt = 0;
 
   const controlQueueForSchedule = (scheduleId: string): ReturnType<typeof schedulerControlQueue> => {
     const existing = controlQueues.get(scheduleId);
@@ -402,6 +403,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
   const tryAcquireLeadership = async (): Promise<void> => {
     if (currentLeaderLock) return;
+    if (Date.now() < nextLeadershipAttemptAt) return;
     const acquired = await leaderMutex.acquire("active", leaseMs);
     if (!acquired) return;
     currentLeaderLock = acquired;
@@ -760,8 +762,11 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         // a black hole: leases are sticky, so the same handler-less leader kept
         // winning and skipping slot after slot while `get()`/`list()` showed a
         // healthy schedule with a frozen runNumber. Step down instead, so a pod
-        // that did register the handler can take over and actually run it.
+        // that did register the handler can take over and actually run it. A
+        // local cooldown prevents this same tick loop from immediately winning
+        // the released lock again and starving the capable pod.
         metrics.unservedSlots += 1;
+        nextLeadershipAttemptAt = Date.now() + leaseMs;
         await relinquishLeadership();
         return;
       }
