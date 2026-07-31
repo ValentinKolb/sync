@@ -12,7 +12,12 @@ const q = queue<{ to: string; subject: string }>({
   // prefix?: string,                        // default: "sync:queue"
   // tenantId?: string,                      // default: "default"
   // delivery?: { defaultLeaseMs: 30_000, maxDeliveries: 10 },
-  // limits?: { payloadBytes, maxMessageAgeMs, maxNackDelayMs, dlqRetentionMs },
+  // limits?: {
+  //   payloadBytes: 128 * 1024,
+  //   maxMessageAgeMs: 7 * 24 * 60 * 60 * 1000,
+  //   maxNackDelayMs: 7 * 24 * 60 * 60 * 1000,
+  //   dlqRetentionMs: 7 * 24 * 60 * 60 * 1000,
+  // },
   // ordering?: { mode: "best_effort" },   // "ordering_key_partitioned" is not implemented and throws
 });
 ```
@@ -32,6 +37,15 @@ type QueueSendConfig<T> = {
   meta?: Record<string, unknown>;
 };
 
+type QueueRecvConfig = {
+  tenantId?: string;
+  wait?: boolean;
+  timeoutMs?: number;
+  leaseMs?: number;
+  consumerId?: string;
+  signal?: AbortSignal;
+};
+
 type QueueReceived<T> = {
   data: T;
   messageId: string;
@@ -45,11 +59,27 @@ type QueueReceived<T> = {
   touch(cfg?: { leaseMs?: number }): Promise<boolean>;
 };
 
-type Queue<T> = {
-  send(cfg: QueueSendConfig<T>): Promise<{ messageId: string }>;
+type QueueDeadLetter<T> = {
+  messageId: string;
+  data: T;
+  attempts: number;
+  movedAt: number;
+  reason: string;
+  orderingKey?: string;
+  meta?: Record<string, unknown>;
+  lastError?: string;
+};
+
+type QueueReader<T> = {
   recv(cfg?: QueueRecvConfig): Promise<QueueReceived<T> | null>;
   stream(cfg?: QueueRecvConfig): AsyncIterable<QueueReceived<T>>;
+};
+
+type Queue<T> = QueueReader<T> & {
+  send(cfg: QueueSendConfig<T>): Promise<{ messageId: string }>;
   reader(): QueueReader<T>;
+  dlq(cfg?: { tenantId?: string; limit?: number }): Promise<QueueDeadLetter<T>[]>;
+  dlqRemove(cfg: { messageId: string; tenantId?: string }): Promise<boolean>;
 };
 ```
 

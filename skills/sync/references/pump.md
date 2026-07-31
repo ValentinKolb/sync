@@ -73,6 +73,39 @@ code only receives an `AbortSignal`.
 The internal dispatch checkpoint is persisted separately and does not count
 toward this source-page limit.
 
+Public progress and trace types:
+
+```ts
+type PumpStatus =
+  | "queued" | "running" | "waiting"
+  | "completed" | "failed" | "canceled";
+
+type PumpState<Input, Cursor> = {
+  key: string;
+  input: Input;
+  cursor: Cursor | null;
+  state: PumpStatus;
+  dispatched: number;
+  failureCount: number;
+  lastError?: string;
+  nextRunAt?: number;
+  meta?: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
+};
+
+type PumpTraceEvent<Input, Cursor> =
+  | { type: "submitted"; key: string; input: Input; meta?: Record<string, unknown> }
+  | { type: "started"; key: string; cursor: Cursor | null; failureCount: number }
+  | { type: "pulled"; key: string; itemCount: number; durationMs: number }
+  | { type: "dispatched"; key: string; itemKey: string; dispatched: number; durationMs: number }
+  | { type: "rescheduled"; key: string; failureCount: number; delayMs: number; error: Error }
+  | { type: "finished"; key: string; status: "completed" | "failed" | "canceled"; dispatched: number; durationMs: number; error?: Error };
+```
+
+Trace callbacks are awaited to preserve event order, but trace errors are logged
+and swallowed. Observability cannot change pump state or delivery decisions.
+
 ## Delivery and recovery
 
 The server stores `input`, the committed cursor, and the complete active page
@@ -88,6 +121,21 @@ deduplicate it. The cursor advances only after all page items were accepted.
 `input`, cursor values, items, and `meta` must contain only JSON values.
 Functions, `Date`, `BigInt`, `Error`, typed arrays, class instances, circular
 references, `undefined`, and non-finite numbers are rejected.
+
+`cancel({ key })` durably marks the run canceled and prevents later pages from
+being dispatched. `stop()` only stops this local worker; it does not cancel a
+durable run, and another live handle or node may resume it. Automatic lease
+heartbeats protect long `pull`/`dispatch` callbacks. Lease loss or a failed
+heartbeat aborts the local attempt so another worker can recover it under the
+same at-least-once guarantee.
+
+## Server namespace upgrades
+
+Server pumps use an encoded `(prefix, id)` identity. Versions `<=5.8.0` used an
+ambiguous colon-concatenated namespace. Stop every old worker and finish,
+export, or remove legacy runs before upgrading. If an exact legacy run remains,
+`start()`, `get()`, and `cancel()` fail with a `namespace migration required`
+error and leave it untouched; new workers never poll the legacy due set.
 
 ## Queue sink
 
@@ -210,6 +258,14 @@ default, so handles with the same `id` share runs. Pass the same explicit store
 to coordinate a separate scope, or `store: createLocalStorageStore()` to resume
 after reloads. Multi-tab ownership is best-effort because browser storage has
 no Redis-style atomic fencing.
+
+Persisted runs from the old concatenated browser namespace are not guessed or
+silently restarted. Close old tabs and call
+`migrateLegacyPumpState({ id, prefix, key, store })` once per run before
+constructing the new pump. The explicit identity and run key are required
+because an old key cannot prove how its prefix and id were split. If two old
+identities collided, the operator must choose the intended owner; never migrate
+the same old run into both new identities.
 
 Browser pump persistence uses an encoded `(prefix, id)` identity. State written
 under the old concatenated key is not auto-imported because colliding old keys

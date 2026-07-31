@@ -9,7 +9,7 @@ import { mutex, LockError } from "@k2b/sync";
 
 const m = mutex({
   id: "checkout",
-  defaultTtl: 5_000,
+  defaultTtl: 10_000,      // default
   // retryCount?: number,   // default: 10
   // retryDelay?: number,   // default: 200 (ms between retries)
   // prefix?: string,       // default: "sync:mutex"

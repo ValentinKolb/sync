@@ -10,8 +10,14 @@ import { ephemeral, EphemeralCapacityError, EphemeralPayloadTooLargeError } from
 const presence = ephemeral<{ userId: string; displayName: string }>({
   id: "notebook.presence",
   ttlMs: 30_000,
+  // prefix?: string,                                     // default: "sync:e"
   // tenantId?: string,                                   // default: "default"
-  // limits?: { maxEntries, maxPayloadBytes, eventRetentionMs, eventMaxLen },
+  // limits?: {
+  //   maxEntries: 10_000,
+  //   maxPayloadBytes: 4 * 1024,
+  //   eventRetentionMs: 5 * 60 * 1000,
+  //   eventMaxLen: 50_000,
+  // },
 });
 ```
 
@@ -32,6 +38,7 @@ type EphemeralReader<T> = {
   recv(cfg?: EphemeralRecvConfig): Promise<EphemeralEvent<T> | null>;
   stream(cfg?: EphemeralRecvConfig): AsyncIterable<EphemeralEvent<T>>;
   close(): Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
 };
 
 type EphemeralEntry<T> = {

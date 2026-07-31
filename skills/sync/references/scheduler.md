@@ -97,6 +97,11 @@ type Scheduler = {
 
 type SchedulerControlState = "available" | "unavailable";
 
+type SchedulerControlConfig = {
+  prefix?: string;
+  timeoutMs?: number;
+};
+
 type SchedulerControlInfo = {
   schedulerId: string;
   scheduleId: string;
@@ -121,6 +126,8 @@ type SchedulerControl = {
     timeoutMs?: number;
   }): Promise<void>;
 };
+
+schedulerControl(config?: SchedulerControlConfig): SchedulerControl;
 ```
 
 ## Usage
@@ -167,6 +174,7 @@ Use `schedulerControl()` in an external process, such as an admin API, when that
 ```ts
 import {
   SchedulerControlNotFoundError,
+  SchedulerControlTimeoutError,
   SchedulerControlUnavailableError,
   schedulerControl,
 } from "@k2b/sync";
@@ -184,6 +192,9 @@ try {
   }
   if (error instanceof SchedulerControlUnavailableError) {
     // The schedule exists, but no live scheduler has its handler registered.
+  }
+  if (error instanceof SchedulerControlTimeoutError) {
+    // Acceptance timed out; retry only with the same requestId.
   }
 }
 ```
@@ -245,6 +256,7 @@ Each item has its own `ctx.failureCount`. Already-running items skip duplicate s
 - **`create` is idempotent by id**: second call with same id updates. If `cron`/`tz` changed, `nextRunAt` resets; otherwise it's preserved.
 - **`runNow` does NOT advance cron**: the regular schedule continues unchanged, unless you call `ctx.reschedule` inside `after`.
 - **`schedulerControl.runNow` is remote accepted, not completed**: it returns when a live scheduler with the handler accepts the request. The handler then runs with `ctx.trigger === "manual"`.
+- **Control heartbeats are contained**: a rejected lease or request-binding refresh increments `tickErrors` and cannot escape from the keepalive timer as an unhandled rejection. A lost lease can still cause at-least-once redelivery, so manual handlers must remain idempotent.
 - **Unavailable is explicit**: `SchedulerControlUnavailableError` means the schedule exists but no live handler heartbeat is present. Start a scheduler instance that calls `create()` for that schedule.
 - **`ctx.trigger`**: `"cron"` when dispatched by the tick loop; `"manual"` when invoked via `runNow`. Useful for conditionals like "skip expensive validation on manual runs" or "log admin runs separately". Available in both `process` and `after` ctx.
 - **`ctx.runNumber` is persistent**: preserved across restarts, re-registrations, and (different) cron changes. Only `delete` resets.
@@ -289,5 +301,5 @@ replacing the final old worker.
 - Handlers registered per-instance (can't serialize functions). Multiple instances with same `id` share schedule records but each has local handlers.
 - `store?: Store` lets `runNumber`/`nextRunAt`/`failureCount` survive tab reloads (via `createLocalStorageStore()`).
 - Browser scheduler state written under the concatenated <=5.8 key is not auto-imported because that key cannot prove which scheduler identity owned it. The first registration after upgrade starts a fresh checkpoint.
-- Leader election always succeeds in single tab.
+- Leader election coordinates scheduler handles through the selected `Store`. With `localStorage`, cross-tab ownership is best-effort because writes have no atomic compare-and-set.
 - Tick loop uses `setTimeout` — it may be throttled in background tabs. A persisted overdue slot still runs once when the tab resumes.

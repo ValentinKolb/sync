@@ -20,7 +20,9 @@ bun add @k2b/sync
 
 No runtime dependencies. TypeScript is a peer dependency.
 
-> **Upgrading from v4?** See [MIGRATION.md](./MIGRATION.md). v5 is a major rewrite.
+> **Upgrading?** v4 users must migrate the public API. Deployments on `<=5.8.0`
+> must also complete the durable namespace maintenance in
+> [MIGRATION.md](./MIGRATION.md) before rolling out a newer version.
 
 ### Agent Skills (optional)
 
@@ -148,8 +150,10 @@ Pass `invalidPayload: "throw"` to `recv()` or `stream()` to receive a
 `TopicPayloadError` for malformed transport envelopes and leave the entry
 pending. The default remains `"ack"` for compatibility. `reclaim()` returns
 pending malformed entries with `kind: "invalid"` so the application can record
-or dead-letter them before acknowledging. The in-memory browser runtime has no
-leased pending deliveries, so `reclaim()` returns an empty completed batch.
+or dead-letter them before acknowledging. The browser runtime keeps at most 256
+uncommitted deliveries per group and persists them when a `Store` is configured.
+`reclaim()` can recover their snapshots until topic retention expires; an
+expired snapshot is discarded only after its event has also left the bounded log.
 
 ## Ephemeral
 
@@ -220,7 +224,7 @@ sendMail.metric(); // { dispatches, failures, reschedules }
 ```
 
 Key lifecycle: claimed on submit, held during run and pending retry, released on terminal (success or failure without reschedule).
-`trace` is observability-only: handler errors are logged and swallowed. `submitted` fires only for a newly enqueued job, not for idempotent duplicate submits. `finished` fires only after a terminal ack and key release; a job that calls `ctx.reschedule()` emits `rescheduled` instead.
+`trace` is observability-only: handler errors are logged and swallowed. On the server, `submitted` is a best-effort first-delivery-attempt event emitted immediately before the first `started`; it can be delayed by `delayMs` or absent if activation fails before tracing. In the browser runtime, `submitted` is emitted after the local queue accepts a new submission. `finished` fires only after terminal transport completion and key release; a job that calls `ctx.reschedule()` emits `rescheduled` instead.
 
 **Input is optional** — simple jobs can omit both the input generic and the `input` submit field:
 
@@ -344,7 +348,7 @@ await sched.stop();
 ```
 
 - Multiple pods running the same scheduler id coordinate via mutex-based leader election.
-- `misfire` is always "skip" — missed slots (e.g. from downtime) jump to the next cron slot.
+- After downtime, one persisted overdue slot runs; the scheduler then jumps to the next future cron slot.
 - `ctx.runNumber` is 1-indexed and monotonic, persisted across restarts.
 - `ctx.failureCount` tracks consecutive failures, resets on success.
 - `trace` is per schedule and observability-only. Scheduler traces have no `finished` event because schedules are recurring definitions; use `succeeded`, `failed`, and `rescheduled` for run outcomes.
@@ -415,12 +419,21 @@ No `after` defined → first error throws immediately. No `ctx.reschedule` call 
 
 ## Differences between server and browser
 
-The browser runtime (`@k2b/sync/browser`) has the **same public API** but:
+The browser runtime (`@k2b/sync/browser`) has parity for the shared public API
+with additive persistence and migration helpers:
 
-- All state is in-memory (no Redis). Survives within a page/tab; resets on reload unless you pass a `store?: Store`.
-- `scheduler`/`mutex`/`ratelimit`/`topic`/`pump` optionally accept `store?: Store` for `createLocalStorageStore()` persistence.
-- Leader election (scheduler mutex) trivially succeeds in a single tab.
-- Multiple instances with the same id in the same tab share state via module-level maps.
+- State is in-memory by default. `scheduler`/`mutex`/`ratelimit`/`topic`/`pump`
+  optionally accept `store?: Store`; use `createLocalStorageStore()` when that
+  state must survive a reload.
+- Browser leader election coordinates handles through the selected `Store`.
+  Cross-tab ownership with `localStorage` is best-effort because it has no
+  atomic compare-and-set.
+- Default in-memory stores are process-wide. Handles with the same primitive
+  identity share state; an explicit store creates an explicit persistence scope.
+- `queue`, `job`, and `ephemeral` remain in-memory and do not accept `store`.
+- The browser entrypoint additionally exports `createMemoryStore`,
+  `createLocalStorageStore`, `StoreWriteError`, and
+  `migrateLegacyPumpState()`.
 
 Parity is enforced at compile time:
 ```bash

@@ -107,10 +107,11 @@ Equivalent to calling the free function `expBackoff(ctx.attempt, cfg)`.
 
 ## `isRetryableTransportError`
 
-Returns true for common transport/connection errors (useful default for `after` predicates):
+Returns true for a deliberately narrow set of transport/connection failures (useful default for `after` predicates):
 
-- Error codes: `ECONNRESET`, `ETIMEDOUT`, `ECONNREFUSED`, `ENOTFOUND`, `EPIPE`, `EHOSTUNREACH`, `ECONNABORTED`
-- Message includes: `"econnreset"`, `"etimedout"`, `"connection"`, `"socket"`, `"broken pipe"`, `"network"`, `"loading"`, `"tryagain"`, `"clusterdown"`
+- Error codes: `ECONNRESET`, `ETIMEDOUT`, `ECONNREFUSED`, `ENOTFOUND`, `EPIPE`, `EHOSTUNREACH`, `ECONNABORTED`, plus Redis `LOADING`, `TRYAGAIN`, `CLUSTERDOWN`, and `MASTERDOWN`.
+- Message phrases: the explicit errno names above, `connection closed/refused/reset/lost`, `socket closed/hang up`, `broken pipe`, or `network error`.
+- A Redis response is retryable when its first whitespace-delimited token is one of the Redis codes above. Generic application messages containing words such as `connection` or `loading` are intentionally not enough.
 
 ## Gotchas
 

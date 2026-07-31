@@ -5,19 +5,19 @@ description: "Use this skill for @k2b/sync and @k2b/sync/browser — distributed
 
 # @k2b/sync — v5
 
-Distributed synchronization primitives with an **identical public API** between server (Redis-backed) and browser (in-memory). Change the import; code generally works on both sides.
+Distributed synchronization primitives with compile-time parity for their shared server (Redis-backed) and browser APIs. Change the import and shared code generally works on both sides; the browser export adds optional `Store` persistence helpers and explicit migration utilities.
 
 ## When to use this skill
 
 Trigger for any imports from:
 - `@k2b/sync` (server — Bun + Redis/Valkey/Dragonfly 6.2+)
-- `@k2b/sync/browser` (browser — in-memory)
+- `@k2b/sync/browser` (browser — in-memory by default, optional `Store` persistence)
 
 Or when the user is building features that need one of the nine modules:
 
 | Module | Use for |
 |---|---|
-| `ratelimit` | Sliding-window rate limiter per identifier |
+| `ratelimit` | Weighted sliding-window rate limiter per identifier |
 | `mutex` | Distributed lock with retry, TTL, owner-only release |
 | `queue` | Durable work queue: at-least-once, lease-based visibility, delayMs, idempotency, DLQ |
 | `topic` | Pub/sub with cursor-based replay, consumer-group pending recovery, or `live()` broadcast |
@@ -29,18 +29,27 @@ Or when the user is building features that need one of the nine modules:
 
 ## v5 API core pattern
 
-All three lifecycle-aware modules (`retry`, `job`, `scheduler`) share the same shape:
+The lifecycle-aware modules share the same `after`/`ctx.reschedule` decision model. `job` and `scheduler` execute `process`; `retry` executes `run`:
 
 ```ts
-mod({
-  id,
+job({
+  id: "send-mail",
   process: async ({ ctx }): Promise<Result> => { /* work */ },
-  after?: async ({ ctx }) => {
+  after: async ({ ctx }) => {
     // ctx.data?      — if process returned
     // ctx.error?     — if process threw
     // ctx.reschedule({ delayMs }) — re-run, holds key/slot
     // ctx.expBackoff({ baseMs, maxMs, jitter }) — helper
     // ctx.metric     — live counters reference
+  },
+});
+
+retry({
+  run: async ({ ctx }): Promise<Result> => { /* work */ },
+  after: async ({ ctx }) => {
+    if (ctx.error && ctx.attempt < 5) {
+      ctx.reschedule({ delayMs: ctx.expBackoff() });
+    }
   },
 });
 ```
@@ -60,8 +69,8 @@ current item, so every item needs a stable `key` and an idempotent sink.
 
 Read the module's reference file in `references/` for full API, gotchas, and usage patterns:
 
-- [references/queue.md](references/queue.md) — `send/recv/ack/nack/touch`, DLQ, idempotency
-- [references/topic.md](references/topic.md) — `pub/reader/reclaim/live`, cursor replay, consumer groups, pending recovery
+- [references/queue.md](references/queue.md) — `send/recv/ack/nack/touch`, DLQ inspection/removal, idempotency
+- [references/topic.md](references/topic.md) — `pub/reader/reclaim/live/latestCursor`, cursor replay, consumer groups, pending recovery
 - [references/ephemeral.md](references/ephemeral.md) — TTL KV with `tenantId` isolation, `prefix` filter (replaces old registry)
 - [references/mutex.md](references/mutex.md) — distributed lock primitives
 - [references/ratelimit.md](references/ratelimit.md) — sliding-window limiter
@@ -73,13 +82,27 @@ Read the module's reference file in `references/` for full API, gotchas, and usa
 
 ## Browser runtime specifics
 
-`@k2b/sync/browser` has the same API with additive options:
+`@k2b/sync/browser` has parity for the shared API with additive options:
 
-- Most configs accept optional `store?: Store` for `createLocalStorageStore()` persistence.
-- Leader election trivially succeeds in a single tab.
-- Multiple instances with the same id in the same tab share state via module-level maps.
+- `ratelimit`, `mutex`, `topic`, `pump`, and `scheduler` accept optional `store?: Store`; use `createLocalStorageStore()` when their state must survive a reload.
+- Browser leader election coordinates handles through the selected `Store`; cross-tab ownership with `localStorage` is best-effort because it has no atomic compare-and-set.
+- Default in-memory stores are process-wide. Handles with the same primitive identity share state; an explicit store creates an explicit persistence scope.
 
 API parity is enforced at compile time (see `parity/` in repo).
+
+The browser entrypoint additionally exports `createMemoryStore`,
+`createLocalStorageStore`, `MemoryStore`, `LocalStorageStore`, `StoreWriteError`,
+and the `Store` interface. Store writes are synchronous. `StoreWriteError`
+distinguishes clone, serialization, and quota failures from primitive/user
+errors. Browser storage has no Redis-style atomic compare-and-set; use one
+active writer per persisted topic or pump identity. Browser `queue`, `job`, and
+`ephemeral` remain in-memory and do not accept `store`.
+
+## Background runtime robustness
+
+Long-lived queue/topic/ephemeral readers and job/pump workers contain retryable Redis/transport failures and retry them with bounded, abort-aware backoff. Scheduler loops catch tick and control failures so later work can continue. Internal timers and fire-and-forget tasks observe their promises, so a rejected heartbeat cannot escape as an unhandled rejection. Where exposed, `stop()` stops local work cooperatively; it does not change durable state unless that module explicitly documents cancellation or deletion.
+
+User callback behavior remains module-specific: `process`, `after`, `pull`, and `dispatch` failures follow the primitive's documented retry/lifecycle rules, while trace failures are observability-only and never determine transport state.
 
 ## High-impact patterns
 
@@ -136,18 +159,18 @@ See [references/migration-v4-v5.md](references/migration-v4-v5.md). High-impact 
 - `job.join()`, `job.cancel()`, `job.events()`, `ctx.step()` are **removed** — use `after` callback and write your own audit row
 - `scheduler.register` → `scheduler.create`; `unregister` → `delete`; `triggerNow` → `runNow`
 - `registry` module deleted → use `ephemeral.snapshot({ prefix })`
-- `misfire: "catch_up_one" | "catch_up_all"` gone → only implicit skip (via `nextCronTimestamp` advancing from now)
+- `misfire: "catch_up_one" | "catch_up_all"` gone → one persisted overdue slot runs, then scheduling advances from now
 
 ## Redis data lifecycle (server package)
 
 Clean by design. Summary:
 
-- **Queue messages** → `ack`/`nack` handles cleanup; terminal = DEL
+- **Queue messages** → `ack` deletes, `nack` requeues, and exhausted delivery attempts move to the retention-bounded DLQ
 - **Job idempotency keys** → released on terminal (DEL), else TTL (default 24h)
 - **Pump active pages** → deleted after cursor commit; terminal state expires after seven days by default
 - **Schedule records** → stay (they ARE the schedule); only `delete({ id })` removes
-- **Scheduler control requests** → queued until a live handler accepts them; ack removes the request
+- **Scheduler control requests** → queued until a live handler accepts them; queue entries are acknowledged on acceptance and short-lived request bindings/responses expire automatically
 - **No per-job event streams** (removed in v5)
 - **No DLQ buildup** for jobs (internal queue uses `maxDeliveries: Number.MAX_SAFE_INTEGER`)
 
-No long-term buildup. A stable production deploy doesn't accumulate cruft.
+Transient execution state is bounded or explicitly cleaned. Schedule definitions, queue counters, and other intentional durable indices remain until their documented delete/drain lifecycle is applied.

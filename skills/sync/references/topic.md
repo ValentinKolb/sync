@@ -12,7 +12,7 @@ const t = topic<{ type: string; orderId: string }>({
   // prefix?: string,                   // default: "sync:topic"
   // tenantId?: string,                 // default: "default"
   // retentionMs?: number,              // default: 7d
-  // limits?: { payloadBytes },
+  // limits?: { payloadBytes: 128 * 1024 },
   // store?: Store,                     // browser only (additive)
 });
 ```
@@ -180,7 +180,7 @@ for await (const event of t.live({ tenantId, after: startCursor })) {
 - **`idempotencyKey` on pub**: dedupes within `idempotencyTtlMs` (default 7d). Same key returns the same eventId.
 - **`retentionMs`**: events older than this are trimmed during publish. Set carefully for replay requirements.
 - **`tenantId`**: isolates the event log and consumer-group state per tenant.
-- **Browser runtime**: consumer groups behave as documented above. The group's cursor advances on `commit()`, not on delivery, so an uncommitted delivery stays recoverable via `reclaim({ minIdleMs, cursor, count })`; pass each returned cursor into the next call until it returns `"0-0"`. Readers of one group distribute rather than broadcast; a recreated reader resumes at the group's committed position; and `commit()` is refused once another reader has reclaimed the delivery. Without `store`, state is tab-local. A persistent `store` checkpoints events, a monotonic cursor high-water mark, idempotency fences, and group state across reloads. Browser logs retain at most 256 entries in addition to the time-based retention bound, limiting the default worst-case payload footprint to 32 MiB before object and persistence overhead. Use one active writer per persisted topic: browser storage has no atomic compare-and-set, so concurrent tabs or independent Store handles can overwrite each other's topic snapshots. Legacy browser keys from <=5.8 are not auto-imported because their concatenated identity is ambiguous; start a fresh browser checkpoint after upgrading.
+- **Browser runtime**: consumer groups behave as documented above. Delivery advances the group's delivered cursor; an uncommitted entry remains pending and only `reclaim({ minIdleMs, cursor, count })` returns it again. Pass each returned cursor into the next reclaim call until it returns `"0-0"`. Readers of one group distribute rather than broadcast; a recreated reader resumes from persisted group state; and `commit()` is refused once another reader has reclaimed the delivery. Without `store`, state is tab-local. A persistent `store` checkpoints events, a monotonic cursor high-water mark, idempotency fences, and group state across reloads. Browser logs retain at most 256 entries in addition to the time-based retention bound, limiting the default worst-case payload footprint to 32 MiB before object and persistence overhead. Use one active writer per persisted topic: browser storage has no atomic compare-and-set, so concurrent tabs or independent Store handles can overwrite each other's topic snapshots. Legacy browser keys from <=5.8 are not auto-imported because their concatenated identity is ambiguous; start a fresh browser checkpoint after upgrading.
 
 ## Redis keys (server)
 

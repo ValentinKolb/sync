@@ -107,10 +107,10 @@ submit({ key })
   → claim idempotency key atomically
   → if key already held → return existing jobId (dedupe)
   → enqueue work message
-  → trace "submitted" (new enqueue only)
   → auto-start worker loop (first submit only)
 
-worker picks up message
+server worker picks up message
+  → trace "submitted" (best effort on first delivery attempt, immediately before "started")
   → trace "started"
   → process({ ctx })
      if process returns: result in ctx.data
@@ -209,7 +209,7 @@ Trace is a callback, not a storage layer. Use it to log, publish, count, or map 
 - **`key` is required** — jobs can't be submitted anonymously. This is your idempotency scope.
 - **`trace` is observability-only**: trace handler errors are logged with `[sync trace]` and swallowed. They never fail submit, process, ack, nack, or key release.
 - **Trace order is deterministic for one job attempt**: handlers are awaited. If you want fire-and-forget behavior, do that inside your trace handler.
-- **`submitted` means new enqueue**: duplicate submits that return an existing `jobId` do not emit `submitted`.
+- **`submitted` differs by runtime**: on the server it is a best-effort first-delivery-attempt event emitted immediately before the first `started`, so `delayMs` delays it and activation failure can suppress it. In the browser runtime it is emitted after the local queue accepts a new submission. Duplicate submits that return an existing `jobId` do not emit it.
 - **`succeeded` / `failed` describe the process attempt**: `after` can still call `ctx.reschedule()` after either event.
 - **`finished` means terminal**: it fires only after a successful ack and idempotency key release. Rescheduled jobs emit `rescheduled`, then a later attempt emits its own `started` event.
 - **Crash recovery**: if the worker dies mid-process, the queue lease expires and another worker (or the same one on restart) receives the message with `attempt++`. `ctx.failureCount` = `attempt - 1`.
@@ -223,13 +223,14 @@ Trace is a callback, not a storage layer. Use it to log, publish, count, or map 
 
 - `sync:job:{id}:seq` — jobId counter
 - `sync:job:claim:v2:{encodedPrefixIdAndKey}` — key → jobId with TTL
+- `sync:job:enqueue-receipt:v2:{encodedPrefixIdKeyAndJobId}` — worker acceptance receipt, capped at the 30-day key TTL maximum
 - `sync:queue:namespace:v2:{encodedJobQueueTuple}:*` — internal queue state
 
 All new claims use the injective full identity tuple. Drain old workers before
 upgrading. If a matching legacy claim still exists, submission fails with an
 explicit migration-required error instead of risking duplicate execution.
 The internal work queue also starts in its collision-free v2 namespace; it does
-not claim or acknowledge ambiguous pre-v6 work-queue records.
+not claim or acknowledge ambiguous work-queue records written by versions `<=5.8.0`.
 
 **What's NOT in Redis (removed in v5):**
 - Per-job state key (`state:{jobId}`) — gone
