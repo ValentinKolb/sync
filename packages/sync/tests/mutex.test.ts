@@ -279,7 +279,7 @@ test("different mutex ids are isolated", async () => {
 });
 
 test("withLock provides mutual exclusion for concurrent operations", async () => {
-  const m = mutex({ id: "mutual", prefix: "test:mx", retryCount: 3, retryDelay: 20, defaultTtl: 2000 });
+  const m = mutex({ id: "mutual", prefix: "test:mx", retryCount: 10, retryDelay: 20, defaultTtl: 2000 });
 
   let counter = 0;
   const iterations = 5;

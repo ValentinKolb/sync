@@ -16,7 +16,7 @@ jobs:
         ports:
           - 6399:6379
         options: >-
-          --health-cmd "valkey-cli ping"
+          --health-cmd "valkey-cli SET sync:test:sentinel k2b-sync-test-v1 >/dev/null && valkey-cli GET sync:test:sentinel | grep -qx k2b-sync-test-v1"
           --health-interval 2s
           --health-timeout 2s
           --health-retries 10
@@ -125,6 +125,7 @@ jobs:
       - name: Copy package docs
         run: |
           cp README.md packages/sync/dist/README.md
+          cp MIGRATION.md packages/sync/dist/MIGRATION.md
           cp LICENSE packages/sync/dist/LICENSE
 
       - name: Generate type declarations
@@ -136,6 +137,7 @@ jobs:
       - name: Verify packed consumer
         run: |
           PACKAGE_TGZ=$(npm pack --silent)
+          tar -tzf "$PACKAGE_TGZ" | grep -qx "package/MIGRATION.md"
           PACKAGE_PATH="$GITHUB_WORKSPACE/packages/sync/dist/$PACKAGE_TGZ"
           CONSUMER_DIR=$(mktemp -d)
           cd "$CONSUMER_DIR"
@@ -143,12 +145,13 @@ jobs:
           npm install "$PACKAGE_PATH" >/dev/null
           cat > index.mjs <<'EOF'
           import { job, pump, scheduler, topic } from "@k2b/sync";
-          import { createMemoryStore, topic as browserTopic } from "@k2b/sync/browser";
-          if (![job, pump, scheduler, topic, createMemoryStore, browserTopic].every((value) => typeof value === "function")) {
+          import { createMemoryStore, migrateLegacyPumpState, topic as browserTopic } from "@k2b/sync/browser";
+          if (![job, pump, scheduler, topic, createMemoryStore, migrateLegacyPumpState, browserTopic].every((value) => typeof value === "function")) {
             throw new Error("packed runtime exports are incomplete");
           }
           EOF
           bun index.mjs
+          test -f node_modules/@k2b/sync/MIGRATION.md
           node --input-type=module --eval \
             'import("@k2b/sync/browser").then((mod) => { if (typeof mod.topic !== "function") throw new Error("packed browser ESM export is incomplete"); })'
           cat > index.ts <<'EOF'

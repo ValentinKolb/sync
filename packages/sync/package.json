@@ -9,9 +9,9 @@
     "./browser": "./browser.ts"
   },
   "scripts": {
-    "test": "bun test --preload ./tests/preload.ts",
-    "test:fault": "bun test --preload ./tests/preload.ts tests/fault-*.test.ts",
-    "test:all": "bun test --preload ./tests/preload.ts tests/*.test.ts",
+    "test": "REDIS_URL=redis://127.0.0.1:6399 bun test --preload ./tests/preload.ts",
+    "test:fault": "REDIS_URL=redis://127.0.0.1:6399 bun test --preload ./tests/preload.ts tests/fault-*.test.ts",
+    "test:all": "REDIS_URL=redis://127.0.0.1:6399 bun test --preload ./tests/preload.ts tests/*.test.ts",
     "typecheck": "bunx tsc --noEmit"
   },
   "peerDependencies": {

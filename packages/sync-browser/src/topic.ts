@@ -10,6 +10,7 @@ const DEFAULT_IDEMPOTENCY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_PAYLOAD_BYTES = 128 * 1024;
 const DEFAULT_MAX_LOG_ENTRIES = 256;
 const DEFAULT_TIMEOUT_MS = 30_000;
+const STORE_KEY_PREFIX = "sync:topic:browser:v2:";
 
 const textEncoder = new TextEncoder();
 
@@ -178,14 +179,55 @@ type IdempotencyFence = {
   payloadHash?: string;
 };
 
+type InFlightDelivery = {
+  at: number;
+  consumerId: string;
+  entry?: EventLogEntry;
+};
+
 type GroupState = {
   committed: string;
   delivered: string;
-  inFlight: Map<string, { at: number; consumerId: string }>;
+  inFlight: Map<string, InFlightDelivery>;
 };
 
 type PersistedGroupState = Omit<GroupState, "inFlight"> & {
-  inFlight: Array<[string, { at: number; consumerId: string }]>;
+  inFlight: Array<[string, InFlightDelivery]>;
+};
+
+const cloneEventLogEntry = (entry: EventLogEntry): EventLogEntry => ({
+  id: entry.id,
+  ts: entry.ts,
+  fields: { ...entry.fields },
+});
+
+const cloneInFlightDelivery = (held: InFlightDelivery): InFlightDelivery => ({
+  at: held.at,
+  consumerId: held.consumerId,
+  ...(held.entry ? { entry: cloneEventLogEntry(held.entry) } : {}),
+});
+
+const persistedGroupValue = (state: GroupState): PersistedGroupState => ({
+  committed: state.committed,
+  delivered: state.delivered,
+  inFlight: [...state.inFlight].map(([eventId, held]) => [
+    eventId,
+    cloneInFlightDelivery(held),
+  ]),
+});
+
+const hydratePendingEntries = (state: GroupState, log: EventLog): boolean => {
+  let changed = false;
+  for (const [eventId, held] of state.inFlight) {
+    if (held.entry) continue;
+    const entry = log.get(eventId);
+    if (!entry) {
+      throw new Error(`cannot restore pending topic delivery ${eventId}: event is no longer retained`);
+    }
+    held.entry = cloneEventLogEntry(entry);
+    changed = true;
+  }
+  return changed;
 };
 
 const persistedEntries = (value: unknown): EventLogEntry[] => {
@@ -252,7 +294,7 @@ const persistedGroup = (value: unknown): GroupState | null => {
     return null;
   }
 
-  const inFlight = new Map<string, { at: number; consumerId: string }>();
+  const inFlight = new Map<string, InFlightDelivery>();
   for (const item of candidate.inFlight) {
     if (
       !Array.isArray(item)
@@ -273,7 +315,23 @@ const persistedGroup = (value: unknown): GroupState | null => {
     ) {
       continue;
     }
-    inFlight.set(item[0], { at: held.at, consumerId: held.consumerId });
+    const entry = held.entry;
+    const validEntry = entry
+      && typeof entry === "object"
+      && entry.id === item[0]
+      && typeof entry.ts === "number"
+      && Number.isFinite(entry.ts)
+      && entry.ts >= 0
+      && entry.fields
+      && typeof entry.fields === "object"
+      && !Array.isArray(entry.fields)
+      ? cloneEventLogEntry(entry)
+      : undefined;
+    inFlight.set(item[0], {
+      at: held.at,
+      consumerId: held.consumerId,
+      ...(validEntry ? { entry: validEntry } : {}),
+    });
   }
   return { committed: candidate.committed, delivered: candidate.delivered, inFlight };
 };
@@ -295,7 +353,18 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
 
   const resolveTenant = (tenantId?: string): string => tenantId ?? defaultTenant;
   const encodedKey = (kind: string, ...segments: string[]): string =>
-    `sync:topic:browser:v2:${encodeURIComponent(JSON.stringify([prefix, config.id, kind, ...segments]))}`;
+    `${STORE_KEY_PREFIX}${encodeURIComponent(JSON.stringify([prefix, config.id, kind, ...segments]))}`;
+  const decodeKey = (key: string): string[] | null => {
+    if (!key.startsWith(STORE_KEY_PREFIX)) return null;
+    try {
+      const value = JSON.parse(decodeURIComponent(key.slice(STORE_KEY_PREFIX.length))) as unknown;
+      return Array.isArray(value) && value.every((segment) => typeof segment === "string")
+        ? value
+        : null;
+    } catch {
+      return null;
+    }
+  };
   const eventLogMapKey = (tenantId: string): string =>
     JSON.stringify([prefix, config.id, tenantId]);
   const eventLogStoreKey = (tenantId: string): string => encodedKey("event-log", tenantId);
@@ -318,6 +387,24 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       log = new EventLog({ retentionMs, maxLen: DEFAULT_MAX_LOG_ENTRIES, initialEntries });
       const highWater = store.get(highWaterStoreKey(tenantId));
       if (typeof highWater === "string") log.advanceTo(highWater);
+      if (config.store) {
+        for (const groupKey of store.keys(STORE_KEY_PREFIX)) {
+          const parts = decodeKey(groupKey);
+          if (
+            parts?.length !== 5
+            || parts[0] !== prefix
+            || parts[1] !== config.id
+            || parts[2] !== "group"
+            || parts[3] !== tenantId
+          ) {
+            continue;
+          }
+          const restored = persistedGroup(store.get(groupKey));
+          if (restored && hydratePendingEntries(restored, log)) {
+            store.set(groupKey, persistedGroupValue(restored));
+          }
+        }
+      }
       eventLogs.set(key, log);
     }
     return log;
@@ -341,7 +428,22 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
     if (typeof rawPayload !== "string") return null;
 
     try {
-      return JSON.parse(rawPayload) as StoredEvent<unknown>;
+      const value = JSON.parse(rawPayload) as unknown;
+      if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+      const envelope = value as Record<string, unknown>;
+      if (typeof envelope.publishedAt !== "number" || !Number.isFinite(envelope.publishedAt)) {
+        return null;
+      }
+      if (envelope.orderingKey !== undefined && typeof envelope.orderingKey !== "string") {
+        return null;
+      }
+      if (
+        envelope.meta !== undefined
+        && (!envelope.meta || typeof envelope.meta !== "object" || Array.isArray(envelope.meta))
+      ) {
+        return null;
+      }
+      return envelope as StoredEvent<unknown>;
     } catch {
       return null;
     }
@@ -459,21 +561,21 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       const restored = config.store
         ? persistedGroup(store.get(groupStoreKey(tenantId, group)))
         : null;
+      if (restored && hydratePendingEntries(restored, getEventLog(tenantId))) {
+        store.set(groupStoreKey(tenantId, group), persistedGroupValue(restored));
+      }
       return restored ?? { committed: "0", delivered: "0", inFlight: new Map() };
     });
   const cloneGroup = (state: GroupState): GroupState => ({
     committed: state.committed,
     delivered: state.delivered,
-    inFlight: new Map(state.inFlight),
+    inFlight: new Map(
+      [...state.inFlight].map(([eventId, held]) => [eventId, cloneInFlightDelivery(held)]),
+    ),
   });
   const persistGroup = (tenantId: string, group: string, state: GroupState): void => {
     if (!config.store) return;
-    const persisted: PersistedGroupState = {
-      committed: state.committed,
-      delivered: state.delivered,
-      inFlight: [...state.inFlight.entries()],
-    };
-    store.set(groupStoreKey(tenantId, group), persisted);
+    store.set(groupStoreKey(tenantId, group), persistedGroupValue(state));
   };
   const publishGroup = (tenantId: string, group: string, current: GroupState, next: GroupState): void => {
     persistGroup(tenantId, group, next);
@@ -491,8 +593,41 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       if (closed) throw new Error("topic reader is closed");
     };
 
+    const holdEntry = (
+      entry: EventLogEntry,
+      log: EventLog,
+      tenantId: string,
+      state: GroupState,
+    ): void => {
+      const next = cloneGroup(state);
+      if (next.inFlight.size >= DEFAULT_MAX_LOG_ENTRIES) {
+        const cutoff = Date.now() - retentionMs;
+        for (const [eventId, held] of next.inFlight) {
+          if (held.entry && held.entry.ts < cutoff && !log.has(eventId)) {
+            next.inFlight.delete(eventId);
+          }
+        }
+        if (next.inFlight.size >= DEFAULT_MAX_LOG_ENTRIES) {
+          if (next.inFlight.size !== state.inFlight.size) {
+            publishGroup(tenantId, group, state, next);
+          }
+          throw new Error(
+            `topic pending delivery capacity reached (${DEFAULT_MAX_LOG_ENTRIES}); commit or reclaim pending deliveries`,
+          );
+        }
+      }
+      next.delivered = entry.id;
+      next.inFlight.set(entry.id, {
+        at: Date.now(),
+        consumerId,
+        entry: cloneEventLogEntry(entry),
+      });
+      publishGroup(tenantId, group, state, next);
+    };
+
     const deliverEntry = (
       entry: EventLogEntry,
+      log: EventLog,
       tenantId: string,
       state: GroupState,
       invalidPayload: TopicRecvConfig["invalidPayload"],
@@ -503,6 +638,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
         // "throw" here; the browser accepted the option and never read it, so a
         // catch written against the documented contract was dead code.
         if (invalidPayload === "throw") {
+          holdEntry(entry, log, tenantId, state);
           const raw = entry.fields.payload;
           throw new TopicPayloadError(
             entry.id,
@@ -517,10 +653,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
         return null;
       }
 
-      const next = cloneGroup(state);
-      next.delivered = entry.id;
-      next.inFlight.set(entry.id, { at: Date.now(), consumerId });
-      publishGroup(tenantId, group, state, next);
+      holdEntry(entry, log, tenantId, state);
 
       const commit = async (): Promise<boolean> => {
         const held = state.inFlight.get(entry.id);
@@ -555,7 +688,7 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       while (true) {
         const entries = log.range(state.delivered, 1);
         if (entries.length === 0) return null;
-        const delivery = deliverEntry(entries[0]!, tenantId, state, invalidPayload);
+        const delivery = deliverEntry(entries[0]!, log, tenantId, state, invalidPayload);
         if (delivery) return delivery;
       }
     };
@@ -587,8 +720,8 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
           const delivery = nextFromLog(log, tenantId, state, recvCfg.invalidPayload);
           if (delivery) return delivery;
         }
-      } catch {
-        // Timeout or abort.
+      } catch (error) {
+        if (!ac.signal.aborted) throw error;
       } finally {
         clearTimeout(timeout);
         if (recvCfg.signal) recvCfg.signal.removeEventListener("abort", onUserAbort);
@@ -640,16 +773,23 @@ export const topic = <T>(config: TopicConfig<T>): RecoverableTopic<T> => {
       const entries: Array<TopicReclaimedDelivery<TData>> = [];
       let lastId = "0-0";
       let groupChanged = false;
-      for (const [eventId] of stale) {
+      for (const [eventId, held] of stale) {
         lastId = eventId;
-        const found = log.range(String(Number(eventId) - 1), 1).find((e) => e.id === eventId);
+        const found = log.get(eventId)
+          ?? (held.entry && held.entry.ts >= now - retentionMs
+            ? cloneEventLogEntry(held.entry)
+            : undefined);
         if (!found) {
           nextState.inFlight.delete(eventId);
           groupChanged = true;
           continue;
         }
         // Take ownership, then hand it out again.
-        nextState.inFlight.set(eventId, { at: now, consumerId });
+        nextState.inFlight.set(eventId, {
+          at: now,
+          consumerId,
+          entry: cloneEventLogEntry(found),
+        });
         groupChanged = true;
         const commit = async (): Promise<boolean> => {
           const held = state.inFlight.get(found.id);

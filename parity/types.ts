@@ -187,7 +187,10 @@ import type {
   PumpConfig as B_PumpConfig,
   PumpStartConfig as B_PumpStartConfig,
   PumpHandle as B_PumpHandle,
+  MigrateLegacyPumpStateConfig as B_MigrateLegacyPumpStateConfig,
+  MigrateLegacyPumpStateResult as B_MigrateLegacyPumpStateResult,
 } from "../packages/sync-browser/index";
+import type { Store as B_Store } from "../packages/sync-browser/index";
 import type {
   Scheduler as B_Scheduler,
   SchedulerConfig as B_SchedulerConfig,
@@ -348,6 +351,16 @@ void _pumpCfgAdditive;
 assertEqual<Equal<S_PumpStartConfig<PumpInput>, B_PumpStartConfig<PumpInput>>>(true);
 assertEqual<Equal<S_PumpStartConfig<void>, B_PumpStartConfig<void>>>(true);
 assertEqual<Equal<S_PumpHandle<PumpInput, PumpCursor>, B_PumpHandle<PumpInput, PumpCursor>>>(true);
+assertEqual<Equal<B_MigrateLegacyPumpStateConfig, {
+  store: B_Store;
+  id: string;
+  key: string;
+  prefix?: string;
+  terminalRetentionMs?: number;
+}>>(true);
+assertEqual<Equal<B_MigrateLegacyPumpStateResult, {
+  status: "migrated" | "already-migrated" | "not-found";
+}>>(true);
 
 // ==========================
 // Scheduler
@@ -408,7 +421,8 @@ type BrowserOnlyKeys =
   | "createLocalStorageStore"
   | "MemoryStore"
   | "LocalStorageStore"
-  | "StoreWriteError";
+  | "StoreWriteError"
+  | "migrateLegacyPumpState";
 
 type ServerKeys = keyof typeof ServerApi;
 type BrowserSharedKeys = Exclude<keyof typeof BrowserApi, BrowserOnlyKeys>;

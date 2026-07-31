@@ -49,6 +49,7 @@ export {
 } from "./src/job";
 export {
   pump,
+  migrateLegacyPumpState,
   type PumpItem,
   type PumpStatus,
   type PumpState,
@@ -60,6 +61,8 @@ export {
   type PumpConfig,
   type PumpStartConfig,
   type PumpHandle,
+  type MigrateLegacyPumpStateConfig,
+  type MigrateLegacyPumpStateResult,
 } from "./src/pump";
 export {
   scheduler,

@@ -1,6 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
-import { pump, type PumpHandle } from "../src/pump";
-import { createMemoryStore, type MemoryStore } from "../src/store";
+import { migrateLegacyPumpState, pump, type PumpHandle } from "../src/pump";
+import {
+  createMemoryStore,
+  LocalStorageStore,
+  type MemoryStore,
+  type Store,
+} from "../src/store";
 
 type Input = { source: string };
 type Cursor = number;
@@ -22,6 +27,57 @@ const trackStore = (store = createMemoryStore()): MemoryStore => {
 
 const pumpStateKey = (prefix: string, id: string, key: string): string =>
   `sync:pump:browser:v2:${encodeURIComponent(JSON.stringify([prefix, id]))}:run:${encodeURIComponent(key)}`;
+
+const legacyPumpStateKey = (prefix: string, id: string, key: string): string =>
+  `${prefix}:${id}:run:${encodeURIComponent(key)}`;
+
+const persistedPumpState = (
+  key: string,
+  cursor: unknown,
+  state: "waiting" | "completed" = "waiting",
+): Record<string, unknown> => {
+  const now = Date.now();
+  return {
+    version: 1,
+    key,
+    input: { source: "legacy" },
+    cursor,
+    state,
+    dispatched: 4,
+    failureCount: 0,
+    ...(state === "waiting" ? { nextRunAt: now } : {}),
+    createdAt: now - 1_000,
+    updatedAt: now,
+  };
+};
+
+const createLocalStorageMock = (): Storage => {
+  const values = new Map<string, string>();
+  return {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      values.set(key, value);
+    },
+    removeItem: (key: string) => {
+      values.delete(key);
+    },
+    key: (index: number) => [...values.keys()][index] ?? null,
+    get length() {
+      return values.size;
+    },
+    clear: () => values.clear(),
+  } as Storage;
+};
+
+const forwardingStore = (
+  store: MemoryStore,
+  overrides: Partial<Pick<Store, "set" | "del">>,
+): Store => ({
+  get: (key) => store.get(key),
+  set: overrides.set ?? ((key, value, ttlMs) => store.set(key, value, ttlMs)),
+  del: overrides.del ?? ((key) => store.del(key)),
+  keys: (prefix) => store.keys(prefix),
+});
 
 const waitFor = async (
   predicate: () => boolean | Promise<boolean>,
@@ -144,6 +200,243 @@ test("colon-rich pump identities keep persisted runs isolated", async () => {
   expect(secondState.input).toEqual({ source: "second" });
 });
 
+test("pump operations fail loudly while exact legacy state needs migration", async () => {
+  const store = trackStore();
+  const id = uid("legacy-required");
+  const key = "run";
+  const state = persistedPumpState(key, 4);
+  store.set(legacyPumpStateKey("sync:pump", id, key), state);
+  store.set(pumpStateKey("sync:pump", id, key), state);
+  let pulls = 0;
+
+  const worker = track(pump<Input, Cursor, Item>({
+    id,
+    store,
+    pull: () => {
+      pulls += 1;
+      return { items: [], nextCursor: null };
+    },
+    dispatch: () => {},
+  }));
+
+  await Bun.sleep(20);
+  await expect(worker.get({ key })).rejects.toThrow(/migrateLegacyPumpState/);
+  await expect(worker.cancel({ key })).rejects.toThrow(/migrateLegacyPumpState/);
+  await expect(worker.start({ key, input: { source: "new" } })).rejects.toThrow(/migrateLegacyPumpState/);
+  expect(pulls).toBe(0);
+  expect(store.get(pumpStateKey("sync:pump", id, key))).toEqual(state);
+});
+
+test("corrupt or key-mismatched exact legacy state prevents a fresh start", async () => {
+  const invalidStates: Array<[string, unknown]> = [
+    ["corrupt", "not-a-pump-state"],
+    ["key-mismatched", persistedPumpState("different", 4)],
+  ];
+
+  for (const [name, state] of invalidStates) {
+    const store = trackStore();
+    const id = uid(`legacy-invalid-${name}`);
+    const key = "run";
+    const legacyKey = legacyPumpStateKey("sync:pump", id, key);
+    store.set(legacyKey, state);
+
+    const worker = track(pump<Input, Cursor, Item>({
+      id,
+      store,
+      pull: () => ({ items: [], nextCursor: null }),
+      dispatch: () => {},
+    }));
+
+    await expect(worker.start({ key, input: { source: "new" } })).rejects.toThrow(
+      /invalid legacy pump state/,
+    );
+    expect(store.get(legacyKey)).toEqual(state);
+    expect(store.get(pumpStateKey("sync:pump", id, key))).toBeUndefined();
+  }
+});
+
+test("legacy migration preserves the cursor and a new worker resumes it", async () => {
+  const store = trackStore();
+  const id = uid("legacy-resume");
+  const key = "run";
+  const legacyKey = legacyPumpStateKey("sync:pump", id, key);
+  store.set(legacyKey, persistedPumpState(key, 4));
+
+  store.set(legacyPumpStateKey("sync:pump", id, "other"), persistedPumpState("other", 8));
+
+  expect(migrateLegacyPumpState({ store, id, key })).toEqual({ status: "migrated" });
+  expect(store.get(legacyKey)).toBeUndefined();
+  expect(store.get(legacyPumpStateKey("sync:pump", id, "other"))).toMatchObject({ cursor: 8 });
+  expect(store.get(pumpStateKey("sync:pump", id, key))).toMatchObject({ cursor: 4 });
+
+  const cursors: Array<number | null> = [];
+  const worker = track(pump<Input, Cursor, Item>({
+    id,
+    store,
+    pull: ({ cursor }) => {
+      cursors.push(cursor);
+      return { items: [], nextCursor: null };
+    },
+    dispatch: () => {},
+  }));
+
+  await waitFor(async () => (await worker.get({ key }))?.state === "completed");
+  expect(cursors).toEqual([4]);
+});
+
+test("legacy migration accepts an identical destination and retries idempotently", () => {
+  const store = trackStore();
+  const id = uid("legacy-idempotent");
+  const key = "run";
+  const state = persistedPumpState(key, 4);
+  const legacyKey = legacyPumpStateKey("sync:pump", id, key);
+  const destinationKey = pumpStateKey("sync:pump", id, key);
+  store.set(legacyKey, state);
+  store.set(destinationKey, state);
+
+  expect(migrateLegacyPumpState({ store, id, key })).toEqual({ status: "already-migrated" });
+  expect(store.get(legacyKey)).toBeUndefined();
+  expect(store.get(destinationKey)).toEqual(state);
+  expect(migrateLegacyPumpState({ store, id, key })).toEqual({ status: "already-migrated" });
+});
+
+test("legacy migration rejects conflicting destination state", () => {
+  const store = trackStore();
+  const id = uid("legacy-conflict");
+  const key = "run";
+  const legacyKey = legacyPumpStateKey("sync:pump", id, key);
+  const destinationKey = pumpStateKey("sync:pump", id, key);
+  store.set(legacyKey, persistedPumpState(key, 4));
+  store.set(destinationKey, persistedPumpState(key, 9));
+
+  expect(() => migrateLegacyPumpState({ store, id, key })).toThrow(
+    /conflicting migrated pump state/,
+  );
+  expect(store.get(legacyKey)).toMatchObject({ cursor: 4 });
+  expect(store.get(destinationKey)).toMatchObject({ cursor: 9 });
+});
+
+test("legacy migration rejects state bound to a different legacy key", () => {
+  const store = trackStore();
+  const id = uid("legacy-binding");
+  const legacyKey = legacyPumpStateKey("sync:pump", id, "requested");
+  store.set(legacyKey, persistedPumpState("different", 4));
+
+  expect(() => migrateLegacyPumpState({ store, id, key: "requested" })).toThrow(
+    /invalid legacy pump state/,
+  );
+  expect(store.get(legacyKey)).toBeDefined();
+});
+
+test("legacy migration leaves the source intact when the destination write fails", () => {
+  const memory = trackStore();
+  const id = uid("legacy-set-failure");
+  const key = "run";
+  const legacyKey = legacyPumpStateKey("sync:pump", id, key);
+  const destinationKey = pumpStateKey("sync:pump", id, key);
+  const state = persistedPumpState(key, 4);
+  memory.set(legacyKey, state);
+  const store = forwardingStore(memory, {
+    set: (target, value, ttlMs) => {
+      if (target === destinationKey) throw new Error("destination unavailable");
+      memory.set(target, value, ttlMs);
+    },
+  });
+
+  expect(() => migrateLegacyPumpState({ store, id, key })).toThrow(/destination unavailable/);
+  expect(memory.get(legacyKey)).toEqual(state);
+  expect(memory.get(destinationKey)).toBeUndefined();
+});
+
+test("legacy migration retries idempotently after source deletion fails", () => {
+  const memory = trackStore();
+  const id = uid("legacy-delete-failure");
+  const key = "run";
+  const legacyKey = legacyPumpStateKey("sync:pump", id, key);
+  const destinationKey = pumpStateKey("sync:pump", id, key);
+  const state = persistedPumpState(key, 4);
+  memory.set(legacyKey, state);
+  let failDelete = true;
+  const store = forwardingStore(memory, {
+    del: (target) => {
+      if (target === legacyKey && failDelete) {
+        failDelete = false;
+        throw new Error("source delete unavailable");
+      }
+      memory.del(target);
+    },
+  });
+
+  expect(() => migrateLegacyPumpState({ store, id, key })).toThrow(/source delete unavailable/);
+  expect(memory.get(legacyKey)).toEqual(state);
+  expect(memory.get(destinationKey)).toEqual(state);
+
+  expect(migrateLegacyPumpState({ store, id, key })).toEqual({ status: "already-migrated" });
+  expect(memory.get(legacyKey)).toBeUndefined();
+  expect(memory.get(destinationKey)).toEqual(state);
+});
+
+test("legacy migration uses the operator-selected identity for colon collisions", () => {
+  const store = trackStore();
+  const key = "run";
+  const first = { prefix: "root:a", id: "b" };
+  const second = { prefix: "root", id: "a:b" };
+  const sharedLegacyKey = legacyPumpStateKey(first.prefix, first.id, key);
+  expect(sharedLegacyKey).toBe(legacyPumpStateKey(second.prefix, second.id, key));
+  store.set(sharedLegacyKey, persistedPumpState(key, 4));
+
+  expect(migrateLegacyPumpState({ store, ...first, key })).toEqual({ status: "migrated" });
+  expect(store.get(pumpStateKey(first.prefix, first.id, key))).toMatchObject({ cursor: 4 });
+  expect(store.get(pumpStateKey(second.prefix, second.id, key))).toBeUndefined();
+  expect(migrateLegacyPumpState({ store, ...second, key })).toEqual({ status: "not-found" });
+});
+
+test("corrupt LocalStorage legacy state blocks migration and a fresh start", async () => {
+  const originalLocalStorage = globalThis.localStorage;
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const storagePrefix = "pump-corrupt";
+    const store = new LocalStorageStore(storagePrefix);
+    const id = uid("legacy-local-storage");
+    const key = "run";
+    const legacyKey = legacyPumpStateKey("sync:pump", id, key);
+    const destinationKey = pumpStateKey("sync:pump", id, key);
+    localStorage.setItem(`${storagePrefix}:${legacyKey}`, "not-json{{{");
+
+    expect(() => migrateLegacyPumpState({ store, id, key })).toThrow(/invalid stored value/);
+
+    const worker = track(pump<Input, Cursor, Item>({
+      id,
+      store,
+      pull: () => ({ items: [], nextCursor: null }),
+      dispatch: () => {},
+    }));
+    await expect(worker.start({ key, input: { source: "new" } })).rejects.toThrow(
+      /invalid stored value/,
+    );
+    expect(localStorage.getItem(`${storagePrefix}:${legacyKey}`)).toBe("not-json{{{");
+    expect(localStorage.getItem(`${storagePrefix}:${destinationKey}`)).toBeNull();
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("legacy migration applies bounded retention to terminal state", async () => {
+  const store = trackStore();
+  const id = uid("legacy-terminal");
+  const key = "run";
+  const destinationKey = pumpStateKey("sync:pump", id, key);
+  store.set(
+    legacyPumpStateKey("sync:pump", id, key),
+    persistedPumpState(key, 4, "completed"),
+  );
+
+  migrateLegacyPumpState({ store, id, key, terminalRetentionMs: 30 });
+  expect(store.get(destinationKey)).toMatchObject({ state: "completed", cursor: 4 });
+  await Bun.sleep(50);
+  expect(store.get(destinationKey)).toBeUndefined();
+});
+
 test("default same-id handles share persisted runs", async () => {
   const id = uid("shared-default");
   let releasePull!: () => void;
@@ -198,6 +491,31 @@ test("empty pages without cursor progress fail after maxAttempts", async () => {
     state: "failed",
     cursor: 1,
     failureCount: 2,
+    lastError: "pull returned a page without advancing the cursor",
+  });
+});
+
+test("composed and decomposed Unicode cursor keys stall despite reversed insertion order", async () => {
+  let pulls = 0;
+  const worker = track(pump<Input, Record<string, number>, Item>({
+    id: uid("canonical-cursor"),
+    retry: { maxAttempts: 1, baseMs: 5, maxMs: 5, jitter: 0 },
+    pull: ({ cursor }) => {
+      pulls += 1;
+      return cursor === null
+        ? { items: [], nextCursor: { ["\u00e9"]: 1, ["e\u0301"]: 2 } }
+        : { items: [], nextCursor: { ["e\u0301"]: 2, ["\u00e9"]: 1 } };
+    },
+    dispatch: () => {},
+  }));
+
+  await worker.start({ key: "canonical", input: { source: "messages" } });
+  await waitFor(async () => (await worker.get({ key: "canonical" }))?.state === "failed");
+
+  expect(pulls).toBe(2);
+  expect(await worker.get({ key: "canonical" })).toMatchObject({
+    state: "failed",
+    failureCount: 1,
     lastError: "pull returned a page without advancing the cursor",
   });
 });

@@ -1,15 +1,47 @@
-import { beforeEach, expect, test } from "bun:test";
+import { afterAll, beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { job, queue, type JobMetrics, type JobTraceEvent } from "../index";
+import {
+  job as createJob,
+  queue,
+  type JobConfig,
+  type JobHandle,
+  type JobMetrics,
+  type JobTraceEvent,
+} from "../index";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+const TEST_PREFIX = `test:jobs:${process.pid}:${uid("run")}`;
+const job = <Input = void, Result = unknown>(
+  config: JobConfig<Input, Result>,
+): JobHandle<Input> =>
+  createJob({ ...config, prefix: config.prefix ?? TEST_PREFIX });
 
-beforeEach(async () => {
-  const keys = await redis.send("KEYS", ["sync:job:*"]);
-  if (Array.isArray(keys) && keys.length > 0) {
+const cleanup = async (): Promise<void> => {
+  const [legacyKeys, claimKeys, receiptKeys, queueKeys] = await Promise.all([
+    redis.send("KEYS", [`${TEST_PREFIX}:*`]),
+    redis.send("KEYS", [
+      `sync:job:claim:v2:${encodeURIComponent(`["${TEST_PREFIX}`)}*`,
+    ]),
+    redis.send("KEYS", [
+      `sync:job:enqueue-receipt:v2:${encodeURIComponent(`["${TEST_PREFIX}`)}*`,
+    ]),
+    redis.send("KEYS", [
+      `sync:queue:namespace:v2:${encodeURIComponent(`["${TEST_PREFIX}:queue`)}*`,
+    ]),
+  ]);
+  const keys = [
+    ...(Array.isArray(legacyKeys) ? legacyKeys : []),
+    ...(Array.isArray(claimKeys) ? claimKeys : []),
+    ...(Array.isArray(receiptKeys) ? receiptKeys : []),
+    ...(Array.isArray(queueKeys) ? queueKeys : []),
+  ];
+  if (keys.length > 0) {
     await redis.send("DEL", keys as string[]);
   }
-});
+};
+
+beforeEach(cleanup);
+afterAll(cleanup);
 
 const waitFor = async (pred: () => boolean, timeoutMs = 5_000, pollMs = 20): Promise<void> => {
   const start = Date.now();
@@ -22,7 +54,7 @@ const waitFor = async (pred: () => boolean, timeoutMs = 5_000, pollMs = 20): Pro
 const internalJobQueueReader = (id: string) =>
   queue({
     id: `${id}:work`,
-    prefix: "sync:job:queue",
+    prefix: `${TEST_PREFIX}:queue`,
   }).reader();
 
 // ==========================
@@ -86,7 +118,7 @@ test("job id and submission key delimiter combinations do not share claims", asy
 test("jobs fail closed when a legacy claim already exists", async () => {
   const id = "legacy-job";
   const key = "scope-key";
-  await redis.set(`sync:job:${id}:idempotency:${key}`, "old-worker-claim");
+  await redis.set(`${TEST_PREFIX}:${id}:idempotency:${key}`, "old-worker-claim");
   const worker = job({ id, process: async () => {} });
 
   try {
@@ -115,9 +147,9 @@ test("ordinary job claims use the full identity tuple", async () => {
     const jobId = await worker.submit({ key: "simple" });
     await waitFor(() => started);
     const claimKey =
-      `sync:job:claim:v2:${encodeURIComponent(JSON.stringify(["sync:job", id, "simple"]))}`;
+      `sync:job:claim:v2:${encodeURIComponent(JSON.stringify([TEST_PREFIX, id, "simple"]))}`;
     expect(await redis.get(claimKey)).toContain(jobId);
-    expect(await redis.get(`sync:job:${id}:idempotency:simple`)).toBeNull();
+    expect(await redis.get(`${TEST_PREFIX}:${id}:idempotency:simple`)).toBeNull();
   } finally {
     release();
     worker.stop();
@@ -597,7 +629,7 @@ test("job timings reject non-finite and unsupported delays before claiming a key
     "submit.delayMs must be a safe integer",
   );
 
-  expect(await redis.send("GET", [`sync:job:${id}:seq`])).toBeNull();
+  expect(await redis.send("GET", [`${TEST_PREFIX}:${id}:seq`])).toBeNull();
   worker.stop();
 
   const callbackErrors: string[] = [];

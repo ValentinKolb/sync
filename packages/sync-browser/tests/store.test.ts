@@ -377,13 +377,28 @@ test("LocalStorageStore: overwrite resets TTL timer", async () => {
   }
 });
 
-test("LocalStorageStore: get returns undefined for corrupted JSON", () => {
+test("LocalStorageStore: corrupt entries fail closed and remain visible", () => {
   globalThis.localStorage = createLocalStorageMock();
   try {
     const store = new LocalStorageStore("test");
-    // Manually inject corrupted data
     localStorage.setItem("test:corrupt", "not-json{{{");
-    expect(store.get("corrupt")).toBeUndefined();
+    expect(() => store.get("corrupt")).toThrow(/invalid stored value for key "corrupt"/);
+    expect(store.keys()).toContain("corrupt");
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("LocalStorageStore: malformed envelopes fail closed", () => {
+  globalThis.localStorage = createLocalStorageMock();
+  try {
+    const store = new LocalStorageStore("test");
+    localStorage.setItem("test:missing-value", JSON.stringify({ expiresAt: null }));
+    localStorage.setItem("test:invalid-expiry", JSON.stringify({ value: 1, expiresAt: "later" }));
+
+    expect(() => store.get("missing-value")).toThrow(/invalid stored value/);
+    expect(() => store.get("invalid-expiry")).toThrow(/invalid stored value/);
+    expect(store.keys().sort()).toEqual(["invalid-expiry", "missing-value"]);
   } finally {
     globalThis.localStorage = originalLocalStorage;
   }
@@ -552,6 +567,39 @@ test("LocalStorageStore retains its JSON value semantics", () => {
       nested: {},
     });
     expect(() => local.set("bigint", 1n)).toThrow(StoreWriteError);
+  } finally {
+    globalThis.localStorage = originalLocalStorage;
+  }
+});
+
+test("unsupported top-level LocalStorage values preserve prior data and TTL", async () => {
+  const mock = createLocalStorageMock();
+  globalThis.localStorage = mock;
+  try {
+    const local = new LocalStorageStore("unsupported");
+    local.set("key", "old", 50);
+    const previous = localStorage.getItem("unsupported:key");
+    const setItem = mock.setItem.bind(mock);
+    let writes = 0;
+    mock.setItem = ((key: string, value: string): void => {
+      writes += 1;
+      setItem(key, value);
+    }) as typeof mock.setItem;
+
+    for (const value of [
+      undefined,
+      () => undefined,
+      Symbol("value"),
+      { toJSON: () => undefined },
+    ]) {
+      expect(() => local.set("key", value, 500)).toThrow(StoreWriteError);
+      expect(localStorage.getItem("unsupported:key")).toBe(previous);
+    }
+
+    expect(writes).toBe(0);
+    expect(local.get("key")).toBe("old");
+    await Bun.sleep(80);
+    expect(local.get("key")).toBeUndefined();
   } finally {
     globalThis.localStorage = originalLocalStorage;
   }

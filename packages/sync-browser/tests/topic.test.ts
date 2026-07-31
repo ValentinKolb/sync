@@ -1018,20 +1018,269 @@ test("a recreated reader resumes at the group's committed position", async () =>
   expect(next?.data).toEqual({ v: 2 });
 });
 
-test("browser topic logs retain at most 256 events", async () => {
-  const id = `bounded-log-${Date.now()}`;
-  const t = topic<{ v: number }>({ id, retentionMs: 60_000 });
-  for (let v = 0; v < 300; v += 1) await t.pub({ data: { v } });
+test("browser topic bounds its log while retaining pending deliveries", async () => {
+  const id = `bounded-pending-log-${Date.now()}`;
+  const backing = new Map<string, string>();
+  const store = jsonStore(backing);
+  const t = topic<{ v: number }>({ id, retentionMs: 60_000, store });
+  await t.pub({ data: { v: 0 } });
+  const localPending = await t.reader("local", { consumerId: "original" }).recv({ wait: false });
+  const persistedPending = await t.reader("persisted", { consumerId: "original" }).recv({ wait: false });
+  expect(localPending?.data).toEqual({ v: 0 });
+  expect(persistedPending?.data).toEqual({ v: 0 });
+
+  for (let v = 1; v <= 300; v += 1) await t.pub({ data: { v } });
 
   const logs = sharedState(
     JSON.stringify(["topic:logs", "sync:topic", id]),
-    undefined,
+    store,
     () => new Map<string, EventLog>(),
   );
   const snapshot = logs.get(JSON.stringify(["sync:topic", id, "default"]))!.snapshot();
   expect(snapshot).toHaveLength(256);
-  expect(snapshot[0]?.id).toBe("45");
-  expect(snapshot.at(-1)?.id).toBe("300");
+  expect(snapshot[0]?.id).toBe("46");
+  expect(snapshot.at(-1)?.id).toBe("301");
+
+  const localReclaimed = await t
+    .reader("local", { consumerId: "recovery" })
+    .reclaim({ minIdleMs: 0 });
+  expect(localReclaimed.entries[0]?.kind).toBe("delivery");
+  if (localReclaimed.entries[0]?.kind === "delivery") {
+    expect(localReclaimed.entries[0].delivery.data).toEqual({ v: 0 });
+    expect(await localReclaimed.entries[0].delivery.commit()).toBe(true);
+  }
+
+  const recreated = topic<{ v: number }>({
+    id,
+    retentionMs: 60_000,
+    store: jsonStore(backing),
+  });
+  const persistedReclaimed = await recreated
+    .reader("persisted", { consumerId: "recovery" })
+    .reclaim({ minIdleMs: 0 });
+  expect(persistedReclaimed.entries[0]?.kind).toBe("delivery");
+  if (persistedReclaimed.entries[0]?.kind === "delivery") {
+    expect(persistedReclaimed.entries[0].delivery.data).toEqual({ v: 0 });
+    expect(await persistedReclaimed.entries[0].delivery.commit()).toBe(true);
+  }
+});
+
+test("browser topic allows 256 pending deliveries and blocks the next without advancing", async () => {
+  const store = createMemoryStore();
+  const t = topic<{ v: number }>({
+    id: `pending-capacity-${Date.now()}`,
+    retentionMs: 60_000,
+    store,
+  });
+  for (let v = 0; v < 256; v += 1) await t.pub({ data: { v } });
+
+  const reader = t.reader("workers");
+  let first: Awaited<ReturnType<typeof reader.recv>> = null;
+  for (let v = 0; v < 256; v += 1) {
+    const delivery = await reader.recv({ wait: false });
+    expect(delivery?.data).toEqual({ v });
+    if (v === 0) first = delivery;
+  }
+
+  const blocked = await t.pub({ data: { v: 256 } });
+  await expect(reader.recv({ wait: false })).rejects.toThrow(
+    "topic pending delivery capacity reached (256)",
+  );
+
+  const groupKey = store.keys().find((key) => topicKeyKind(key, "group"));
+  expect(groupKey).toBeDefined();
+  expect(store.get(groupKey!)).toMatchObject({
+    delivered: "256",
+  });
+  expect((store.get(groupKey!) as { inFlight: unknown[] }).inFlight).toHaveLength(256);
+
+  expect(await first?.commit()).toBe(true);
+  const released = await reader.recv({ wait: false });
+  expect(released?.eventId).toBe(blocked.eventId);
+  expect(released?.data).toEqual({ v: 256 });
+});
+
+test("pending capacity cleanup keeps expired pins that remain in the event log", async () => {
+  const retentionMs = 60_000;
+  const backing = new Map<string, string>();
+  const store = jsonStore(backing);
+  const id = `pending-capacity-cleanup-${Date.now()}`;
+  const t = topic<{ v: number }>({ id, retentionMs, store });
+  for (let v = 0; v < 256; v += 1) await t.pub({ data: { v } });
+
+  const reader = t.reader("workers");
+  for (let v = 0; v < 256; v += 1) {
+    expect((await reader.recv({ wait: false }))?.data).toEqual({ v });
+  }
+
+  const groupKey = store.keys().find((key) => topicKeyKind(key, "group"));
+  expect(groupKey).toBeDefined();
+  const state = store.get(groupKey!) as {
+    committed: string;
+    delivered: string;
+    inFlight: Array<[string, { at: number; consumerId: string; entry: { ts: number } }]>;
+  };
+  store.set(groupKey!, {
+    ...state,
+    inFlight: state.inFlight.map(([eventId, held]) => [
+      eventId,
+      { ...held, entry: { ...held.entry, ts: Date.now() - retentionMs - 1 } },
+    ]),
+  });
+
+  const recreatedStore = jsonStore(backing);
+  const recreated = topic<{ v: number }>({ id, retentionMs, store: recreatedStore });
+  const blocked = await recreated.pub({ data: { v: 256 } });
+  expect((await recreated.reader("workers").recv({ wait: false }))?.eventId).toBe(blocked.eventId);
+
+  const cleaned = recreatedStore.get(groupKey!) as {
+    inFlight: Array<[string, unknown]>;
+  };
+  expect(cleaned.inFlight).toHaveLength(256);
+  expect(cleaned.inFlight.some(([eventId]) => eventId === "1")).toBe(false);
+  expect(cleaned.inFlight.some(([eventId]) => eventId === "2")).toBe(true);
+  expect(cleaned.inFlight.some(([eventId]) => eventId === blocked.eventId)).toBe(true);
+
+  const reclaimed = await recreated
+    .reader("workers", { consumerId: "recovery" })
+    .reclaim({ minIdleMs: 0, cursor: "1", count: 1 });
+  expect(reclaimed.entries[0]?.kind).toBe("delivery");
+  if (reclaimed.entries[0]?.kind === "delivery") {
+    expect(reclaimed.entries[0].delivery.eventId).toBe("2");
+  }
+});
+
+test("browser topic reclaims legacy pending state from the event log", async () => {
+  const id = `legacy-pending-${Date.now()}`;
+  const backing = new Map<string, string>();
+  const store = jsonStore(backing);
+  const t = topic<{ v: number }>({ id, store });
+  await t.pub({ data: { v: 1 } });
+  expect(await t.reader("workers", { consumerId: "original" }).recv({ wait: false })).not.toBeNull();
+
+  const groupKey = store.keys().find((key) => topicKeyKind(key, "group"));
+  expect(groupKey).toBeDefined();
+  const state = store.get(groupKey!) as {
+    committed: string;
+    delivered: string;
+    inFlight: Array<[string, { at: number; consumerId: string }]>;
+  };
+  store.set(groupKey!, {
+    ...state,
+    inFlight: state.inFlight.map(([eventId, held]) => [
+      eventId,
+      { at: held.at, consumerId: held.consumerId },
+    ]),
+  });
+
+  const recreated = topic<{ v: number }>({ id, store: jsonStore(backing) });
+  const reclaimed = await recreated
+    .reader("workers", { consumerId: "recovery" })
+    .reclaim({ minIdleMs: 0 });
+  expect(reclaimed.entries[0]?.kind).toBe("delivery");
+  if (reclaimed.entries[0]?.kind === "delivery") {
+    expect(reclaimed.entries[0].delivery.data).toEqual({ v: 1 });
+    expect(await reclaimed.entries[0].delivery.commit()).toBe(true);
+  }
+});
+
+test("browser topic hydrates legacy pending state before a full log is trimmed", async () => {
+  const id = `legacy-pending-full-log-${Date.now()}`;
+  const backing = new Map<string, string>();
+  const store = jsonStore(backing);
+  const t = topic<{ v: number }>({ id, store });
+  for (let v = 0; v < 256; v += 1) await t.pub({ data: { v } });
+  expect(await t.reader("workers", { consumerId: "original" }).recv({ wait: false })).not.toBeNull();
+
+  const groupKey = store.keys().find((key) => topicKeyKind(key, "group"));
+  expect(groupKey).toBeDefined();
+  const state = store.get(groupKey!) as {
+    committed: string;
+    delivered: string;
+    inFlight: Array<[string, { at: number; consumerId: string }]>;
+  };
+  store.set(groupKey!, {
+    ...state,
+    inFlight: state.inFlight.map(([eventId, held]) => [
+      eventId,
+      { at: held.at, consumerId: held.consumerId },
+    ]),
+  });
+
+  const recreated = topic<{ v: number }>({ id, store: jsonStore(backing) });
+  await recreated.pub({ data: { v: 256 } });
+  const reclaimed = await recreated
+    .reader("workers", { consumerId: "recovery" })
+    .reclaim({ minIdleMs: 0 });
+
+  expect(reclaimed.entries[0]?.kind).toBe("delivery");
+  if (reclaimed.entries[0]?.kind === "delivery") {
+    expect(reclaimed.entries[0].delivery.eventId).toBe("1");
+    expect(reclaimed.entries[0].delivery.data).toEqual({ v: 0 });
+    expect(await reclaimed.entries[0].delivery.commit()).toBe(true);
+  }
+});
+
+test("browser topic rejects publish before mutating when legacy pending state cannot be hydrated", async () => {
+  const id = `legacy-pending-missing-event-${Date.now()}`;
+  const backing = new Map<string, string>();
+  const store = jsonStore(backing);
+  const t = topic<{ v: number }>({ id, store });
+  await t.pub({ data: { v: 0 } });
+  expect(await t.reader("workers").recv({ wait: false })).not.toBeNull();
+
+  const groupKey = store.keys().find((key) => topicKeyKind(key, "group"));
+  const eventLogKey = store.keys().find((key) => topicKeyKind(key, "event-log"));
+  const highWaterKey = store.keys().find((key) => topicKeyKind(key, "high-water"));
+  expect(groupKey).toBeDefined();
+  expect(eventLogKey).toBeDefined();
+  expect(highWaterKey).toBeDefined();
+  const state = store.get(groupKey!) as {
+    committed: string;
+    delivered: string;
+    inFlight: Array<[string, { at: number; consumerId: string }]>;
+  };
+  store.set(groupKey!, {
+    ...state,
+    inFlight: state.inFlight.map(([eventId, held]) => [
+      eventId,
+      { at: held.at, consumerId: held.consumerId },
+    ]),
+  });
+  store.set(eventLogKey!, { entries: [] });
+
+  const recreated = topic<{ v: number }>({ id, store: jsonStore(backing) });
+  await expect(recreated.pub({ data: { v: 1 } })).rejects.toThrow(
+    "cannot restore pending topic delivery 1: event is no longer retained",
+  );
+  expect(store.get(eventLogKey!)).toEqual({ entries: [] });
+  expect(store.get(highWaterKey!)).toBe("1");
+});
+
+test("browser topic drops expired pinned deliveries during reclaim", async () => {
+  const originalNow = Date.now;
+  let now = originalNow();
+  Date.now = () => now;
+  try {
+    const store = createMemoryStore();
+    const t = topic<{ v: number }>({
+      id: `expired-pending-${now}`,
+      retentionMs: 1_000,
+      store,
+    });
+    await t.pub({ data: { v: 0 } });
+    expect(await t.reader("workers").recv({ wait: false })).not.toBeNull();
+    for (let v = 1; v <= 300; v += 1) await t.pub({ data: { v } });
+
+    now += 1_001;
+    const reader = t.reader("workers", { consumerId: "recovery" });
+    expect((await reader.reclaim({ minIdleMs: 0 })).entries).toHaveLength(0);
+    const groupKey = store.keys().find((key) => topicKeyKind(key, "group"));
+    expect(groupKey).toBeDefined();
+    expect((store.get(groupKey!) as { inFlight: unknown[] }).inFlight).toEqual([]);
+  } finally {
+    Date.now = originalNow;
+  }
 });
 
 test("invalidPayload: 'throw' raises TopicPayloadError on a malformed entry", async () => {
@@ -1046,19 +1295,85 @@ test("invalidPayload: 'throw' raises TopicPayloadError on a malformed entry", as
     () => new Map<string, EventLog>(),
   );
   logs.get(JSON.stringify(["sync:topic", id, "default"]))!.append({ payload: "not-json" });
+  await t.pub({ data: { v: 2 } });
 
   const reader = t.reader("g");
-  expect(await reader.recv({ wait: false }))?.data;
+  const first = await reader.recv({ wait: false });
+  expect(first?.data).toEqual({ v: 1 });
+  expect(await first?.commit()).toBe(true);
 
-  // The option was accepted and never read, so `catch (e) { if (e instanceof
-  // TopicPayloadError) ... }`, written against the documented contract, was
-  // dead code in the browser.
   await expect(reader.recv({ wait: false, invalidPayload: "throw" })).rejects.toThrow(TopicPayloadError);
+
+  const reclaimed = await t.reader("g", { consumerId: "recovery" }).reclaim({ minIdleMs: 0 });
+  expect(reclaimed.entries).toHaveLength(1);
+  expect(reclaimed.entries[0]?.kind).toBe("invalid");
+  if (reclaimed.entries[0]?.kind === "invalid") {
+    expect(await reclaimed.entries[0].commit()).toBe(true);
+  }
+  expect((await reader.recv({ wait: false }))?.data).toEqual({ v: 2 });
 
   // Default behaviour is still to skip it and keep draining.
   const skipping = t.reader("g2");
   expect((await skipping.recv({ wait: false }))?.data).toEqual({ v: 1 });
+  expect((await skipping.recv({ wait: false }))?.data).toEqual({ v: 2 });
   expect(await skipping.recv({ wait: false })).toBeNull();
+});
+
+test("waiting recv propagates TopicPayloadError for a newly arrived malformed entry", async () => {
+  const id = `invalid-waiting-${Date.now()}`;
+  const t = topic({ id });
+  const reader = t.reader("workers");
+  const pending = reader.recv({
+    wait: true,
+    timeoutMs: 1_000,
+    invalidPayload: "throw",
+  });
+
+  await Bun.sleep(10);
+  const logs = sharedState(
+    JSON.stringify(["topic:logs", "sync:topic", id]),
+    undefined,
+    () => new Map<string, EventLog>(),
+  );
+  logs.get(JSON.stringify(["sync:topic", id, "default"]))!.append({ payload: "not-json" });
+
+  await expect(pending).rejects.toThrow(TopicPayloadError);
+  expect((await reader.reclaim({ minIdleMs: 0 })).entries[0]?.kind).toBe("invalid");
+});
+
+test("reloaded structural-invalid envelopes stay invalid and reclaimable", async () => {
+  const id = `invalid-structure-${Date.now()}`;
+  const backing = new Map<string, string>();
+  const initialStore = jsonStore(backing);
+  const initial = topic<{ v: number }>({ id, store: initialStore });
+  await initial.pub({ data: { v: 1 } });
+
+  const eventLogKey = initialStore.keys().find((key) => topicKeyKind(key, "event-log"));
+  expect(eventLogKey).toBeDefined();
+  const persisted = initialStore.get(eventLogKey!) as {
+    entries: Array<{ id: string; ts: number; fields: Record<string, string> }>;
+  };
+  initialStore.set(eventLogKey!, {
+    entries: [
+      ...persisted.entries,
+      { id: "2", ts: Date.now(), fields: { payload: "{}" } },
+    ],
+  });
+
+  const reloaded = topic<{ v: number }>({ id, store: jsonStore(backing) });
+  const reader = reloaded.reader("workers");
+  const valid = await reader.recv({ wait: false });
+  expect(valid?.data).toEqual({ v: 1 });
+  expect(await valid?.commit()).toBe(true);
+  await expect(reader.recv({ wait: false, invalidPayload: "throw" })).rejects.toThrow(
+    TopicPayloadError,
+  );
+
+  const reclaimed = await reader.reclaim({ minIdleMs: 0 });
+  expect(reclaimed.entries[0]?.kind).toBe("invalid");
+  if (reclaimed.entries[0]?.kind === "invalid") {
+    expect(await reclaimed.entries[0].commit()).toBe(true);
+  }
 });
 
 test("a stale consumer cannot commit a delivery another reader reclaimed", async () => {

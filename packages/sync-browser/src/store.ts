@@ -149,6 +149,28 @@ type StoredValue = {
   expiresAt: number | null;
 };
 
+const parseStoredValue = (key: string, raw: string): StoredValue => {
+  try {
+    const entry = JSON.parse(raw) as unknown;
+    if (
+      entry === null ||
+      typeof entry !== "object" ||
+      Array.isArray(entry) ||
+      !Object.prototype.hasOwnProperty.call(entry, "value") ||
+      !Object.prototype.hasOwnProperty.call(entry, "expiresAt")
+    ) {
+      throw new Error("invalid storage envelope");
+    }
+    const stored = entry as StoredValue;
+    if (stored.expiresAt !== null && !Number.isFinite(stored.expiresAt)) {
+      throw new Error("invalid expiry");
+    }
+    return stored;
+  } catch (error) {
+    throw new Error(`invalid stored value for key "${key}"`, { cause: error });
+  }
+};
+
 export class LocalStorageStore implements Store {
   private prefix: string;
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -179,10 +201,10 @@ export class LocalStorageStore implements Store {
       if (raw === null) continue;
 
       try {
-        const entry = JSON.parse(raw) as StoredValue;
+        const logicalKey = storageKey.slice(fullPrefix.length);
+        const entry = parseStoredValue(logicalKey, raw);
         if (entry.expiresAt === null || !Number.isFinite(entry.expiresAt)) continue;
 
-        const logicalKey = storageKey.slice(fullPrefix.length);
         if (now >= entry.expiresAt) {
           localStorage.removeItem(storageKey);
         } else {
@@ -205,7 +227,7 @@ export class LocalStorageStore implements Store {
       }
 
       try {
-        const entry = JSON.parse(raw) as StoredValue;
+        const entry = parseStoredValue(key, raw);
         if (entry.expiresAt !== expiresAt) {
           this.timers.delete(key);
           return;
@@ -229,26 +251,29 @@ export class LocalStorageStore implements Store {
     const raw = localStorage.getItem(this.storageKey(key));
     if (raw === null) return undefined;
 
-    try {
-      const entry = JSON.parse(raw) as StoredValue;
+    const entry = parseStoredValue(key, raw);
 
-      // Lazy expiry check
-      if (entry.expiresAt !== null && Date.now() >= entry.expiresAt) {
-        this.del(key);
-        return undefined;
-      }
-
-      return entry.value;
-    } catch {
+    // Lazy expiry check
+    if (entry.expiresAt !== null && Date.now() >= entry.expiresAt) {
+      this.del(key);
       return undefined;
     }
+
+    return entry.value;
   }
 
   set(key: string, value: unknown, ttlMs?: number): void {
     this.ensureInitialized();
     const expiresAt = ttlMs != null && ttlMs > 0 ? Date.now() + ttlMs : null;
+    let raw: string;
     try {
-      localStorage.setItem(this.storageKey(key), JSON.stringify({ value, expiresAt }));
+      raw = JSON.stringify({ value, expiresAt });
+      parseStoredValue(key, raw);
+    } catch (error) {
+      throw new StoreWriteError(key, error);
+    }
+    try {
+      localStorage.setItem(this.storageKey(key), raw);
     } catch (error) {
       // A raw QuotaExceededError used to propagate out of topic.pub(),
       // ratelimit.check() or pump's writeState mid-dispatch, where it landed
@@ -302,13 +327,13 @@ export class LocalStorageStore implements Store {
       const raw = localStorage.getItem(storageKey);
       if (raw) {
         try {
-          const entry = JSON.parse(raw) as StoredValue;
+          const entry = parseStoredValue(logicalKey, raw);
           if (entry.expiresAt !== null && now >= entry.expiresAt) {
             this.del(logicalKey);
             continue;
           }
         } catch {
-          continue;
+          // Keep corrupt keys visible so callers cannot mistake them for absent state.
         }
       }
 

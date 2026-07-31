@@ -1,16 +1,21 @@
-import { beforeEach, expect, test } from "bun:test";
+import { afterAll, beforeEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { job, queue } from "../index";
+import { job as createJob, queue, type JobConfig, type JobHandle } from "../index";
 
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+const TEST_PREFIX = `test:fault-jobs:${process.pid}:${uid("run")}`;
+const job = <Input = void, Result = unknown>(
+  config: JobConfig<Input, Result>,
+): JobHandle<Input> =>
+  createJob({ ...config, prefix: config.prefix ?? TEST_PREFIX });
 const jobQueueBase = (id: string): string =>
-  `sync:queue:namespace:v2:${encodeURIComponent(JSON.stringify(["sync:job:queue", "default", `${id}:work`]))}`;
+  `sync:queue:namespace:v2:${encodeURIComponent(JSON.stringify([`${TEST_PREFIX}:queue`, "default", `${id}:work`]))}`;
 const jobClaimKey = (id: string, key: string): string =>
-  `sync:job:claim:v2:${encodeURIComponent(JSON.stringify(["sync:job", id, key]))}`;
+  `sync:job:claim:v2:${encodeURIComponent(JSON.stringify([TEST_PREFIX, id, key]))}`;
 const internalJobQueue = <T>(id: string) =>
   queue<T>({
     id: `${id}:work`,
-    prefix: "sync:job:queue",
+    prefix: `${TEST_PREFIX}:queue`,
   });
 
 const waitFor = async (pred: () => boolean, timeoutMs = 10_000, pollMs = 20): Promise<void> => {
@@ -21,12 +26,32 @@ const waitFor = async (pred: () => boolean, timeoutMs = 10_000, pollMs = 20): Pr
   }
 };
 
-beforeEach(async () => {
-  const keys = await redis.send("KEYS", ["sync:job:*"]);
-  if (Array.isArray(keys) && keys.length > 0) {
+const cleanup = async (): Promise<void> => {
+  const [legacyKeys, claimKeys, receiptKeys, queueKeys] = await Promise.all([
+    redis.send("KEYS", [`${TEST_PREFIX}:*`]),
+    redis.send("KEYS", [
+      `sync:job:claim:v2:${encodeURIComponent(`["${TEST_PREFIX}`)}*`,
+    ]),
+    redis.send("KEYS", [
+      `sync:job:enqueue-receipt:v2:${encodeURIComponent(`["${TEST_PREFIX}`)}*`,
+    ]),
+    redis.send("KEYS", [
+      `sync:queue:namespace:v2:${encodeURIComponent(`["${TEST_PREFIX}:queue`)}*`,
+    ]),
+  ]);
+  const keys = [
+    ...(Array.isArray(legacyKeys) ? legacyKeys : []),
+    ...(Array.isArray(claimKeys) ? claimKeys : []),
+    ...(Array.isArray(receiptKeys) ? receiptKeys : []),
+    ...(Array.isArray(queueKeys) ? queueKeys : []),
+  ];
+  if (keys.length > 0) {
     await redis.send("DEL", keys as string[]);
   }
-});
+};
+
+beforeEach(cleanup);
+afterAll(cleanup);
 
 // ==========================
 // Redelivery via ctx.reschedule increments failureCount
@@ -81,7 +106,7 @@ test("idempotency key stays claimed while process is running; concurrent submit 
   expect(id2).toBe(id1);
 
   allowFinish = true;
-  await Bun.sleep(200);
+  await waitFor(() => worker.metric().dispatches === 1);
 
   const id3 = await worker.submit({ key: "chat:1" });
   expect(id3).not.toBe(id1);
@@ -111,6 +136,7 @@ test("terminal failure (no reschedule) releases key; resubmit with same key runs
 
   const id1 = await worker.submit({ key: "item:1" });
   await waitFor(() => afterCalls === 1);
+  await waitFor(() => worker.metric().failures === 1);
 
   const id2 = await worker.submit({ key: "item:1" });
   expect(id2).not.toBe(id1);
@@ -158,11 +184,9 @@ test("reschedule via ctx.reschedule keeps key claimed across delayMs window", as
 
 test("two live workers with the same id process each key exactly once", async () => {
   const processedBy: string[] = [];
-  const sharedPrefix = `sync:job:shared-${Date.now()}`;
 
   const wa = job<{ n: number }>({
     id: "shared-def",
-    prefix: sharedPrefix,
     process: async () => {
       processedBy.push("a");
       await Bun.sleep(30);
@@ -170,7 +194,6 @@ test("two live workers with the same id process each key exactly once", async ()
   });
   const wb = job<{ n: number }>({
     id: "shared-def",
-    prefix: sharedPrefix,
     process: async () => {
       processedBy.push("b");
       await Bun.sleep(30);
@@ -338,20 +361,22 @@ test("submit after stop waits for the aborted callback before restarting", async
 });
 
 test("worker.stop while process is running does not prevent the in-flight process from completing", async () => {
+  let started = false;
   let completedNormally = false;
 
   const worker = job({
     id: uid("stop-mid"),
     process: async () => {
+      started = true;
       await Bun.sleep(150);
       completedNormally = true;
     },
   });
 
   await worker.submit({ key: "x" });
-  await Bun.sleep(50);
+  await waitFor(() => started);
   worker.stop();
-  await Bun.sleep(300);
+  await waitFor(() => completedNormally);
 
   expect(completedNormally).toBe(true);
 });
@@ -499,6 +524,346 @@ test("an ambiguous successful queue send starts the worker and keeps one job", a
   await waitFor(() => runs.length === 1);
   await Bun.sleep(100);
   expect(runs).toEqual(["orders/ambiguous"]);
+  j.stop();
+});
+
+test("a cold worker runs accepted work when submit-side mark faults", async () => {
+  const id = uid("mark-fault-worker");
+  const key = "orders/accepted";
+  const claimKey = jobClaimKey(id, key);
+  const targetSeqKey = `${jobQueueBase(id)}:seq`;
+  const runs: string[] = [];
+  const j = job({
+    id,
+    process: async ({ ctx }) => {
+      runs.push(ctx.key);
+    },
+  });
+  const originalSend = redis.send.bind(redis);
+  let queueSendSucceeded = false;
+  let markFaulted = false;
+
+  redis.send = (async (command, args) => {
+    if (
+      !markFaulted
+      && command === "EVAL"
+      && args[2] === claimKey
+      && args.at(-1) === "submit"
+    ) {
+      if (!queueSendSucceeded) throw new Error("submit mark ran before queue send");
+      markFaulted = true;
+      const error = new Error("connection reset during submit mark") as Error & { code: string };
+      error.code = "ECONNRESET";
+      throw error;
+    }
+    const result = await originalSend(command, args);
+    if (command === "EVAL" && args.includes(targetSeqKey)) queueSendSucceeded = true;
+    return result;
+  }) as typeof redis.send;
+
+  try {
+    await expect(j.submit({ key })).rejects.toThrow("connection reset during submit mark");
+    expect(queueSendSucceeded).toBe(true);
+    expect(markFaulted).toBe(true);
+    await waitFor(() => j.metric().dispatches === 1);
+    await Bun.sleep(100);
+    expect(runs).toEqual([key]);
+  } finally {
+    redis.send = originalSend as typeof redis.send;
+    j.stop();
+  }
+});
+
+test("worker trace stays ordered when the committed submit mark reply is lost", async () => {
+  const id = uid("committed-mark-reply");
+  const key = "orders/traced";
+  const claimKey = jobClaimKey(id, key);
+  const events: string[] = [];
+  const j = job({
+    id,
+    trace: (event) => {
+      events.push(event.type);
+    },
+    process: async () => {},
+  });
+  const originalSend = redis.send.bind(redis);
+  let markCommitted = false;
+  let releaseReply = (): void => {};
+  const replyGate = new Promise<void>((resolve) => {
+    releaseReply = resolve;
+  });
+
+  redis.send = (async (command, args) => {
+    if (
+      !markCommitted
+      && command === "EVAL"
+      && args[2] === claimKey
+      && args.at(-1) === "submit"
+    ) {
+      await originalSend(command, args);
+      markCommitted = true;
+      await replyGate;
+      const error = new Error("connection reset after submit mark") as Error & { code: string };
+      error.code = "ECONNRESET";
+      throw error;
+    }
+    return await originalSend(command, args);
+  }) as typeof redis.send;
+
+  try {
+    const submitted = j.submit({ key });
+    await waitFor(() => markCommitted);
+    await waitFor(() => events.includes("finished"));
+    expect(events).toEqual(["submitted", "started", "succeeded", "finished"]);
+
+    releaseReply();
+    await expect(submitted).rejects.toThrow("connection reset after submit mark");
+  } finally {
+    releaseReply();
+    redis.send = originalSend as typeof redis.send;
+    j.stop();
+  }
+});
+
+test("concurrent submitters confirm a job after its warmed worker finishes", async () => {
+  const id = uid("worker-before-submit-mark");
+  const key = "orders/fast";
+  const idemKey = jobClaimKey(id, key);
+  const receiptKey =
+    `sync:job:enqueue-receipt:v2:${encodeURIComponent(JSON.stringify([TEST_PREFIX, id, key, "2"]))}`;
+  const runs: string[] = [];
+  const events: string[] = [];
+  const worker = job({
+    id,
+    trace: (event) => {
+      events.push(event.type);
+    },
+    process: async ({ ctx }) => {
+      runs.push(ctx.key);
+    },
+  });
+
+  await worker.submit({ key: "warm-up" });
+  await waitFor(() => runs.includes("warm-up"));
+  await waitFor(() => worker.metric().dispatches === 1);
+  await waitFor(() => events.includes("finished"));
+  events.length = 0;
+
+  const originalSend = redis.send.bind(redis);
+  let blockedMarks = 0;
+  let releaseMark = (): void => {};
+  const markGate = new Promise<void>((resolve) => {
+    releaseMark = resolve;
+  });
+  redis.send = (async (command, args) => {
+    if (
+      command === "EVAL"
+      && args[2] === idemKey
+      && args.at(-1) === "submit"
+    ) {
+      blockedMarks += 1;
+      await markGate;
+    }
+    return await originalSend(command, args);
+  }) as typeof redis.send;
+
+  try {
+    const submitted = [worker.submit({ key }), worker.submit({ key })];
+    await waitFor(() => blockedMarks === 2);
+    await waitFor(() => runs.includes(key));
+    await waitFor(() => worker.metric().dispatches === 2);
+    expect(await redis.get(idemKey)).toBeNull();
+    expect(await redis.get(receiptKey)).toBe("2");
+
+    releaseMark();
+    await expect(Promise.all(submitted)).resolves.toEqual(["2", "2"]);
+    expect(await redis.get(receiptKey)).toBe("2");
+    expect(Number(await redis.send("PTTL", [receiptKey]))).toBeGreaterThan(0);
+    await Bun.sleep(100);
+    expect(runs.filter((run) => run === key)).toHaveLength(1);
+    await waitFor(() => events.includes("finished"));
+    expect(events).toEqual(["submitted", "started", "succeeded", "finished"]);
+    expect(events.filter((event) => event === "submitted")).toHaveLength(1);
+  } finally {
+    releaseMark();
+    redis.send = originalSend as typeof redis.send;
+    worker.stop();
+  }
+});
+
+test("a worker refreshes the receipt after one concurrent submitter marks enqueued", async () => {
+  const id = uid("worker-after-submit-mark");
+  const key = "orders/marked";
+  const idemKey = jobClaimKey(id, key);
+  const receiptKey =
+    `sync:job:enqueue-receipt:v2:${encodeURIComponent(JSON.stringify([TEST_PREFIX, id, key, "2"]))}`;
+  const runs: string[] = [];
+  const events: string[] = [];
+  const worker = job({
+    id,
+    trace: (event) => {
+      events.push(event.type);
+    },
+    process: async ({ ctx }) => {
+      runs.push(ctx.key);
+    },
+  });
+
+  await worker.submit({ key: "warm-up" });
+  await waitFor(() => worker.metric().dispatches === 1);
+  await waitFor(() => events.includes("finished"));
+  events.length = 0;
+
+  const originalSend = redis.send.bind(redis);
+  let submitMarks = 0;
+  let firstMarkCommitted = false;
+  let secondMarkBlocked = false;
+  let signalBothMarks = (): void => {};
+  const bothMarksGate = new Promise<void>((resolve) => {
+    signalBothMarks = resolve;
+  });
+  let signalFirstMark = (): void => {};
+  const firstMarkGate = new Promise<void>((resolve) => {
+    signalFirstMark = resolve;
+  });
+  let releaseSecondMark = (): void => {};
+  const secondMarkGate = new Promise<void>((resolve) => {
+    releaseSecondMark = resolve;
+  });
+
+  redis.send = (async (command, args) => {
+    if (command === "EVAL" && args[2] === idemKey && args.at(-1) === "submit") {
+      submitMarks += 1;
+      if (submitMarks === 1) {
+        await bothMarksGate;
+        const result = await originalSend(command, args);
+        firstMarkCommitted = true;
+        signalFirstMark();
+        return result;
+      }
+      if (submitMarks === 2) {
+        secondMarkBlocked = true;
+        signalBothMarks();
+        await secondMarkGate;
+      }
+    }
+    if (command === "EVAL" && args[2] === idemKey && args.at(-1) === "worker") {
+      await firstMarkGate;
+    }
+    return await originalSend(command, args);
+  }) as typeof redis.send;
+
+  try {
+    const submitted = [worker.submit({ key }), worker.submit({ key })];
+    await waitFor(() => firstMarkCommitted && secondMarkBlocked);
+    await waitFor(() => worker.metric().dispatches === 2);
+    expect(await redis.get(idemKey)).toBeNull();
+    expect(await redis.get(receiptKey)).toBe("2");
+
+    releaseSecondMark();
+    await expect(Promise.all(submitted)).resolves.toEqual(["2", "2"]);
+    expect(Number(await redis.send("PTTL", [receiptKey]))).toBeGreaterThan(0);
+    expect(runs.filter((run) => run === key)).toHaveLength(1);
+    expect(events).toEqual(["submitted", "started", "succeeded", "finished"]);
+  } finally {
+    signalBothMarks();
+    signalFirstMark();
+    releaseSecondMark();
+    redis.send = originalSend as typeof redis.send;
+    worker.stop();
+  }
+});
+
+test("worker enqueue receipts stay bounded when the delivery lease exceeds the key TTL cap", async () => {
+  const maxKeyTtlMs = 30 * 24 * 60 * 60 * 1_000;
+  const id = uid("bounded-worker-receipt");
+  const key = "orders/long-lease";
+  const receiptKey =
+    `sync:job:enqueue-receipt:v2:${encodeURIComponent(JSON.stringify([TEST_PREFIX, id, key, "1"]))}`;
+  let runs = 0;
+  const worker = job({
+    id,
+    defaults: { leaseMs: maxKeyTtlMs + 10_000 },
+    process: async () => {
+      runs += 1;
+    },
+  });
+
+  try {
+    await expect(worker.submit({ key })).resolves.toBe("1");
+    await waitFor(() => worker.metric().dispatches === 1);
+
+    const receiptTtlMs = Number(await redis.send("PTTL", [receiptKey]));
+    expect(receiptTtlMs).toBeGreaterThan(0);
+    expect(receiptTtlMs).toBeLessThanOrEqual(maxKeyTtlMs);
+    expect(runs).toBe(1);
+  } finally {
+    worker.stop();
+  }
+});
+
+test("pending retries cannot renew a claim past the queue idempotency fence", async () => {
+  const id = uid("pending-claim-expiry");
+  const key = "orders/pending";
+  const claimKey = jobClaimKey(id, key);
+  const queueBase = jobQueueBase(id);
+  const queueIdempotencyKey = `${queueBase}:idempotency:1`;
+  const seen: number[] = [];
+  const j = job<{ value: number }>({
+    id,
+    process: async ({ ctx }) => {
+      seen.push(ctx.input.value);
+    },
+  });
+  const originalSend = redis.send.bind(redis);
+  let faultedMarks = 0;
+
+  redis.send = (async (command, args) => {
+    if (
+      command === "EVAL"
+      && args[2] === claimKey
+      && args[4] === "1"
+      && args.at(-1) === "submit"
+    ) {
+      faultedMarks += 1;
+      throw new Error("faulted submit mark");
+    }
+    return await originalSend(command, args);
+  }) as typeof redis.send;
+
+  try {
+    await expect(
+      j.submit({ key, input: { value: 1 }, delayMs: 5_000, keyTtlMs: 1_000 }),
+    ).rejects.toThrow("faulted submit mark");
+    const pending = await redis.get(claimKey);
+    expect(pending).not.toBeNull();
+    expect(await redis.get(queueIdempotencyKey)).toBe("1");
+    expect(await redis.send("HLEN", [`${queueBase}:messages`])).toBe(1);
+
+    // Put the claim and queue fence at the same near-expiry point. Retrying the
+    // captured payload must leave the pending record and its deadline intact.
+    await redis.send("PEXPIRE", [claimKey, "500"]);
+    await redis.send("PEXPIRE", [queueIdempotencyKey, "500"]);
+    await expect(
+      j.submit({ key, input: { value: 99 }, keyTtlMs: 1_000 }),
+    ).rejects.toThrow("faulted submit mark");
+    expect(await redis.get(claimKey)).toBe(pending);
+    expect(Number(await redis.send("PTTL", [claimKey]))).toBeLessThanOrEqual(500);
+    expect(await redis.send("HLEN", [`${queueBase}:messages`])).toBe(1);
+
+    while (await redis.get(queueIdempotencyKey)) {
+      await Bun.sleep(5);
+    }
+    expect(await redis.get(claimKey)).toBeNull();
+  } finally {
+    redis.send = originalSend as typeof redis.send;
+  }
+
+  const replacement = await j.submit({ key, input: { value: 2 }, keyTtlMs: 1_000 });
+  expect(replacement).toBe("2");
+  await waitFor(() => j.metric().dispatches === 1);
+  expect(faultedMarks).toBe(2);
+  expect(seen).toEqual([2]);
   j.stop();
 });
 
@@ -691,7 +1056,7 @@ test("a reschedule chain keeps the idempotency claim alive past keyTtlMs", async
   // Without a refresh the claim expires mid-chain, and a fanout submit would
   // then enqueue a second concurrent job for the same key.
   expect(claimHeld.slice(0, 4)).toEqual([true, true, true, true]);
-});
+}, 20_000);
 
 test("terminal settlement atomically acknowledges work and releases its claim", async () => {
   const id = uid("atomic-terminal");

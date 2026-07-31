@@ -46,8 +46,6 @@ const CLAIM_KEY_SCRIPT = `
     if type(record.payloadJson) == "string" and record.payloadJson ~= "" then
       -- Every contender retries the exact payload captured by the first claim.
       -- The work queue's jobId idempotency key makes concurrent sends harmless.
-      record.claimedAt = now
-      redis.call("SET", idemKey, cjson.encode(record), "PX", tostring(ttlMs))
       return { record.jobId, 1, record.payloadJson }
     end
     if (now - (tonumber(record.claimedAt) or 0)) <= graceMs then
@@ -77,19 +75,47 @@ const CLAIM_KEY_SCRIPT = `
 `;
 
 // Mark the claim as backed by a real queue message, and refresh its TTL.
+// A remote worker may win this transition before submit() returns from send().
+// Its TTL-bounded receipt lets concurrent submitters distinguish that accepted
+// work from a stale delivery after the worker terminally released the claim.
 const MARK_ENQUEUED_SCRIPT = `
   local existing = redis.call("GET", KEYS[1])
-  if not existing then return 0 end
-  local ok, record = pcall(cjson.decode, existing)
-  if not ok or type(record) ~= "table" or record.jobId ~= ARGV[1] then return 0 end
-  if record.enqueued then
-    redis.call("PEXPIRE", KEYS[1], tostring(ARGV[2]))
-    return 2
+  local receipt = redis.call("GET", KEYS[2])
+  local jobId = ARGV[1]
+  local claimTtlMs = tostring(ARGV[2])
+  local receiptTtlMs = tostring(ARGV[3])
+  local actor = ARGV[4]
+
+  if existing then
+    local ok, record = pcall(cjson.decode, existing)
+    local structured = ok and type(record) == "table" and record.jobId
+    local matches = (structured and record.jobId == jobId) or (not structured and existing == jobId)
+
+    if matches and actor == "worker" then
+      redis.call("SET", KEYS[2], jobId, "PX", receiptTtlMs)
+    end
+
+    if matches and structured and not record.enqueued then
+      record.enqueued = true
+      record.payloadJson = nil
+      redis.call("SET", KEYS[1], cjson.encode(record), "PX", claimTtlMs)
+      return 1
+    end
+
+    if matches then
+      redis.call("PEXPIRE", KEYS[1], claimTtlMs)
+      if actor == "submit" and receipt == jobId then
+        return 3
+      end
+      return 2
+    end
   end
-  record.enqueued = true
-  record.payloadJson = nil
-  redis.call("SET", KEYS[1], cjson.encode(record), "PX", tostring(ARGV[2]))
-  return 1
+
+  if actor == "submit" and receipt == jobId then
+    return 3
+  end
+
+  return 0
 `;
 
 // Release only our own claim. An unconditional DEL let a slow job's terminal
@@ -297,6 +323,8 @@ export const job = <Input = void, Result = unknown>(
     }
     return encodedKey;
   };
+  const resolveEnqueueReceiptKey = (key: string, jobId: JobId): string =>
+    `sync:job:enqueue-receipt:v2:${encodeURIComponent(JSON.stringify([prefix, config.id, key, jobId]))}`;
   const resolveWorkQueueBase = async (): Promise<string> => {
     const queuePrefix = `${prefix}:queue`;
     return `sync:queue:namespace:v2:${encodeURIComponent(JSON.stringify([
@@ -359,15 +387,40 @@ export const job = <Input = void, Result = unknown>(
     return Number(result) > 0;
   };
 
+  const transitionEnqueued = async (
+    key: string,
+    jobId: JobId,
+    keyTtlMs: number,
+    actor: "submit" | "worker",
+  ): Promise<"new" | "existing" | "worker-reported" | "lost"> => {
+    const result = await redis.send("EVAL", [
+      MARK_ENQUEUED_SCRIPT,
+      "2",
+      await resolveIdempotencyKey(key),
+      resolveEnqueueReceiptKey(key, jobId),
+      jobId,
+      String(keyTtlMs),
+      String(Math.min(MAX_KEY_TTL_MS, keyTtlMs)),
+      actor,
+    ]);
+    if (Number(result) === 1) return "new";
+    if (Number(result) === 2) return "existing";
+    if (Number(result) === 3) return "worker-reported";
+    return "lost";
+  };
   const markEnqueued = async (
     key: string,
     jobId: JobId,
     keyTtlMs: number,
+  ): Promise<"new" | "existing" | "worker-reported" | "lost"> =>
+    await transitionEnqueued(key, jobId, keyTtlMs, "submit");
+  const activateClaim = async (
+    key: string,
+    jobId: JobId,
+    keyTtlMs: number,
   ): Promise<"new" | "existing" | "lost"> => {
-    const result = await evalKeyScript(MARK_ENQUEUED_SCRIPT, key, [jobId, String(keyTtlMs)]);
-    if (Number(result) === 1) return "new";
-    if (Number(result) === 2) return "existing";
-    return "lost";
+    const state = await transitionEnqueued(key, jobId, keyTtlMs, "worker");
+    return state === "worker-reported" ? "existing" : state;
   };
 
   const claimKey = async (
@@ -442,6 +495,8 @@ export const job = <Input = void, Result = unknown>(
             const jobAc = new AbortController();
             let leaseLost = false;
             let claimLost = false;
+            let claimActivated = false;
+            let reportSubmitted = false;
             activeJobAc = jobAc;
 
             try {
@@ -458,11 +513,14 @@ export const job = <Input = void, Result = unknown>(
                 // means a newer submit owns the key and this delivery is stale.
                 let ownsClaim: boolean;
                 try {
-                  ownsClaim = await extendKey(
-                    payload.key,
-                    payload.jobId,
-                    Math.max(payload.keyTtlMs, leaseMs),
-                  );
+                  const claimTtlMs = Math.max(payload.keyTtlMs, leaseMs);
+                  if (claimActivated) {
+                    ownsClaim = await extendKey(payload.key, payload.jobId, claimTtlMs);
+                  } else {
+                    const activation = await activateClaim(payload.key, payload.jobId, claimTtlMs);
+                    ownsClaim = activation !== "lost";
+                    reportSubmitted = ownsClaim && attempt === 1;
+                  }
                 } catch (error) {
                   leaseLost = true;
                   jobAc.abort();
@@ -473,6 +531,7 @@ export const job = <Input = void, Result = unknown>(
                   jobAc.abort();
                   return false;
                 }
+                claimActivated = true;
                 return true;
               };
               const canceled = (): boolean => ac.signal.aborted || leaseLost || jobAc.signal.aborted;
@@ -503,6 +562,16 @@ export const job = <Input = void, Result = unknown>(
 
               const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
 
+              if (reportSubmitted) {
+                await emitTrace(config.trace, {
+                  type: "submitted",
+                  jobId: payload.jobId,
+                  key: payload.key,
+                  ...traceInput,
+                  ...(payload.meta ? { meta: payload.meta } : {}),
+                });
+                reportSubmitted = false;
+              }
               await emitTrace(config.trace, {
                 type: "started",
                 jobId: payload.jobId,
@@ -700,22 +769,11 @@ export const job = <Input = void, Result = unknown>(
     // Only now is the claim genuinely backed by queued work. A crash before
     // this point leaves the claim pending; a later submit retries the enqueue,
     // while the queue's jobId key prevents a successful send from duplicating.
+    startWorker();
     const enqueueState = await markEnqueued(cfg.key, claim.jobId, pending.idempotencyTtlMs);
     if (enqueueState === "lost") {
       throw new Error(`job submit lost idempotency claim for key ${cfg.key}`);
     }
-
-    if (enqueueState === "new") {
-      const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
-      await emitTrace(config.trace, {
-        type: "submitted",
-        jobId: claim.jobId,
-        key: payload.key,
-        ...traceInput,
-        ...(payload.meta ? { meta: payload.meta } : {}),
-      });
-    }
-    startWorker();
 
     return claim.jobId;
   };

@@ -1,6 +1,6 @@
-import { beforeEach, afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { redis } from "bun";
-import { scheduler, type Scheduler } from "../index";
+import { scheduler, schedulerControl, type Scheduler } from "../index";
 import {
   legacySchedulerScheduleKey,
   schedulerDueKey,
@@ -17,13 +17,6 @@ const waitFor = async (pred: () => boolean | Promise<boolean>, timeoutMs = 10_00
     await Bun.sleep(pollMs);
   }
 };
-
-beforeEach(async () => {
-  const keys = await redis.send("KEYS", ["sync:scheduler:*"]);
-  if (Array.isArray(keys) && keys.length > 0) {
-    await redis.send("DEL", keys as string[]);
-  }
-});
 
 let activeSchedulers: Scheduler[] = [];
 afterEach(async () => {
@@ -188,6 +181,93 @@ test("failing process does not halt the scheduler; subsequent dispatches still o
   await s.runNow({ id: "good" });
   expect(goodRuns).toBe(2);
 });
+
+test("scheduler control heartbeat failures stay observed and later runs recover", async () => {
+  const prefix = `test:sched:${uid("control-heartbeat-fault")}`;
+  const schedId = uid("control-heartbeat-fault");
+  const s = makeScheduler(schedId, { prefix, dispatch: { tickMs: 20 } });
+  let releaseRun = (): void => {};
+  const runGate = new Promise<void>((resolve) => {
+    releaseRun = resolve;
+  });
+  let firstStarted = false;
+  let firstFinished = false;
+  let laterRuns = 0;
+
+  await s.create({
+    id: "slow",
+    cron: "0 3 * * *",
+    process: async () => {
+      firstStarted = true;
+      await runGate;
+      firstFinished = true;
+    },
+  });
+  await s.create({
+    id: "later",
+    cron: "0 3 * * *",
+    process: async () => {
+      laterRuns += 1;
+    },
+  });
+  s.start();
+
+  const originalSend = redis.send.bind(redis);
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown): void => {
+    unhandled.push(reason);
+  };
+  let touchFailures = 0;
+  let bindingFailures = 0;
+  redis.send = (async (command, args) => {
+    const script = command === "EVAL" ? String(args[0]) : "";
+    if (
+      firstStarted
+      && touchFailures === 0
+      && script.includes('local deliveryRaw = redis.call("HGET", KEYS[1], deliveryId)')
+    ) {
+      touchFailures += 1;
+      throw new Error("injected control touch failure");
+    }
+    if (
+      firstStarted
+      && bindingFailures === 0
+      && script.includes('if redis.call("GET", KEYS[1]) ~= ARGV[1] then return 0 end')
+    ) {
+      bindingFailures += 1;
+      throw new Error("injected control binding failure");
+    }
+    return await originalSend(command, args);
+  }) as typeof redis.send;
+  process.on("unhandledRejection", onUnhandled);
+
+  try {
+    const errorsBefore = s.metric().tickErrors;
+    const control = schedulerControl({ prefix });
+    await waitFor(async () => {
+      const listed = await control.list();
+      return listed.some(
+        (entry) => entry.schedulerId === schedId && entry.scheduleId === "slow" && entry.state === "available",
+      );
+    });
+    await control.runNow({ schedulerId: schedId, scheduleId: "slow", timeoutMs: 2_000 });
+    await waitFor(() => firstStarted);
+    await waitFor(() => touchFailures === 1 && bindingFailures === 1, 12_000);
+    await Bun.sleep(50);
+
+    expect(unhandled).toEqual([]);
+    expect(s.metric().tickErrors).toBeGreaterThan(errorsBefore);
+
+    releaseRun();
+    await waitFor(() => firstFinished);
+    await control.runNow({ schedulerId: schedId, scheduleId: "later", timeoutMs: 2_000 });
+    await waitFor(() => laterRuns === 1);
+  } finally {
+    releaseRun();
+    process.off("unhandledRejection", onUnhandled);
+    redis.send = originalSend as typeof redis.send;
+  }
+}, 20_000);
 
 // ==========================
 // Broken schedule record

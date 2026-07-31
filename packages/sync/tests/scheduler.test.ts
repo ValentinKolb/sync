@@ -1,4 +1,4 @@
-import { beforeEach, afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { redis } from "bun";
 import {
   SchedulerControlNotFoundError,
@@ -33,13 +33,6 @@ const waitFor = async (pred: () => boolean | Promise<boolean>, timeoutMs = 5_000
     await Bun.sleep(pollMs);
   }
 };
-
-beforeEach(async () => {
-  const keys = await redis.send("KEYS", ["sync:scheduler:*"]);
-  if (Array.isArray(keys) && keys.length > 0) {
-    await redis.send("DEL", keys as string[]);
-  }
-});
 
 let activeSchedulers: Scheduler[] = [];
 afterEach(async () => {
@@ -1197,6 +1190,29 @@ test("a late conflicting legacy registration fences an existing namespace owner"
   await expect(sched.get({ id: "daily" })).rejects.toThrow(/scheduler namespace migration required/);
   await expect(sched.delete({ id: "daily" })).rejects.toThrow(/scheduler namespace migration required/);
   expect(await redis.get(schedulerScheduleKey(prefix, schedulerId, "daily"))).not.toBeNull();
+});
+
+test("a current-only colliding registration is not treated as a late legacy owner", async () => {
+  const root = `test:sched:${uid("current-only-owner")}`;
+  const legacyOwner = makeScheduler("b", { prefix: `${root}:a` });
+  const currentOnly = makeScheduler("a:b", { prefix: root });
+
+  expect(await legacyOwner.get({ id: "missing" })).toBeNull();
+  await currentOnly.create({
+    id: "current",
+    cron: "0 2 * * *",
+    process: async () => {},
+  });
+
+  expect(await legacyOwner.get({ id: "missing" })).toBeNull();
+  await legacyOwner.create({
+    id: "legacy",
+    cron: "0 1 * * *",
+    process: async () => {},
+  });
+
+  expect((await legacyOwner.list()).map((schedule) => schedule.id)).toEqual(["legacy"]);
+  expect((await currentOnly.list()).map((schedule) => schedule.id)).toEqual(["current"]);
 });
 
 test("revisionless workers cannot roll back revisioned config but can advance compatible runtime", async () => {

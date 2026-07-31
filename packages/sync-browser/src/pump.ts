@@ -22,6 +22,30 @@ const STALLED_PAGE_ERROR = "pull returned a page without advancing the cursor";
 
 const textEncoder = new TextEncoder();
 
+const canonicalJson = (value: unknown): string => {
+  const normalize = (current: unknown): unknown => {
+    if (Array.isArray(current)) return current.map(normalize);
+    if (current && typeof current === "object") {
+      return Object.fromEntries(
+        Object.entries(current as Record<string, unknown>)
+          .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+          .map(([key, entry]) => [key, normalize(entry)]),
+      );
+    }
+    return current;
+  };
+  const encoded = JSON.stringify(normalize(value));
+  if (encoded === undefined) throw new Error("value is not JSON-serializable");
+  return encoded;
+};
+
+const pumpRunPrefix = (prefix: string, id: string): string =>
+  `sync:pump:browser:v2:${encodeURIComponent(JSON.stringify([prefix, id]))}:run:`;
+
+const legacyPumpRunPrefix = (prefix: string, id: string): string => `${prefix}:${id}:run:`;
+
+const pumpStateKey = (runPrefix: string, key: string): string => `${runPrefix}${encodeURIComponent(key)}`;
+
 export type PumpItem = {
   key: string;
 };
@@ -114,6 +138,18 @@ export type PumpHandle<Input = void, Cursor = unknown> = {
   get(cfg: { key: string }): Promise<PumpState<Input, Cursor> | null>;
   cancel(cfg: { key: string }): Promise<boolean>;
   stop(): void;
+};
+
+export type MigrateLegacyPumpStateConfig = {
+  store: Store;
+  id: string;
+  key: string;
+  prefix?: string;
+  terminalRetentionMs?: number;
+};
+
+export type MigrateLegacyPumpStateResult = {
+  status: "migrated" | "already-migrated" | "not-found";
 };
 
 type ActivePage<Cursor, Item extends PumpItem> = {
@@ -285,6 +321,64 @@ const cloneState = <Input, Cursor, Item extends PumpItem>(
   }
 };
 
+const isTerminalPumpState = (state: PumpStatus): boolean =>
+  state === "completed" || state === "failed" || state === "canceled";
+
+export const migrateLegacyPumpState = (
+  config: MigrateLegacyPumpStateConfig,
+): MigrateLegacyPumpStateResult => {
+  assertIdentifier(config.id, "config.id");
+  assertKey(config.key);
+
+  const prefix = config.prefix ?? DEFAULT_PREFIX;
+  const legacyRunPrefix = legacyPumpRunPrefix(prefix, config.id);
+  const destinationRunPrefix = pumpRunPrefix(prefix, config.id);
+  const terminalRetentionMs = positiveSafeIntegerConfig(
+    config.terminalRetentionMs,
+    DEFAULT_TERMINAL_RETENTION_MS,
+    "terminalRetentionMs",
+  );
+  const legacyKey = pumpStateKey(legacyRunPrefix, config.key);
+  const destinationKey = pumpStateKey(destinationRunPrefix, config.key);
+  const raw = config.store.get(legacyKey);
+  const destinationRaw = config.store.get(destinationKey);
+
+  if (raw === undefined) {
+    if (destinationRaw === undefined) return { status: "not-found" };
+    const destination = cloneState<unknown, unknown, PumpItem>(destinationRaw);
+    if (!destination || destination.key !== config.key) {
+      throw new Error(`invalid migrated pump state for key "${config.key}"`);
+    }
+    return { status: "already-migrated" };
+  }
+
+  const state = cloneState<unknown, unknown, PumpItem>(raw);
+  if (!state || state.key !== config.key) {
+    throw new Error(`invalid legacy pump state at "${legacyKey}"`);
+  }
+
+  if (destinationRaw !== undefined) {
+    const destination = cloneState<unknown, unknown, PumpItem>(destinationRaw);
+    if (
+      !destination ||
+      destination.key !== config.key ||
+      canonicalJson(destination) !== canonicalJson(state)
+    ) {
+      throw new Error(`conflicting migrated pump state for key "${config.key}"`);
+    }
+    config.store.del(legacyKey);
+    return { status: "already-migrated" };
+  }
+
+  config.store.set(
+    destinationKey,
+    state,
+    isTerminalPumpState(state.state) ? terminalRetentionMs : undefined,
+  );
+  config.store.del(legacyKey);
+  return { status: "migrated" };
+};
+
 const toPublicState = <Input, Cursor, Item extends PumpItem>(
   state: StoredPumpState<Input, Cursor, Item>,
 ): PumpState<Input, Cursor> => ({
@@ -307,9 +401,8 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   assertIdentifier(config.id, "config.id");
 
   const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const baseKey =
-    `sync:pump:browser:v2:${encodeURIComponent(JSON.stringify([prefix, config.id]))}`;
-  const runPrefix = `${baseKey}:run:`;
+  const runPrefix = pumpRunPrefix(prefix, config.id);
+  const legacyRunPrefix = legacyPumpRunPrefix(prefix, config.id);
   const store = resolveStore(config.store);
   const batchSize = Math.max(1, Math.floor(finiteConfig(config.batchSize, DEFAULT_BATCH_SIZE, "batchSize")));
   const delayMs = Math.max(0, finiteConfig(config.delayMs, DEFAULT_DELAY_MS, "delayMs"));
@@ -340,7 +433,21 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   // The worker belongs to this handle, not to its Store or its id.
   let activeWorker: ActiveWorker | null = null;
 
-  const stateKeyFor = (key: string): string => `${runPrefix}${encodeURIComponent(key)}`;
+  const stateKeyFor = (key: string): string => pumpStateKey(runPrefix, key);
+
+  const assertLegacyStateMigrated = (key: string): void => {
+    const legacyStateKey = pumpStateKey(legacyRunPrefix, key);
+    const raw = store.get(legacyStateKey);
+    if (raw === undefined) return;
+
+    const legacyState = cloneState<Input, Cursor, Item>(raw);
+    if (!legacyState || pumpStateKey(legacyRunPrefix, legacyState.key) !== legacyStateKey) {
+      throw new Error(`invalid legacy pump state at "${legacyStateKey}"`);
+    }
+    throw new Error(
+      `legacy browser pump state exists for key "${key}"; call migrateLegacyPumpState() before continuing`,
+    );
+  };
 
   const readStateByKey = (stateKey: string): StoredPumpState<Input, Cursor, Item> | null => {
     const raw = store.get(stateKey);
@@ -464,7 +571,7 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
         currentState.activePage = activePage;
         const stalled =
           activePage.nextCursor !== null &&
-          JSON.stringify(activePage.nextCursor) === JSON.stringify(currentState.cursor);
+          canonicalJson(activePage.nextCursor) === canonicalJson(currentState.cursor);
         if (!stalled) {
           currentState.failureCount = 0;
           delete currentState.lastError;
@@ -509,7 +616,7 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
         currentState.dispatched += 1;
         const stalled =
           currentState.activePage.nextCursor !== null &&
-          JSON.stringify(currentState.activePage.nextCursor) === JSON.stringify(currentState.cursor);
+          canonicalJson(currentState.activePage.nextCursor) === canonicalJson(currentState.cursor);
         if (!stalled) {
           currentState.failureCount = 0;
           delete currentState.lastError;
@@ -540,7 +647,7 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
       const nextCursor = currentState.activePage.nextCursor;
       const stalled =
         nextCursor !== null &&
-        JSON.stringify(nextCursor) === JSON.stringify(currentState.cursor);
+        canonicalJson(nextCursor) === canonicalJson(currentState.cursor);
       currentState.cursor = nextCursor;
       delete currentState.activePage;
       delete currentState.leaseToken;
@@ -659,6 +766,11 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
     for (const stateKey of store.keys(runPrefix)) {
       const state = readStateByKey(stateKey);
       if (!state) continue;
+      try {
+        assertLegacyStateMigrated(state.key);
+      } catch {
+        continue;
+      }
       if (state.state === "completed" || state.state === "failed" || state.state === "canceled") continue;
       const dueAt = state.nextRunAt ?? 0;
       if (dueAt > now) continue;
@@ -711,6 +823,7 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
     if (input !== undefined) assertJsonValue(input, "start.input");
     if (cfg.meta !== undefined) assertJsonValue(cfg.meta, "start.meta");
 
+    assertLegacyStateMigrated(cfg.key);
     const stateKey = stateKeyFor(cfg.key);
     const existing = readStateByKey(stateKey);
     if (existing) {
@@ -745,12 +858,14 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
 
   const get = async (cfg: { key: string }): Promise<PumpState<Input, Cursor> | null> => {
     assertKey(cfg.key);
+    assertLegacyStateMigrated(cfg.key);
     const state = readState(cfg.key);
     return state ? toPublicState(state) : null;
   };
 
   const cancel = async (cfg: { key: string }): Promise<boolean> => {
     assertKey(cfg.key);
+    assertLegacyStateMigrated(cfg.key);
     const stateKey = stateKeyFor(cfg.key);
     const state = readStateByKey(stateKey);
     if (!state || state.state === "completed" || state.state === "failed" || state.state === "canceled") {

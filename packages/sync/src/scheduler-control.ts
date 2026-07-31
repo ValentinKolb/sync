@@ -317,6 +317,21 @@ export const hasCompatibleLegacySchedule = async (
   }
 };
 
+const hasCurrentSchedulerRegistration = async (
+  prefix: string,
+  schedulerId: string,
+): Promise<boolean> => {
+  if (Number(await redis.send("EXISTS", [schedulerRegistrationKey(prefix, schedulerId)])) > 0) {
+    return true;
+  }
+  const index = schedulerScheduleIndexKey(prefix, schedulerId);
+  const typeRaw = await redis.send("TYPE", [index]);
+  const type = typeof typeRaw === "string"
+    ? typeRaw
+    : (typeRaw as { ok?: unknown } | null)?.ok;
+  return type === "set" && Number(await redis.send("SCARD", [index])) > 0;
+};
+
 export const resolveLegacySchedulerAccess = async (
   prefix: string,
   schedulerId: string,
@@ -351,23 +366,9 @@ export const resolveLegacySchedulerAccess = async (
         candidatePrefix !== prefix || candidateSchedulerId !== schedulerId,
     );
     const currentRegistrations = await Promise.all(
-      conflictingOwners.map(async ([candidatePrefix, candidateSchedulerId]) => {
-        if (
-          Number(
-            await redis.send("EXISTS", [
-              schedulerRegistrationKey(candidatePrefix, candidateSchedulerId),
-            ]),
-          ) > 0
-        ) {
-          return true;
-        }
-        const index = schedulerScheduleIndexKey(candidatePrefix, candidateSchedulerId);
-        const typeRaw = await redis.send("TYPE", [index]);
-        const type = typeof typeRaw === "string"
-          ? typeRaw
-          : (typeRaw as { ok?: unknown } | null)?.ok;
-        return type === "set" && Number(await redis.send("SCARD", [index])) > 0;
-      }),
+      conflictingOwners.map(([candidatePrefix, candidateSchedulerId]) =>
+        hasCurrentSchedulerRegistration(candidatePrefix, candidateSchedulerId)
+      ),
     );
     if (existingOwner === null || currentRegistrations.some((registered) => !registered)) {
       throw new Error(
@@ -379,7 +380,10 @@ export const resolveLegacySchedulerAccess = async (
     if (existingOwner !== identity) return false;
     if (owners.length === 1) {
       const [ownerPrefix, ownerSchedulerId] = owners[0]!;
-      if (ownerPrefix !== prefix || ownerSchedulerId !== schedulerId) {
+      if (
+        (ownerPrefix !== prefix || ownerSchedulerId !== schedulerId)
+        && !(await hasCurrentSchedulerRegistration(ownerPrefix, ownerSchedulerId))
+      ) {
         throw new Error(
           "scheduler namespace migration required for a late conflicting legacy registration; drain old workers and migrate or remove legacy keys",
         );

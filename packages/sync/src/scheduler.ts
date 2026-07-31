@@ -1228,11 +1228,29 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
         continue;
       }
 
+      let controlHeartbeat: Promise<void> | null = null;
       const touchTimer = setInterval(() => {
-        // Without the catch a transient Redis error here becomes an unhandled
-        // rejection, which terminates the process under Bun and Node defaults.
-        void message.touch({ leaseMs: controlLeaseMs }).catch(() => {});
-        void refreshSchedulerControlRequestBinding(prefix, request).catch(() => {});
+        if (controlHeartbeat) return;
+
+        controlHeartbeat = (async () => {
+          const [touch, binding] = await Promise.allSettled([
+            message.touch({ leaseMs: controlLeaseMs }),
+            refreshSchedulerControlRequestBinding(prefix, request),
+          ]);
+          if (
+            touch.status === "rejected"
+            || (touch.status === "fulfilled" && !touch.value)
+            || binding.status === "rejected"
+          ) {
+            metrics.tickErrors += 1;
+          }
+        })()
+          .catch(() => {
+            metrics.tickErrors += 1;
+          })
+          .finally(() => {
+            controlHeartbeat = null;
+          });
       }, Math.floor(controlLeaseMs / 3));
       try {
         await dispatchSchedule(scheduleId, "manual", {

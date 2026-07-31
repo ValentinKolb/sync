@@ -808,6 +808,85 @@ test("stop cancels the in-flight schedule callback via ctx.signal", async () => 
   expect(ranToCompletion).toBe(false);
 });
 
+test("start during stop waits for the previous scheduler generation to exit", async () => {
+  const s = makeScheduler(uid("stop-start-generation"), {
+    dispatch: { tickMs: 20 },
+  });
+  let started = false;
+  let release = (): void => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await s.create({
+    id: "future",
+    cron: "0 3 * * *",
+    process: async () => {
+      started = true;
+      await gate;
+    },
+  });
+
+  s.start();
+  const run = s.runNow({ id: "future" }).then(
+    () => null,
+    (error: unknown) => error,
+  );
+  await waitFor(() => started);
+  const stopping = s.stop();
+  s.start();
+
+  try {
+    release();
+    const stopped = await Promise.race([
+      stopping.then(() => true),
+      Bun.sleep(1_000).then(() => false),
+    ]);
+    expect(stopped).toBe(true);
+    const runError = await run;
+    expect(runError).toBeInstanceOf(Error);
+    expect((runError as Error).message).toContain("scheduler dispatch stopped");
+    await waitFor(() => s.metric().isLeader);
+  } finally {
+    release();
+    await run;
+    await s.stop();
+  }
+});
+
+test("runNow rejects while stop is draining the previous scheduler generation", async () => {
+  const s = makeScheduler(uid("run-during-stop"));
+  let calls = 0;
+  let started = (): void => {};
+  let release = (): void => {};
+  const startedGate = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const releaseGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await s.create({
+    id: "report",
+    cron: "0 3 * * *",
+    process: async () => {
+      calls += 1;
+      started();
+      await releaseGate;
+    },
+  });
+
+  const firstRun = s.runNow({ id: "report" }).catch(() => {});
+  await startedGate;
+  const stopping = s.stop();
+
+  await expect(s.runNow({ id: "report" })).rejects.toThrow("scheduler is stopping");
+  release();
+  await firstRun;
+  await stopping;
+  expect(calls).toBe(1);
+});
+
 test("schedulerControl runNow surfaces a pre-acceptance error instead of reporting success", async () => {
   const prefix = uid("control-error-prefix");
   const schedulerId = uid("control-error");

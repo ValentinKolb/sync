@@ -6,9 +6,11 @@ const queueBase = (id: string, tenantId = "default", prefix = "test:q"): string 
   `sync:queue:namespace:v2:${encodeURIComponent(JSON.stringify([prefix, tenantId, id]))}`;
 
 beforeEach(async () => {
+  const versionedTestPrefix =
+    `sync:queue:namespace:v2:${encodeURIComponent('["test:q')}*`;
   const [legacyKeys, versionedKeys] = await Promise.all([
     redis.send("KEYS", ["test:q:*"]),
-    redis.send("KEYS", ["sync:queue:namespace:v2:*"]),
+    redis.send("KEYS", [versionedTestPrefix]),
   ]);
   const keys = [
     ...(Array.isArray(legacyKeys) ? legacyKeys : []),

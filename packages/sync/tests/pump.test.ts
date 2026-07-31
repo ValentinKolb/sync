@@ -8,7 +8,17 @@ type Item = { key: string; value: number };
 
 const handles: PumpHandle<unknown, unknown>[] = [];
 const PUMP_PREFIX = "test:pump:unit";
+const COLLISION_LEFT_PREFIX = `${PUMP_PREFIX}:root`;
+const COLLISION_RIGHT_PREFIX = `${PUMP_PREFIX}:root:mail`;
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+const pumpBaseKey = (prefix: string, id: string): string =>
+  `sync:pump:namespace:v2:${encodeURIComponent(JSON.stringify([prefix, id]))}`;
+const pumpDueKey = (prefix: string, id: string): string =>
+  `${pumpBaseKey(prefix, id)}:due`;
+const pumpStateKey = (prefix: string, id: string, key: string): string =>
+  `${pumpBaseKey(prefix, id)}:run:${encodeURIComponent(key)}`;
+const pumpNamespacePattern = (prefix: string): string =>
+  `sync:pump:namespace:v2:${encodeURIComponent(`${JSON.stringify([prefix]).slice(0, -1)},`)}*`;
 
 const track = <I, C>(handle: PumpHandle<I, C>): PumpHandle<I, C> => {
   handles.push(handle as PumpHandle<unknown, unknown>);
@@ -30,8 +40,13 @@ const waitFor = async (
 };
 
 const cleanup = async (): Promise<void> => {
-  const keys = await redis.send("KEYS", [`${PUMP_PREFIX}:*`]);
-  if (Array.isArray(keys) && keys.length > 0) await redis.send("DEL", keys as string[]);
+  const matches = await Promise.all([
+    redis.send("KEYS", [`${PUMP_PREFIX}:*`]),
+    ...[PUMP_PREFIX, COLLISION_LEFT_PREFIX, COLLISION_RIGHT_PREFIX]
+      .map((prefix) => redis.send("KEYS", [pumpNamespacePattern(prefix)])),
+  ]);
+  const keys = matches.flatMap((value) => Array.isArray(value) ? value.map(String) : []);
+  if (keys.length > 0) await redis.send("DEL", keys);
 };
 
 beforeEach(cleanup);
@@ -131,6 +146,80 @@ test("start is idempotent for the same key", async () => {
   expect(pulls).toBe(1);
 });
 
+test("colon-rich pump identities keep same-key runs isolated", async () => {
+  const sharedRunKey = "tenant:shared:run";
+  const leftPrefix = COLLISION_LEFT_PREFIX;
+  const leftId = "mail:backfill";
+  const rightPrefix = COLLISION_RIGHT_PREFIX;
+  const rightId = "backfill";
+  const leftCalls: string[] = [];
+  const rightCalls: string[] = [];
+
+  expect(`${leftPrefix}:${leftId}`).toBe(`${rightPrefix}:${rightId}`);
+  expect(pumpBaseKey(leftPrefix, leftId)).not.toBe(pumpBaseKey(rightPrefix, rightId));
+
+  const left = track(pump<Input, Cursor, Item>({
+    id: leftId,
+    prefix: leftPrefix,
+    pull: () => ({ items: [{ key: "left", value: 1 }], nextCursor: null }),
+    dispatch: ({ item }) => {
+      leftCalls.push(item.key);
+    },
+  }));
+  const right = track(pump<Input, Cursor, Item>({
+    id: rightId,
+    prefix: rightPrefix,
+    pull: () => ({ items: [{ key: "right", value: 2 }], nextCursor: null }),
+    dispatch: ({ item }) => {
+      rightCalls.push(item.key);
+    },
+  }));
+
+  await Promise.all([
+    left.start({ key: sharedRunKey, input: { source: "left" } }),
+    right.start({ key: sharedRunKey, input: { source: "right" } }),
+  ]);
+  await waitFor(async () =>
+    (await left.get({ key: sharedRunKey }))?.state === "completed" &&
+    (await right.get({ key: sharedRunKey }))?.state === "completed"
+  );
+
+  expect(leftCalls).toEqual(["left"]);
+  expect(rightCalls).toEqual(["right"]);
+  expect((await left.get({ key: sharedRunKey }))?.input).toEqual({ source: "left" });
+  expect((await right.get({ key: sharedRunKey }))?.input).toEqual({ source: "right" });
+});
+
+test("legacy run state blocks public access without being changed", async () => {
+  const id = uid("legacy-state");
+  const key = "tenant:legacy";
+  const legacyStateKey = `${PUMP_PREFIX}:${id}:run:${encodeURIComponent(key)}`;
+  await redis.send("RPUSH", [legacyStateKey, "opaque", "state"]);
+
+  let pulls = 0;
+  const worker = track(pump<Input, Cursor, Item>({
+    id,
+    prefix: PUMP_PREFIX,
+    pull: () => {
+      pulls += 1;
+      return { items: [], nextCursor: null };
+    },
+    dispatch: () => {},
+  }));
+
+  await expect(worker.start({ key, input: { source: "new" } })).rejects.toThrow(
+    "pump namespace migration required",
+  );
+  await expect(worker.get({ key })).rejects.toThrow("pump namespace migration required");
+  await expect(worker.cancel({ key })).rejects.toThrow("pump namespace migration required");
+
+  expect(pulls).toBe(0);
+  expect(await redis.send("TYPE", [legacyStateKey])).toBe("list");
+  expect(await redis.send("LRANGE", [legacyStateKey, "0", "-1"])).toEqual(["opaque", "state"]);
+  expect(Number(await redis.send("EXISTS", [pumpStateKey(PUMP_PREFIX, id, key)]))).toBe(0);
+  expect(Number(await redis.send("EXISTS", [pumpDueKey(PUMP_PREFIX, id)]))).toBe(0);
+});
+
 test("empty pages without cursor progress fail after maxAttempts", async () => {
   let pulls = 0;
   const worker = track(pump<Input, Cursor, Item>({
@@ -167,6 +256,32 @@ test("object cursors with different property order still count as stalled", asyn
       return cursor === null
         ? { items: [], nextCursor: { page: 1, shard: 2 } }
         : { items: [], nextCursor: { shard: 2, page: 1 } };
+    },
+    dispatch: () => {},
+  }));
+
+  await worker.start({ key: "canonical", input: { source: "messages" } });
+  await waitFor(async () => (await worker.get({ key: "canonical" }))?.state === "failed");
+
+  expect(pulls).toBe(2);
+  expect(await worker.get({ key: "canonical" })).toMatchObject({
+    state: "failed",
+    failureCount: 1,
+    lastError: "pull returned a page without advancing the cursor",
+  });
+});
+
+test("composed and decomposed Unicode cursor keys stall despite reversed insertion order", async () => {
+  let pulls = 0;
+  const worker = track(pump<Input, Record<string, number>, Item>({
+    id: uid("canonical-unicode-cursor"),
+    prefix: PUMP_PREFIX,
+    retry: { maxAttempts: 1, baseMs: 10, maxMs: 10, jitter: 0 },
+    pull: ({ cursor }) => {
+      pulls += 1;
+      return cursor === null
+        ? { items: [], nextCursor: { ["\u00e9"]: 1, ["e\u0301"]: 2 } }
+        : { items: [], nextCursor: { ["e\u0301"]: 2, ["\u00e9"]: 1 } };
     },
     dispatch: () => {},
   }));
@@ -375,7 +490,7 @@ test("automatically heartbeats the lease during a long pull", async () => {
   await worker.start({ key: "heartbeat", input: { source: "messages" } });
   await waitFor(() => pullStarted);
 
-  const stateKey = `${PUMP_PREFIX}:${id}:run:${encodeURIComponent("heartbeat")}`;
+  const stateKey = pumpStateKey(PUMP_PREFIX, id, "heartbeat");
   const first = JSON.parse((await redis.get(stateKey))!) as { leaseUntil: number };
   await Bun.sleep(70);
   const second = JSON.parse((await redis.get(stateKey))!) as { leaseUntil: number };
@@ -561,7 +676,7 @@ test("a non-empty page with an unchanged cursor dispatches at least once and fai
 
 test("malformed persisted states are removed and their keys are reusable", async () => {
   const id = uid("malformed");
-  const dueKey = `${PUMP_PREFIX}:${id}:due`;
+  const dueKey = pumpDueKey(PUMP_PREFIX, id);
   const malformed = [
     { key: "invalid-json", raw: "{not-json" },
     { key: "invalid-shape", raw: "{}" },
@@ -573,7 +688,7 @@ test("malformed persisted states are removed and their keys are reusable", async
   const now = Date.now();
   for (const [index, entry] of malformed.entries()) {
     const member = encodeURIComponent(entry.key);
-    await redis.set(`${PUMP_PREFIX}:${id}:run:${member}`, entry.raw);
+    await redis.set(pumpStateKey(PUMP_PREFIX, id, entry.key), entry.raw);
     await redis.send("ZADD", [dueKey, String(now - malformed.length + index), member]);
   }
 
@@ -594,7 +709,7 @@ test("malformed persisted states are removed and their keys are reusable", async
   await waitFor(async () => {
     for (const entry of malformed) {
       const member = encodeURIComponent(entry.key);
-      if (await redis.get(`${PUMP_PREFIX}:${id}:run:${member}`)) return false;
+      if (await redis.get(pumpStateKey(PUMP_PREFIX, id, entry.key))) return false;
       if (await redis.send("ZSCORE", [dueKey, member])) return false;
     }
     return true;
@@ -612,7 +727,7 @@ test("malformed persisted states are removed and their keys are reusable", async
 test("a stale worker cannot checkpoint after its lease token is replaced", async () => {
   const id = uid("stale-commit");
   const key = "run";
-  const stateKey = `${PUMP_PREFIX}:${id}:run:${encodeURIComponent(key)}`;
+  const stateKey = pumpStateKey(PUMP_PREFIX, id, key);
   let dispatchStarted = false;
   let releaseDispatch!: () => void;
   let dispatchFinished = false;

@@ -312,6 +312,8 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
   let running = false;
   let loopPromise: Promise<void> | null = null;
   let heartbeatPromise: Promise<void> | null = null;
+  let stopPromise: Promise<void> | null = null;
+  let restartRequested = false;
   let dispatchGeneration = 0;
   // Controllers of the callbacks currently running, so stop() can cancel them.
   const activeRuns = new Set<AbortController>();
@@ -767,6 +769,7 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     const schedule = schedules.get(cfg.id);
     if (!schedule) throw new Error(`runNow: schedule ${cfg.id} not found`);
     if (!handlers.has(cfg.id)) throw new Error(`runNow: no handler registered for schedule ${cfg.id}`);
+    if (stopPromise) throw new Error("runNow: scheduler is stopping");
 
     await dispatchSchedule(cfg.id, "manual", {
       onAcquired: onAccepted,
@@ -787,15 +790,26 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
 
   const metric = (): SchedulerMetrics => ({ ...metrics });
 
-  const start = (): void => {
-    if (running) return;
+  const launch = (): void => {
     running = true;
     setBrowserSchedulerControlAvailable({ prefix, schedulerId: config.id, instanceId, available: true });
     loopPromise = loop();
     heartbeatPromise = heartbeatLoop();
   };
 
-  const stop = async (): Promise<void> => {
+  const start = (): void => {
+    if (running) return;
+    if (stopPromise) {
+      restartRequested = true;
+      return;
+    }
+    launch();
+  };
+
+  const stop = (): Promise<void> => {
+    restartRequested = false;
+    if (stopPromise) return stopPromise;
+
     const wasRunning = running;
     running = false;
     dispatchGeneration += 1;
@@ -804,11 +818,29 @@ export const scheduler = (config: SchedulerConfig): Scheduler => {
     // cancellation signal instead of something that is always false.
     for (const ac of activeRuns) ac.abort();
     setBrowserSchedulerControlAvailable({ prefix, schedulerId: config.id, instanceId, available: false });
-    if (wasRunning) await Promise.all([loopPromise, heartbeatPromise]);
-    await Promise.all(pendingDispatches);
-    loopPromise = null;
-    heartbeatPromise = null;
-    await relinquishLeadership();
+
+    const cleanup = (async (): Promise<void> => {
+      if (wasRunning) await Promise.all([loopPromise, heartbeatPromise]);
+      await Promise.all(pendingDispatches);
+      loopPromise = null;
+      heartbeatPromise = null;
+      await relinquishLeadership();
+    })();
+    stopPromise = cleanup;
+
+    const finish = (): void => {
+      if (stopPromise !== cleanup) return;
+      stopPromise = null;
+      if (!restartRequested) return;
+      restartRequested = false;
+      launch();
+    };
+    void cleanup.then(finish, () => {
+      if (stopPromise !== cleanup) return;
+      stopPromise = null;
+      restartRequested = false;
+    });
+    return cleanup;
   };
 
   return {

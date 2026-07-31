@@ -4,6 +4,11 @@ import { pump, type PumpHandle } from "../index";
 
 const handles: PumpHandle<unknown, unknown>[] = [];
 const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+const PUMP_PREFIX = "test:pump:fault";
+const pumpBaseKey = (prefix: string, id: string): string =>
+  `sync:pump:namespace:v2:${encodeURIComponent(JSON.stringify([prefix, id]))}`;
+const pumpNamespacePattern = (prefix: string): string =>
+  `sync:pump:namespace:v2:${encodeURIComponent(`${JSON.stringify([prefix]).slice(0, -1)},`)}*`;
 
 const track = <I, C>(handle: PumpHandle<I, C>): PumpHandle<I, C> => {
   handles.push(handle as PumpHandle<unknown, unknown>);
@@ -24,21 +29,30 @@ const waitFor = async (
   }
 };
 
-beforeEach(async () => {
-  const keys = await redis.send("KEYS", ["test:pump:fault:*"]);
-  if (Array.isArray(keys) && keys.length > 0) await redis.send("DEL", keys as string[]);
-});
+const cleanup = async (): Promise<void> => {
+  const matches = await Promise.all([
+    redis.send("KEYS", [`${PUMP_PREFIX}:*`]),
+    redis.send("KEYS", [pumpNamespacePattern(PUMP_PREFIX)]),
+  ]);
+  const keys = matches.flatMap((value) => Array.isArray(value) ? value.map(String) : []);
+  if (keys.length > 0) await redis.send("DEL", keys);
+};
 
-afterEach(() => {
+beforeEach(cleanup);
+
+afterEach(async () => {
   for (const handle of handles.splice(0)) handle.stop();
+  await Bun.sleep(20);
+  await cleanup();
 });
 
 test("lease loss fences the stale worker before its item checkpoint", async () => {
   const id = uid("lease-loss");
   const key = "run";
-  const prefix = "test:pump:fault";
-  const stateKey = `${prefix}:${id}:run:${encodeURIComponent(key)}`;
-  const dueKey = `${prefix}:${id}:due`;
+  const prefix = PUMP_PREFIX;
+  const baseKey = pumpBaseKey(prefix, id);
+  const stateKey = `${baseKey}:run:${encodeURIComponent(key)}`;
+  const dueKey = `${baseKey}:due`;
   const calls: string[] = [];
   let stoleLease = false;
 

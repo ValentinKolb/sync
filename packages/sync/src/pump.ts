@@ -17,6 +17,8 @@ const DEFAULT_RETRY_JITTER = 0.2;
 const WORKER_POLL_MS = 250;
 const MAX_KEY_BYTES = 512;
 const STALLED_PAGE_ERROR = "pull returned a page without advancing the cursor";
+const NAMESPACE_MIGRATION_ERROR =
+  "pump namespace migration required; drain old workers and migrate or remove legacy keys";
 
 const textEncoder = new TextEncoder();
 
@@ -26,7 +28,7 @@ const canonicalJson = (value: unknown): string => {
     if (current && typeof current === "object") {
       return Object.fromEntries(
         Object.entries(current as Record<string, unknown>)
-          .sort(([left], [right]) => left.localeCompare(right))
+          .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
           .map(([key, entry]) => [key, normalize(entry)]),
       );
     }
@@ -671,7 +673,9 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   assertIdentifier(config.id, "config.id");
 
   const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const baseKey = `${prefix}:${config.id}`;
+  const legacyBaseKey = `${prefix}:${config.id}`;
+  const baseKey =
+    `sync:pump:namespace:v2:${encodeURIComponent(JSON.stringify([prefix, config.id]))}`;
   const dueKey = `${baseKey}:due`;
   // The worker belongs to this handle, not to the id.
   let activeWorker: ActiveWorker | null = null;
@@ -704,6 +708,13 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
   const memberFor = (key: string): string => encodeURIComponent(key);
   const stateKeyForMember = (member: string): string => `${baseKey}:run:${member}`;
   const stateKeyFor = (key: string): string => stateKeyForMember(memberFor(key));
+  const legacyStateKeyFor = (key: string): string =>
+    `${legacyBaseKey}:run:${memberFor(key)}`;
+
+  const assertNoLegacyState = async (key: string): Promise<void> => {
+    const exists = Number(await redis.send("EXISTS", [legacyStateKeyFor(key)]));
+    if (exists > 0) throw new Error(NAMESPACE_MIGRATION_ERROR);
+  };
 
   const removeInvalidState = async (member: string, raw: string): Promise<void> => {
     await evalScript(
@@ -1017,6 +1028,7 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
 
   const start = async (cfg: PumpStartConfig<Input>): Promise<PumpState<Input, Cursor>> => {
     assertKey(cfg.key);
+    await assertNoLegacyState(cfg.key);
     const input = (cfg as { input?: Input }).input as Input;
     if (input !== undefined) assertJsonValue(input, "start.input");
     if (cfg.meta !== undefined) assertJsonValue(cfg.meta, "start.meta");
@@ -1070,12 +1082,14 @@ export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = Pum
 
   const get = async (cfg: { key: string }): Promise<PumpState<Input, Cursor> | null> => {
     assertKey(cfg.key);
+    await assertNoLegacyState(cfg.key);
     const state = await readState(cfg.key);
     return state ? toPublicState(state) : null;
   };
 
   const cancel = async (cfg: { key: string }): Promise<boolean> => {
     assertKey(cfg.key);
+    await assertNoLegacyState(cfg.key);
     const member = memberFor(cfg.key);
     const result = await evalScript(
       CANCEL_SCRIPT,
