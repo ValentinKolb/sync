@@ -120,6 +120,7 @@ for await (const event of apps.reader({ prefix: "apps/" }).stream()) {
 - **`maxEntries` per tenant**: once reached, `upsert` throws `EphemeralCapacityError`. Scale via multiple tenants or raise the limit.
 - **Touch returns `{ ok: false }`** if the key already expired between check and touch.
 - **`createdAt` vs `updatedAt`**: `createdAt` is set once when the entry is first upserted and **preserved** across subsequent `upsert` (even with new values) and `touch` calls on the same key. It only resets after `remove` or TTL expiry followed by a fresh upsert. Use `Date.now() - entry.createdAt` for "how long has this been registered" displays (admin UI uptime). `updatedAt` tracks the most recent touch/upsert — use for "last heartbeat" semantics.
+- **Mixed v5.8/current server deployments**: v5.9.1+ writes an exact `dataJson` value for current readers and a decoded `data` compatibility shadow for v5.8 readers. Current readers always prefer `dataJson`; the shadow retains v5.8's Lua `cjson` limitations and remains until the next major storage boundary. Do not mix exactly v5.9.0 with older readers because its records omitted the compatibility field.
 
 ## Redis keys (server)
 

@@ -36,12 +36,10 @@ const UPSERT_SCRIPT = `
     end
   end
 
-  -- Validate only. The decoded value is deliberately discarded: cjson turns an
-  -- empty array into an empty object and loses precision past 14 significant
-  -- digits, so the caller's bytes are stored verbatim as dataJson instead.
-  -- That also makes the snapshot path agree with the change stream, which has
-  -- always carried the pristine string.
-  local decodeOk = pcall(cjson.decode, dataRaw)
+  -- dataJson remains authoritative because cjson changes empty arrays and
+  -- precision-sensitive numbers. data is an N-1 compatibility shadow for 5.8
+  -- readers and intentionally retains their existing cjson semantics.
+  local decodeOk, legacyData = pcall(cjson.decode, dataRaw)
   if not decodeOk then
     return "__ERR_PAYLOAD__"
   end
@@ -63,6 +61,7 @@ const UPSERT_SCRIPT = `
     v = 2,
     key = logicalKey,
     dataJson = dataRaw,
+    data = legacyData,
     version = version,
     createdAt = createdAt,
     updatedAt = updatedAt,
@@ -130,13 +129,18 @@ const TOUCH_SCRIPT = `
   local version = tostring(redis.call("INCR", KEYS[1]))
   local expiresAt = now + ttlMs
 
-  -- Upgrade a <= 5.8.0 record (decoded data field) on first touch, then patch only
-  -- the metadata so the payload string is copied, never re-encoded.
-  if existing.dataJson == nil then
-    existing.dataJson = existing.data ~= nil and cjson.encode(existing.data) or nil
-    existing.data = nil
-    existing.v = 2
+  -- Keep both representations during the 5.8 compatibility window. Existing
+  -- records from either side are expanded on touch without changing dataJson.
+  if existing.dataJson == nil and existing.data ~= nil then
+    existing.dataJson = cjson.encode(existing.data)
   end
+  if existing.data == nil and existing.dataJson ~= nil then
+    local legacyOk, legacyData = pcall(cjson.decode, existing.dataJson)
+    if legacyOk then
+      existing.data = legacyData
+    end
+  end
+  existing.v = 2
   existing.version = version
   existing.updatedAt = now
   existing.expiresAt = expiresAt
@@ -468,9 +472,9 @@ type EphemeralKeys = {
 };
 
 /**
- * Stored entry, version 2. `dataJson` holds the caller's value as the opaque
- * string they sent, so Lua never re-encodes it. Records written by <= 5.8.0
- * carry a decoded `data` instead and are read through the same parser.
+ * Stored entry, version 2. `dataJson` is the authoritative caller JSON. `data`
+ * remains as a decoded compatibility shadow for 5.8 readers until the next
+ * major storage boundary. Records written by <= 5.8.0 only carry `data`.
  */
 type StoredEntry<T> = {
   v?: 2;

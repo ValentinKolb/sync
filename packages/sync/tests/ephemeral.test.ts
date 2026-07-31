@@ -10,6 +10,42 @@ import {
 const testId = (suffix: string): string => `test-eph-${suffix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 const readers: EphemeralReader<unknown>[] = [];
 
+type CompatibilityRecord = {
+  v?: number;
+  data?: unknown;
+  dataJson?: string;
+};
+
+const readStoredRecordRaw = async (id: string, key: string): Promise<string> => {
+  const raw = await redis.send("HGET", [`sync:e:default:${id}:state`, key]);
+  if (typeof raw !== "string") throw new Error(`missing ephemeral test record: ${key}`);
+  return raw;
+};
+
+const writeCompatibilityRecord = async (
+  id: string,
+  key: string,
+  payload: CompatibilityRecord,
+): Promise<void> => {
+  const now = Date.now();
+  await redis.send("HSET", [
+    `sync:e:default:${id}:state`,
+    key,
+    JSON.stringify({
+      key,
+      version: "1",
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: now + 60_000,
+      ...payload,
+    }),
+  ]);
+};
+
+// Frozen sync-v5.8.0 reader contract: snapshot values came only from parsed.data.
+const readValueWith58Parser = <T>(raw: string): T | undefined =>
+  (JSON.parse(raw) as { data?: T }).data;
+
 const connectedClients = async (): Promise<number> => {
   const info = (await redis.send("INFO", ["clients"])) as string;
   return Number(/connected_clients:(\d+)/.exec(info)?.[1] ?? 0);
@@ -707,6 +743,100 @@ test("entries written in the 5.8.0 record format are still readable", async () =
 
   const snap = await store.snapshot({});
   expect(snap.entries.find((e) => e.key === "apps/legacy")?.value).toEqual({ endpoints: ["a"] });
+});
+
+test("current writer records remain readable by the frozen 5.8.0 parser", async () => {
+  const id = testId("writer-compat");
+  const value = { status: "ready", endpoints: ["https://example.test"] };
+  const store = ephemeral<typeof value>({ id, ttlMs: 60_000 });
+
+  await store.upsert({ key: "apps/current", value });
+  const raw = await readStoredRecordRaw(id, "apps/current");
+  const record = JSON.parse(raw) as CompatibilityRecord;
+
+  expect(readValueWith58Parser<typeof value>(raw)).toEqual(value);
+  expect(JSON.parse(record.dataJson ?? "null")).toEqual(value);
+});
+
+test("current reader prefers exact dataJson in a dual-format record", async () => {
+  const id = testId("reader-prefers-exact");
+  const store = ephemeral<{ endpoints: string[]; n: number }>({ id, ttlMs: 60_000 });
+
+  await writeCompatibilityRecord(id, "apps/dual", {
+    v: 2,
+    data: { endpoints: {}, n: 9_007_199_254_741_000 },
+    dataJson: JSON.stringify({ endpoints: [], n: 9_007_199_254_740_991 }),
+  });
+
+  expect((await store.snapshot()).entries[0]?.value).toEqual({
+    endpoints: [],
+    n: 9_007_199_254_740_991,
+  });
+});
+
+test("touch preserves both current record representations", async () => {
+  const id = testId("touch-current-compat");
+  const value = { status: "ready" };
+  const store = ephemeral<typeof value>({ id, ttlMs: 60_000 });
+
+  await store.upsert({ key: "apps/current", value });
+  await store.touch({ key: "apps/current" });
+  const raw = await readStoredRecordRaw(id, "apps/current");
+  const record = JSON.parse(raw) as CompatibilityRecord;
+
+  expect(readValueWith58Parser<typeof value>(raw)).toEqual(value);
+  expect(JSON.parse(record.dataJson ?? "null")).toEqual(value);
+});
+
+test("touch expands a 5.9.0 dataJson-only record to both representations", async () => {
+  const id = testId("touch-59-compat");
+  const store = ephemeral<{ status: string }>({ id, ttlMs: 60_000 });
+
+  await writeCompatibilityRecord(id, "apps/current", {
+    v: 2,
+    dataJson: JSON.stringify({ status: "ready" }),
+  });
+
+  await store.touch({ key: "apps/current" });
+  const raw = await readStoredRecordRaw(id, "apps/current");
+  const record = JSON.parse(raw) as CompatibilityRecord;
+
+  expect(readValueWith58Parser<{ status: string }>(raw)).toEqual({ status: "ready" });
+  expect(JSON.parse(record.dataJson ?? "null")).toEqual({ status: "ready" });
+});
+
+test("touch expands a 5.8.0 record to both representations", async () => {
+  const id = testId("touch-legacy-compat");
+  const store = ephemeral<{ status: string }>({ id, ttlMs: 60_000 });
+
+  await writeCompatibilityRecord(id, "apps/legacy", {
+    data: { status: "ready" },
+  });
+
+  await store.touch({ key: "apps/legacy" });
+  const raw = await readStoredRecordRaw(id, "apps/legacy");
+  const record = JSON.parse(raw) as CompatibilityRecord;
+
+  expect(record.v).toBe(2);
+  expect(readValueWith58Parser<{ status: string }>(raw)).toEqual({ status: "ready" });
+  expect(JSON.parse(record.dataJson ?? "null")).toEqual({ status: "ready" });
+});
+
+test("upsert expands an existing 5.8.0 record to both representations", async () => {
+  const id = testId("upsert-legacy-compat");
+  const store = ephemeral<{ status: string }>({ id, ttlMs: 60_000 });
+
+  await writeCompatibilityRecord(id, "apps/legacy", {
+    data: { status: "old" },
+  });
+
+  await store.upsert({ key: "apps/legacy", value: { status: "new" } });
+  const raw = await readStoredRecordRaw(id, "apps/legacy");
+  const record = JSON.parse(raw) as CompatibilityRecord;
+
+  expect(record.v).toBe(2);
+  expect(readValueWith58Parser<{ status: string }>(raw)).toEqual({ status: "new" });
+  expect(JSON.parse(record.dataJson ?? "null")).toEqual({ status: "new" });
 });
 
 test("snapshot omits expired rows even when reconciliation cannot remove them", async () => {

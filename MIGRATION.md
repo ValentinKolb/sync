@@ -22,6 +22,26 @@ imports:
 The retired standalone `@valentinkolb/sync-browser` package is also deprecated.
 Use the `/browser` export from `@k2b/sync`.
 
+## Ephemeral mixed-version compatibility (v5.9.1)
+
+Server `ephemeral()` records written by v5.9.1 and later in the v5 line carry
+both the exact `dataJson` representation used by current readers and a decoded
+`data` compatibility field used by v5.8 readers. Touching or upserting a record
+expands either older representation to this dual format.
+
+Do not mix exactly v5.9.0 with v5.8 or older processes in one ephemeral
+namespace. The v5.9.0 writer omitted `data`, so an older snapshot reader saw an
+undefined value. Upgrade writers to v5.9.1 or later before resuming a rolling
+deployment.
+
+Current readers always prefer `dataJson`, preserving empty arrays and
+precision-sensitive JSON. The compatibility `data` field intentionally retains
+the Redis Lua `cjson` behavior that v5.8 already exposed. It remains throughout
+v5 and may be removed at the next major storage boundary.
+
+This compatibility window applies only to `ephemeral()`. The maintenance rules
+below still apply to durable primitives whose namespaces changed after v5.8.0.
+
 ## Durable namespace upgrade
 
 Versions `<=5.8.0` use the old colon-concatenated durable namespaces. The
