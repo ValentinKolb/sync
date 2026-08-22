@@ -23,6 +23,8 @@ export type {
 export type { ProcessOptions, Worker } from "./src/worker.ts";
 
 export type {
+  BatchReceipt,
+  PauseInfo,
   Queue,
   QueueConfig,
   QueueDelivery,
@@ -35,6 +37,7 @@ export type {
 
 export type {
   Topic,
+  TopicBatchEvent,
   TopicConfig,
   TopicCursor,
   TopicEvent,
@@ -85,6 +88,7 @@ export type {
 
 export {
   BatchSubmitError,
+  ConflictError,
   ConflictingResourceDeclarationError,
   CursorMismatchError,
   InvalidNameError,

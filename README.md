@@ -83,6 +83,7 @@ await emails.deadLetters.requeue({ messageId: dead[0].messageId, idempotencyKey:
 - `idempotencyKey` deduplicates within `dedupeWindowMs` (default 2 min), scoped per tenant.
 - `delayMs`/`at` use one-shot NATS message schedules — no consumer slot is occupied while waiting.
 - `reader()` gives manual `ack()` / `retry()` / `deadLetter()` settlement per message.
+- `sendBatch([...])` enqueues up to 1000 messages atomically (all-or-nothing; no dedupe ids — NATS batches exclude them). `pause()`/`resume()` stop and restart global delivery without touching publishers. `send({ ttlMs })` makes work expire if not settled in time.
 - `ordering: { mode: "partitioned", partitions: 64 }` hashes `orderingKey` to a stable partition with strictly serial per-partition delivery — including across handler failures: partitioned retries happen in place (the delivery is held with heartbeats through the backoff) so younger messages can never overtake a retrying one. The partition count becomes the global in-flight ceiling; this is for per-aggregate processing, not general fan-out.
 - Retention limits (`maxAgeMs`/`maxBytes`) are a hard loss boundary: NATS forbids reject-new on streams with message schedules, so at the limits the **oldest pending work is dropped**. Size them generously.
 
@@ -127,6 +128,10 @@ const events = sync.topic<NotebookEvent>({
 });
 
 const receipt = await events.publish({ data: event, tenantId: workspaceId });
+
+// Optimistic per-tenant event sourcing: append only if nothing was written since.
+await events.publish({ data: event, tenantId: workspaceId, expectedAfter: receipt.cursor }); // ConflictError on lost races
+await events.publishBatch({ tenantId: workspaceId, events: [...], expectedAfter: receipt.cursor }); // atomic multi-event append
 
 // 1. live(): core NATS broadcast — best-effort, no replay, every listener sees it.
 for await (const event of events.live({ tenantId: workspaceId })) notifySockets(event);

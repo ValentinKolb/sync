@@ -271,3 +271,56 @@ describe("hardening regressions", () => {
     await w.drain();
   }, 45_000);
 });
+
+describe("nats feature surface", () => {
+  test("sendBatch is atomic: all messages land, failures persist nothing", async () => {
+    const queue = sync.queue<Task>({ id: "batch" });
+    const receipt = await queue.sendBatch([{ data: { n: 1 } }, { data: { n: 2 } }, { data: { n: 3 } }]);
+    expect(receipt.count).toBe(3);
+    expect(receipt.messageIds).toHaveLength(3);
+
+    // An oversized member fails the whole batch before anything is staged.
+    const tiny = sync.queue<string>({ id: "batch-fail", maxPayloadBytes: 1_024 });
+    await expect(tiny.sendBatch([{ data: "ok" }, { data: "y".repeat(4_000) }])).rejects.toThrow("payload");
+    const seen: number[] = [];
+    const w = await queue.process({ concurrency: 4 }, async (m) => {
+      seen.push(m.data.n);
+    });
+    await waitFor(() => seen.length >= 3, 15_000);
+    expect(seen.toSorted()).toEqual([1, 2, 3]);
+    await w.drain();
+
+    await expect(queue.sendBatch([{ data: { n: 1 }, idempotencyKey: "x" }])).rejects.toThrow("idempotencyKey");
+    await expect(queue.sendBatch([{ data: { n: 1 }, delayMs: 5_000 }, { data: { n: 2 } }])).rejects.toThrow("delayed");
+  }, 30_000);
+
+  test("pause stops global delivery; resume restores it", async () => {
+    const queue = sync.queue<Task>({ id: "pausable" });
+    const seen: number[] = [];
+    const w = await queue.process({}, async (m) => {
+      seen.push(m.data.n);
+    });
+    const paused = await queue.pause();
+    expect(paused.paused).toBe(true);
+    await queue.send({ data: { n: 1 } });
+    await Bun.sleep(1_500);
+    expect(seen).toEqual([]); // publishes continue, delivery does not
+    const resumed = await queue.resume();
+    expect(resumed.paused).toBe(false);
+    await waitFor(() => seen.length === 1, 15_000);
+    await w.drain();
+  }, 30_000);
+
+  test("ttlMs expires unconsumed work", async () => {
+    const queue = sync.queue<Task>({ id: "expiring" });
+    await queue.send({ data: { n: 1 }, ttlMs: 1_000 });
+    await Bun.sleep(2_500);
+    const seen: number[] = [];
+    const w = await queue.process({}, async (m) => {
+      seen.push(m.data.n);
+    });
+    await Bun.sleep(1_500);
+    expect(seen).toEqual([]); // expired before any worker existed
+    await w.drain();
+  }, 15_000);
+});

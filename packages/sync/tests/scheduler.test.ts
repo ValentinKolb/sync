@@ -269,3 +269,21 @@ describe("hardening regressions", () => {
     await worker.drain();
   }, 45_000);
 });
+
+describe("pause and resume", () => {
+  test("a paused schedule stops executing; resume applies the misfire policy", async () => {
+    const scheduler = sync.scheduler({ id: "pauser" });
+    const runs: string[] = [];
+    await scheduler.create({ id: "job", cron: "0 0 1 1 *", misfire: "latest", process: async (c) => {
+      runs.push(c.runId);
+    } });
+    const worker = await scheduler.process();
+    expect((await scheduler.pause({ id: "job" })).paused).toBe(true);
+    await scheduler.runNow({ id: "job", requestId: "r1" });
+    await Bun.sleep(1_500);
+    expect(runs).toEqual([]);
+    await scheduler.resume({ id: "job" });
+    await waitFor(() => runs.length === 1, 15_000);
+    await worker.drain();
+  }, 30_000);
+});

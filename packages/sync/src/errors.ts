@@ -122,3 +122,6 @@ export class SyncUsageError extends SyncError {}
 
 /** A referenced entity (dead letter, schedule, ...) does not exist. */
 export class NotFoundError extends SyncError {}
+
+/** An optimistic-concurrency expectation (expectedAfter) was not met. */
+export class ConflictError extends SyncError {}

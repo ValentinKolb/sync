@@ -3,7 +3,7 @@ import { jetstreamManager } from "@nats-io/jetstream";
 import type { NatsConnection } from "@nats-io/nats-core";
 import { createSync } from "../src/sync.ts";
 import type { Sync } from "../src/sync.ts";
-import { CursorMismatchError, ResourceDriftError, RetentionGapError } from "../src/errors.ts";
+import { ConflictError, CursorMismatchError, ResourceDriftError, RetentionGapError } from "../src/errors.ts";
 import { connectToCluster, uniqueName } from "./cluster.ts";
 import { cleanupNamespaces, collect, testNamespace, waitFor } from "./helpers.ts";
 
@@ -326,6 +326,54 @@ describe("hardening regressions", () => {
     await waitFor(() => seen.length >= 1, 15_000);
     await Bun.sleep(200);
     expect(seen).toEqual([3]);
+    await w.drain();
+  }, 30_000);
+});
+
+describe("optimistic concurrency and batches", () => {
+  test("expectedAfter guards per-tenant appends (event sourcing)", async () => {
+    const topic = sync.topic<Event>(topicConfig("occ"));
+    // First event: the tenant must be empty.
+    const first = await topic.publish({ data: { n: 1 }, expectedAfter: null });
+    await expect(topic.publish({ data: { n: 99 }, expectedAfter: null })).rejects.toBeInstanceOf(ConflictError);
+    // Appends chained on the latest cursor succeed; stale cursors conflict.
+    const second = await topic.publish({ data: { n: 2 }, expectedAfter: first.cursor });
+    await expect(topic.publish({ data: { n: 99 }, expectedAfter: first.cursor })).rejects.toBeInstanceOf(ConflictError);
+    // Other tenants are independent versions.
+    await topic.publish({ data: { n: 1 }, tenantId: "acme", expectedAfter: null });
+    const events = await collect(topic.replay());
+    expect(events.map((e) => e.data.n)).toEqual([1, 2]);
+    expect(second.cursor).toBe((await topic.latestCursor())!);
+  });
+
+  test("publishBatch appends atomically with optimistic concurrency", async () => {
+    const topic = sync.topic<Event>(topicConfig("occ-batch"));
+    const base = await topic.publish({ data: { n: 1 } });
+    const batch = await topic.publishBatch({
+      events: [{ data: { n: 2 } }, { data: { n: 3 } }, { data: { n: 4 } }],
+      expectedAfter: base.cursor,
+    });
+    expect(batch.count).toBe(3);
+    // The same expectation cannot commit twice — and nothing partial lands.
+    await expect(
+      topic.publishBatch({ events: [{ data: { n: 90 } }, { data: { n: 91 } }], expectedAfter: base.cursor }),
+    ).rejects.toBeInstanceOf(ConflictError);
+    const events = await collect(topic.replay());
+    expect(events.map((e) => e.data.n)).toEqual([1, 2, 3, 4]);
+  });
+
+  test("named consumers can be paused and resumed", async () => {
+    const topic = sync.topic<Event>(topicConfig("pause"));
+    const seen: number[] = [];
+    const w = await topic.process({ consumer: "pausee" }, async (event) => {
+      seen.push(event.data.n);
+    });
+    expect((await topic.pauseConsumer({ consumer: "pausee" })).paused).toBe(true);
+    await topic.publish({ data: { n: 1 } });
+    await Bun.sleep(1_500);
+    expect(seen).toEqual([]);
+    await topic.resumeConsumer({ consumer: "pausee" });
+    await waitFor(() => seen.length === 1, 15_000);
     await w.drain();
   }, 30_000);
 });

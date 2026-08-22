@@ -3,7 +3,7 @@ import type { Consumer, JsMsg } from "@nats-io/jetstream";
 import { decodeEnvelope, encodeEnvelope, extString } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
 import { confirmedAck, runPullLoop, settleSuccess } from "./consume.ts";
-import { CursorMismatchError, RetentionGapError, asError } from "./errors.ts";
+import { ConflictError, CursorMismatchError, RetentionGapError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, resourceIdentity, streamName, dlqStreamName, consumerName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
 import type { ResourceIdentity } from "./naming.ts";
 import { ensureConsumer, ensureStream, toStorageType } from "./resources.ts";
@@ -56,6 +56,19 @@ export type TopicPublish<T> = {
   idempotencyKey?: string;
   orderingKey?: string;
   meta?: MessageMeta;
+  /**
+   * Optimistic concurrency: the publish succeeds only while the given cursor
+   * is still the tenant's latest event (`null` = the tenant must have no
+   * events yet). On a lost race the publish throws ConflictError and nothing
+   * is written — re-read, rebase, retry.
+   */
+  expectedAfter?: TopicCursor | null;
+};
+
+export type TopicBatchEvent<T> = {
+  data: T;
+  orderingKey?: string;
+  meta?: MessageMeta;
 };
 
 export type TopicProcessOptions = ProcessOptions & {
@@ -68,6 +81,19 @@ export type TopicProcessOptions = ProcessOptions & {
 export type Topic<T> = {
   ready(): Promise<void>;
   publish(input: TopicPublish<T>): Promise<PublishReceipt & { eventId: string; cursor: TopicCursor }>;
+  /**
+   * Atomically append several events for one tenant — with `expectedAfter`
+   * this is an optimistic event-sourcing append: all events land or none do.
+   * Batch events carry no dedupe ids (NATS batches exclude message ids).
+   */
+  publishBatch(input: {
+    tenantId?: string;
+    events: TopicBatchEvent<T>[];
+    expectedAfter?: TopicCursor | null;
+  }): Promise<{ lastSequence: number; count: number; cursor: TopicCursor; eventIds: string[] }>;
+  /** Pause delivery for one named durable consumer — global, all pods. */
+  pauseConsumer(input: { consumer: string; tenantId?: string; untilMs?: number }): Promise<{ paused: boolean; pauseUntil?: Date }>;
+  resumeConsumer(input: { consumer: string; tenantId?: string }): Promise<{ paused: boolean }>;
   latestCursor(options?: { tenantId?: string }): Promise<TopicCursor | null>;
   live(options?: { tenantId?: string; signal?: AbortSignal }): AsyncIterable<TopicLiveEvent<T>>;
   replay(options?: {
@@ -165,6 +191,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
         max_msgs: retention.maxMessages ?? -1,
         max_msg_size: -1,
         duplicate_window: nanos(dedupeWindowMs),
+        allow_atomic: true,
       });
       await ensureStream(ctx, identity, owner, {
         name: dlqStream,
@@ -222,7 +249,27 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     };
     const bytes = encodeEnvelope(`topic ${config.id}`, envelope, maxPayloadBytes);
     const ctx = await runtime.context();
-    const ack = await ctx.js.publish(eventSubject(tenantId), bytes, { msgID: messageId });
+    const subject = eventSubject(tenantId);
+    let expectation: { last_subject_sequence: number } | null = null;
+    if (input.expectedAfter !== undefined) {
+      expectation = {
+        last_subject_sequence: input.expectedAfter === null ? 0 : parseCursor(identity, input.expectedAfter, "expectedAfter"),
+      };
+    }
+    let ack;
+    try {
+      ack = await ctx.js.publish(subject, bytes, {
+        msgID: messageId,
+        ...(expectation !== null ? { expect: { lastSubjectSequence: expectation.last_subject_sequence } } : {}),
+      });
+    } catch (error) {
+      if (expectation !== null && /wrong last sequence/i.test(asError(error).message)) {
+        throw new ConflictError(
+          `topic ${config.id}: expectedAfter no longer matches the tenant's latest event — re-read and retry`,
+        );
+      }
+      throw error;
+    }
     return {
       messageId,
       streamSequence: ack.seq,
@@ -517,13 +564,89 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     return wr.worker;
   };
 
+  const publishBatch: Topic<T>["publishBatch"] = async (input) => {
+    runtime.assertActive();
+    await declaration.ready();
+    if (input.events.length === 0 || input.events.length > 1_000) {
+      throw new SyncUsageError("publishBatch takes 1 to 1000 events");
+    }
+    const tenantId = input.tenantId ?? DEFAULT_TENANT;
+    const subject = eventSubject(tenantId);
+    const ctx = await runtime.context();
+    const eventIds = input.events.map(() => crypto.randomUUID());
+    const encoded = input.events.map((event, index) =>
+      encodeEnvelope(`topic ${config.id}`, {
+        v: 6,
+        data: event.data,
+        tenantId,
+        publishedAt: new Date().toISOString(),
+        ...(event.orderingKey !== undefined ? { orderingKey: event.orderingKey } : {}),
+        ...(event.meta !== undefined ? { meta: event.meta } : {}),
+        ext: { eventId: eventIds[index]! },
+      }, maxPayloadBytes),
+    );
+    const expect =
+      input.expectedAfter !== undefined
+        ? {
+            lastSubjectSequence:
+              input.expectedAfter === null ? 0 : parseCursor(identity, input.expectedAfter, "expectedAfter"),
+            lastSubjectSequenceSubject: subject,
+          }
+        : undefined;
+    try {
+      if (encoded.length === 1) {
+        const ack = await ctx.js.publish(subject, encoded[0]!, {
+          ...(expect !== undefined ? { expect: { lastSubjectSequence: expect.lastSubjectSequence } } : {}),
+        });
+        return { lastSequence: ack.seq, count: 1, cursor: cursorOf(identity, ack.seq), eventIds };
+      }
+      // The expectation rides on the first staged message; the atomic commit
+      // persists all events or none.
+      const batch = await ctx.js.startBatch(subject, encoded[0]!, expect !== undefined ? { expect } : {});
+      for (const bytes of encoded.slice(1, -1)) batch.add(subject, bytes);
+      const ack = await batch.commit(subject, encoded[encoded.length - 1]!);
+      return { lastSequence: ack.seq, count: ack.count, cursor: cursorOf(identity, ack.seq), eventIds };
+    } catch (error) {
+      if (expect !== undefined && /wrong last sequence|batch/i.test(asError(error).message)) {
+        throw new ConflictError(
+          `topic ${config.id}: expectedAfter no longer matches the tenant's latest event — re-read and retry`,
+        );
+      }
+      throw error;
+    }
+  };
+
+  const pauseConsumer: Topic<T>["pauseConsumer"] = async (input) => {
+    runtime.assertActive();
+    assertName(input.consumer, "consumer");
+    await declaration.ready();
+    const ctx = await runtime.context();
+    const durable = consumerName(identity, JSON.stringify([input.consumer, input.tenantId ?? DEFAULT_TENANT]));
+    const until = new Date(Date.now() + (input.untilMs ?? 365 * 24 * 60 * 60 * 1_000));
+    const result = await ctx.jsm.consumers.pause(stream, durable, until);
+    return { paused: result.paused, ...(result.pause_until !== undefined ? { pauseUntil: new Date(result.pause_until) } : {}) };
+  };
+
+  const resumeConsumer: Topic<T>["resumeConsumer"] = async (input) => {
+    runtime.assertActive();
+    assertName(input.consumer, "consumer");
+    await declaration.ready();
+    const ctx = await runtime.context();
+    const durable = consumerName(identity, JSON.stringify([input.consumer, input.tenantId ?? DEFAULT_TENANT]));
+    const result = await ctx.jsm.consumers.resume(stream, durable);
+    return { paused: result.paused };
+  };
+
   return {
     ready: () => declaration.ready(),
     publish,
+    publishBatch,
     latestCursor,
     live,
     replay,
     follow,
     process,
+    pauseConsumer,
+    resumeConsumer,
   };
 };

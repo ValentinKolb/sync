@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { headers as natsHeaders } from "@nats-io/nats-core";
 import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from "@nats-io/jetstream";
 import type { JsMsg } from "@nats-io/jetstream";
 import { decodeEnvelope, encodeEnvelope, extNumber, extString } from "./codec.ts";
@@ -46,6 +47,11 @@ export type QueueSend<T> = {
   orderingKey?: string;
   delayMs?: number;
   at?: Date;
+  /**
+   * Expiring work: the message is removed from the stream after ttlMs if not
+   * yet settled — including between retries. Minimum 1s (NATS).
+   */
+  ttlMs?: number;
   meta?: MessageMeta;
 };
 
@@ -91,9 +97,23 @@ export type DeadLetterStore<T> = {
   delete(input: { messageId: string }): Promise<boolean>;
 };
 
+export type BatchReceipt = {
+  /** Stream sequence of the batch's last message. */
+  lastSequence: number;
+  count: number;
+  messageIds: string[];
+};
+
+export type PauseInfo = { paused: boolean; pauseUntil?: Date };
+
 export type Queue<T> = {
   ready(): Promise<void>;
   send(message: QueueSend<T>): Promise<PublishReceipt>;
+  /** Atomic all-or-nothing enqueue of up to 1000 messages (no delays). */
+  sendBatch(messages: QueueSend<T>[]): Promise<BatchReceipt>;
+  /** Pause delivery on the durable consumer(s) — global, all pods. Publishes continue. */
+  pause(options?: { untilMs?: number }): Promise<PauseInfo>;
+  resume(): Promise<PauseInfo>;
   process(options: ProcessOptions, handler: (message: QueueMessage<T>) => Promise<void>): Promise<Worker>;
   reader(options?: { signal?: AbortSignal }): Promise<QueueReader<T>>;
   deadLetters: DeadLetterStore<T>;
@@ -107,6 +127,10 @@ type PreparedSend = {
   messageId: string;
   bytes: Uint8Array;
   byteLength: number;
+  target: string;
+  /** Delayed sends go through a schedule and cannot join an atomic batch. */
+  delayed: boolean;
+  ttl?: string;
 };
 
 // Part of exported signatures; required for declaration emit.
@@ -114,6 +138,9 @@ type PreparedSend = {
 export type QueueCore<T, D = T> = {
   declarationReady(): Promise<void>;
   send(message: QueueSend<T>, ext?: Record<string, JsonValue>): Promise<PublishReceipt>;
+  sendBatch(messages: QueueSend<T>[], ext?: (index: number) => Record<string, JsonValue>): Promise<BatchReceipt>;
+  pause(options?: { untilMs?: number }): Promise<PauseInfo>;
+  resume(): Promise<PauseInfo>;
   /** Encode a message now (byte size known), publish it later — for bounded fan-out. */
   prepareSend(message: QueueSend<T>, ext?: Record<string, JsonValue>): Promise<PreparedSend & { publish(): Promise<PublishReceipt> }>;
   process(
@@ -211,6 +238,7 @@ export const createQueueCore = <T, D = T>(
         duplicate_window: nanos(dedupeWindowMs),
         allow_msg_schedules: true,
         allow_msg_ttl: true,
+        allow_atomic: true,
       });
       await ensureStream(ctx, identity, owner, {
         name: dlqStream,
@@ -316,6 +344,10 @@ export const createQueueCore = <T, D = T>(
     const bytes = encodeEnvelope(label, envelope, maxPayloadBytes);
     const target = workSubject(tenantId, partition);
     const fireAt = message.at ?? (message.delayMs !== undefined ? new Date(Date.now() + message.delayMs) : null);
+    if (message.ttlMs !== undefined && (!Number.isSafeInteger(message.ttlMs) || message.ttlMs < 1_000)) {
+      throw new RangeError("ttlMs must be an integer of at least 1000");
+    }
+    const ttl = message.ttlMs !== undefined ? `${Math.ceil(message.ttlMs / 1_000)}s` : undefined;
 
     const publish = async (): Promise<PublishReceipt> => {
       const ctx = await runtime.context();
@@ -327,16 +359,74 @@ export const createQueueCore = <T, D = T>(
         });
         return { messageId, streamSequence: ack.seq, duplicate: ack.duplicate };
       }
-      const ack = await ctx.js.publish(target, bytes, { msgID: messageId });
+      const headers = ttl !== undefined ? (() => { const h = natsHeaders(); h.set("Nats-TTL", ttl); return h; })() : undefined;
+      const ack = await ctx.js.publish(target, bytes, { msgID: messageId, ...(headers !== undefined ? { headers } : {}) });
       return { messageId, streamSequence: ack.seq, duplicate: ack.duplicate };
     };
 
-    return { messageId, bytes, byteLength: bytes.byteLength, publish };
+    return { messageId, bytes, byteLength: bytes.byteLength, target, delayed: fireAt !== null && fireAt.getTime() > Date.now(), ttl, publish };
   };
 
   const send: QueueCore<T, D>["send"] = async (message, ext) => {
     const prepared = await prepareSend(message, ext);
     return prepared.publish();
+  };
+
+  const sendBatch: QueueCore<T, D>["sendBatch"] = async (messages, ext) => {
+    runtime.assertActive();
+    if (messages.length === 0 || messages.length > 1_000) {
+      throw new SyncUsageError("sendBatch takes 1 to 1000 messages");
+    }
+    if (messages.some((message) => message.idempotencyKey !== undefined)) {
+      // NATS batch messages cannot carry Nats-Msg-Id: a batch is atomic but
+      // NOT deduplicated. Refuse silently different semantics.
+      throw new SyncUsageError("idempotencyKey is not supported in atomic batches (no dedupe); use send()");
+    }
+    const prepared = await Promise.all(messages.map((message, index) => prepareSend(message, ext?.(index))));
+    if (prepared.some((entry) => entry.delayed)) {
+      throw new SyncUsageError("delayed sends cannot join an atomic batch");
+    }
+    const messageIds = prepared.map((entry) => entry.messageId);
+    if (prepared.length === 1) {
+      const receipt = await prepared[0]!.publish();
+      return { lastSequence: receipt.streamSequence, count: 1, messageIds };
+    }
+    const ctx = await runtime.context();
+    const first = prepared[0]!;
+    const last = prepared[prepared.length - 1]!;
+    // NATS atomic batch: nothing is persisted unless the commit succeeds.
+    const batch = await ctx.js.startBatch(first.target, first.bytes);
+    for (const entry of prepared.slice(1, -1)) {
+      batch.add(entry.target, entry.bytes);
+    }
+    const ack = await batch.commit(last.target, last.bytes);
+    return { lastSequence: ack.seq, count: ack.count, messageIds };
+  };
+
+  const pause: QueueCore<T, D>["pause"] = async (options = {}) => {
+    runtime.assertActive();
+    await declaration.ready();
+    const ctx = await runtime.context();
+    await ensureWorkConsumers(ctx);
+    const until = new Date(Date.now() + (options.untilMs ?? 365 * 24 * 60 * 60 * 1_000));
+    let result: { paused: boolean; pause_until?: string } = { paused: false };
+    const partitions = ordering.mode === "partitioned" ? ordering.partitions : 1;
+    for (let p = 0; p < partitions; p++) {
+      result = await ctx.jsm.consumers.pause(stream, durableFor(ordering.mode === "partitioned" ? p : null), until);
+    }
+    return { paused: result.paused, ...(result.pause_until !== undefined ? { pauseUntil: new Date(result.pause_until) } : {}) };
+  };
+
+  const resume: QueueCore<T, D>["resume"] = async () => {
+    runtime.assertActive();
+    await declaration.ready();
+    const ctx = await runtime.context();
+    let result: { paused: boolean; pause_until?: string } = { paused: false };
+    const partitions = ordering.mode === "partitioned" ? ordering.partitions : 1;
+    for (let p = 0; p < partitions; p++) {
+      result = await ctx.jsm.consumers.resume(stream, durableFor(ordering.mode === "partitioned" ? p : null)).catch(() => ({ paused: false }));
+    }
+    return { paused: result.paused };
   };
 
   // ==========================
@@ -709,6 +799,9 @@ export const createQueueCore = <T, D = T>(
   return {
     declarationReady: () => declaration.ready(),
     send,
+    sendBatch,
+    pause,
+    resume,
     prepareSend,
     process,
     reader,
@@ -725,6 +818,9 @@ export const createQueue = <T>(runtime: SyncRuntime, config: QueueConfig): Queue
   return {
     ready: () => core.declarationReady(),
     send: (message) => core.send(message),
+    sendBatch: (messages) => core.sendBatch(messages),
+    pause: core.pause,
+    resume: core.resume,
     process: (options, handler) => core.process(options, (message) => handler(message)),
     reader: core.reader,
     deadLetters: core.deadLetters,

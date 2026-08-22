@@ -85,6 +85,9 @@ export type Scheduler = {
    * consumers needing permanent uniqueness enforce it in their own store).
    */
   runNow(input: { id: string; requestId: string }): Promise<{ runId: string }>;
+  /** Pause execution of one schedule (ticks keep accruing; misfire policy applies on resume). */
+  pause(input: { id: string; untilMs?: number }): Promise<{ paused: boolean; pauseUntil?: Date }>;
+  resume(input: { id: string }): Promise<{ paused: boolean }>;
   get(input: { id: string }): Promise<ScheduleInfo | null>;
   list(): Promise<ScheduleInfo[]>;
 };
@@ -557,22 +560,8 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
     if (active.served.has(scheduleId) || active.wr.stopping) return;
     active.served.add(scheduleId);
     const durable = consumerName(identity, scheduleId);
-    const ensureScheduleConsumer = async (): Promise<void> => {
-      const ctx = await runtime.context();
-      await ensureConsumer(ctx, stream, {
-        durable_name: durable,
-        ack_policy: AckPolicy.Explicit,
-        filter_subjects: [tickSubject(scheduleId), manualSubject(scheduleId)],
-        ack_wait: nanos(delivery.ackWaitMs),
-        // No max_deliver: the client-side attempt guard bounds handler runs
-        // and unbounded redelivery keeps failure accounting crash-safe.
-        // Serial execution per schedule: no overlapping runs.
-        max_ack_pending: 1,
-        deliver_policy: DeliverPolicy.All,
-      });
-    };
     const setup = async (): Promise<void> => {
-      await ensureScheduleConsumer();
+      await ensureScheduleConsumer(scheduleId);
       await runPullLoop(
         active.wr,
         async () => {
@@ -582,7 +571,7 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
           } catch (error) {
             // delete() removes the consumer; a re-create() needs it back.
             if (registry.has(scheduleId)) {
-              await ensureScheduleConsumer();
+              await ensureScheduleConsumer(scheduleId);
               return ctx.js.consumers.get(stream, durable);
             }
             throw error;
@@ -636,12 +625,51 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
     return wr.worker;
   };
 
+  /** The per-schedule serial consumer (also created lazily by process()). */
+  const ensureScheduleConsumer = async (scheduleId: string): Promise<void> => {
+    const ctx = await runtime.context();
+    await ensureConsumer(ctx, stream, {
+      durable_name: consumerName(identity, scheduleId),
+      ack_policy: AckPolicy.Explicit,
+      filter_subjects: [tickSubject(scheduleId), manualSubject(scheduleId)],
+      ack_wait: nanos(delivery.ackWaitMs),
+      // No max_deliver: the client-side attempt guard bounds handler runs
+      // and unbounded redelivery keeps failure accounting crash-safe.
+      // Serial execution per schedule: no overlapping runs.
+      max_ack_pending: 1,
+      deliver_policy: DeliverPolicy.All,
+    });
+  };
+
+  const pause: Scheduler["pause"] = async (input) => {
+    runtime.assertActive();
+    const existing = await loadDef(input.id);
+    if (existing === null) throw new NotFoundError(`schedule ${input.id} does not exist`);
+    await ensureScheduleConsumer(input.id);
+    const ctx = await runtime.context();
+    const until = new Date(Date.now() + (input.untilMs ?? 365 * 24 * 60 * 60 * 1_000));
+    const result = await ctx.jsm.consumers.pause(stream, consumerName(identity, input.id), until);
+    return { paused: result.paused, ...(result.pause_until !== undefined ? { pauseUntil: new Date(result.pause_until) } : {}) };
+  };
+
+  const resume: Scheduler["resume"] = async (input) => {
+    runtime.assertActive();
+    const existing = await loadDef(input.id);
+    if (existing === null) throw new NotFoundError(`schedule ${input.id} does not exist`);
+    await ensureScheduleConsumer(input.id);
+    const ctx = await runtime.context();
+    const result = await ctx.jsm.consumers.resume(stream, consumerName(identity, input.id));
+    return { paused: result.paused };
+  };
+
   return {
     ready: () => declaration.ready(),
     create,
     process,
     delete: deleteSchedule,
     runNow,
+    pause,
+    resume,
     get,
     list,
   };

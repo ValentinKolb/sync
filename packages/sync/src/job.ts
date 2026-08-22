@@ -3,7 +3,7 @@ import type { JsonValue } from "./codec.ts";
 import { BatchSubmitError, asError } from "./errors.ts";
 import { assertName } from "./naming.ts";
 import { createQueueCore } from "./queue.ts";
-import type { DeadLetterStore, QueueConfig } from "./queue.ts";
+import type { BatchReceipt, DeadLetterStore, PauseInfo, QueueConfig } from "./queue.ts";
 import type { SyncRuntime } from "./runtime.ts";
 import type { MessageMeta, PublishReceipt } from "./types.ts";
 import type { ProcessOptions, Worker } from "./worker.ts";
@@ -59,6 +59,15 @@ export type Job<Input> = {
     jobs: Iterable<JobSubmit<Input>> | AsyncIterable<JobSubmit<Input>>,
     options?: JobSubmitManyOptions,
   ): Promise<{ accepted: number; duplicates: number }>;
+  /**
+   * Atomic all-or-nothing submission of up to 1000 jobs. Unlike submit(), keys
+   * are NOT deduplicated (NATS batches carry no message ids) — resubmitting a
+   * committed batch duplicates its jobs.
+   */
+  submitBatch(jobs: JobSubmit<Input>[]): Promise<BatchReceipt>;
+  /** Pause delivery on the durable consumer — global, all pods. Submissions continue. */
+  pause(options?: { untilMs?: number }): Promise<PauseInfo>;
+  resume(): Promise<PauseInfo>;
   process(options: JobProcessOptions<Input>, handler: (context: JobContext<Input>) => Promise<void>): Promise<Worker>;
   deadLetters: DeadLetterStore<{ key: string; input: Input }>;
 };
@@ -195,10 +204,28 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
     );
   };
 
+  const submitBatch: Job<Input>["submitBatch"] = (jobs) => {
+    for (const job of jobs) assertName(job.key, "job key");
+    return core.sendBatch(
+      jobs.map((job) => ({
+        data: job.input,
+        tenantId: job.tenantId,
+        delayMs: job.delayMs,
+        at: job.at,
+        orderingKey: job.orderingKey,
+        meta: job.meta,
+      })),
+      (index) => ({ key: jobs[index]!.key }),
+    );
+  };
+
   return {
     ready: () => core.declarationReady(),
     submit,
     submitMany,
+    submitBatch,
+    pause: core.pause,
+    resume: core.resume,
     process,
     deadLetters: core.deadLetters,
   };
