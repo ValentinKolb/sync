@@ -15,7 +15,8 @@ export type DeliveryConfig = {
   backoffMs?: number[];
 };
 
-// fallow-ignore-next-line unused-type -- part of exported signatures; required for declaration emit
+// Part of exported signatures; required for declaration emit.
+// fallow-ignore-next-line unused-type
 export type ResolvedDelivery = Required<DeliveryConfig>;
 
 export type RetentionConfig = {

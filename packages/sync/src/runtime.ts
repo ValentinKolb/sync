@@ -67,7 +67,8 @@ export type SyncResourceSummary = {
 // Internal runtime
 // ==========================
 
-// fallow-ignore-next-line unused-type -- part of exported signatures; required for declaration emit
+// Part of exported signatures; required for declaration emit.
+// fallow-ignore-next-line unused-type
 export type Declaration = {
   identity: ResourceIdentity;
   owner: string;

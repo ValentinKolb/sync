@@ -155,7 +155,8 @@ export const subjectRoot = (identity: ResourceIdentity): string => {
 // Resource metadata
 // ==========================
 
-// fallow-ignore-next-line unused-type -- part of exported signatures; required for declaration emit
+// Part of exported signatures; required for declaration emit.
+// fallow-ignore-next-line unused-type
 export type ResourceMetadata = {
   "sync.api": "6";
   "sync.namespace": string;
