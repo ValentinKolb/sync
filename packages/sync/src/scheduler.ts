@@ -5,14 +5,14 @@ import type { KV } from "@nats-io/kv";
 import { assertValidTimeZone, nextCronTimestamp } from "./cron.ts";
 import { decodeJson, encodeJson } from "./codec.ts";
 import type { JsonValue } from "./codec.ts";
-import { confirmedAck, runPullLoop } from "./consume.ts";
-import { InvalidNameError, asError } from "./errors.ts";
+import { confirmedAck, runPullLoop, settleSuccess } from "./consume.ts";
+import { NotFoundError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, consumerName, resourceIdentity, streamName, subjectRoot, subjectToken, decodeSubjectToken } from "./naming.ts";
 import { ensureConsumer, ensureKv, ensureStream } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
-import { assertRetention, backoffDelayMs, millis, nanos, resolveDelivery } from "./types.ts";
-import type { DeliveryConfig, MessageMeta, RetentionConfig } from "./types.ts";
+import { backoffDelayMs, millis, nanos, resolveDelivery } from "./types.ts";
+import type { DeliveryConfig, MessageMeta } from "./types.ts";
 import { createWorkerRuntime } from "./worker.ts";
 import type { ProcessOptions, Worker, WorkerRuntime } from "./worker.ts";
 
@@ -23,9 +23,19 @@ import type { ProcessOptions, Worker, WorkerRuntime } from "./worker.ts";
 export type SchedulerConfig = {
   id: string;
   owner?: string;
+  /** Handler delivery policy. `maxInFlight` is ignored: schedules execute serially (one in-flight tick per schedule). */
   delivery?: DeliveryConfig;
-  /** Retention of accepted ticks (and run history) in the schedule stream. Default 7 days / 64 MiB. */
-  retention?: RetentionConfig;
+  /**
+   * Tick retention. Global size limits are deliberately not configurable:
+   * with discard-old they would eventually evict the broker-side schedule
+   * definitions themselves and silently stop the clock (server-verified).
+   */
+  retention?: {
+    /** How long accepted ticks stay retained. Default 7 days. */
+    maxAgeMs?: number;
+    /** Retained ticks/manual runs per schedule. Default 10_000. */
+    maxTicksPerSchedule?: number;
+  };
 };
 
 export type ScheduleContext = {
@@ -66,7 +76,12 @@ export type Scheduler = {
   create(config: ScheduleDefinition): Promise<{ created: boolean; updated: boolean }>;
   start(options?: ProcessOptions): Promise<Worker>;
   delete(input: { id: string }): Promise<boolean>;
-  /** Durably accept a manual run. Repeating the same requestId returns the same run. */
+  /**
+   * Durably accept a manual run. Repeating the same requestId within the
+   * stream's duplicate window (120 s) is deduplicated to the same run; beyond
+   * the window a repeated requestId is accepted again (at-least-once —
+   * consumers needing permanent uniqueness enforce it in their own store).
+   */
   runNow(input: { id: string; requestId: string }): Promise<{ runId: string }>;
   get(input: { id: string }): Promise<ScheduleInfo | null>;
   list(): Promise<ScheduleInfo[]>;
@@ -96,7 +111,14 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
   const identity = resourceIdentity(runtime.namespace, "scheduler", config.id);
   const owner = config.owner ?? runtime.application;
   const delivery = resolveDelivery(config.delivery);
-  const retention = assertRetention(config.retention ?? { maxAgeMs: 7 * 24 * 60 * 60 * 1_000, maxBytes: 64 * 1024 * 1024 });
+  const retentionMaxAgeMs = config.retention?.maxAgeMs ?? 7 * 24 * 60 * 60 * 1_000;
+  const maxTicksPerSchedule = config.retention?.maxTicksPerSchedule ?? 10_000;
+  if (!Number.isSafeInteger(retentionMaxAgeMs) || retentionMaxAgeMs <= 0) {
+    throw new RangeError("retention.maxAgeMs must be a positive integer");
+  }
+  if (!Number.isSafeInteger(maxTicksPerSchedule) || maxTicksPerSchedule <= 0) {
+    throw new RangeError("retention.maxTicksPerSchedule must be a positive integer");
+  }
   const replicas = runtime.defaults.replicas;
   const storage = runtime.defaults.storage === "memory" ? StorageType.Memory : StorageType.File;
   const stream = streamName(identity);
@@ -118,7 +140,15 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
   const declaration = runtime.declare({
     identity,
     owner,
-    configKey: JSON.stringify(["scheduler", config.id, owner, delivery, retention]),
+    // maxInFlight is ignored (serial per schedule) and excluded so it can
+    // never cause declaration conflicts without having an effect.
+    configKey: JSON.stringify([
+      "scheduler",
+      config.id,
+      owner,
+      { ackWaitMs: delivery.ackWaitMs, maxAttempts: delivery.maxAttempts, backoffMs: delivery.backoffMs },
+      { maxAgeMs: retentionMaxAgeMs, maxTicksPerSchedule },
+    ]),
     natsNames: [stream, `KV_${bucket}`],
     provision: async (ctx: ProvisionContext) => {
       await ensureStream(ctx, identity, owner, {
@@ -128,9 +158,14 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
         discard: DiscardPolicy.Old,
         storage,
         num_replicas: replicas,
-        max_age: nanos(retention.maxAgeMs),
-        max_bytes: retention.maxBytes,
-        max_msgs: retention.maxMessages ?? -1,
+        // Ticks age out; schedule messages survive via Nats-TTL: never.
+        // Bounds are per subject: global max_msgs/max_bytes with discard-old
+        // would evict the oldest messages — the schedule definitions — and
+        // silently stop the broker clock (server-verified).
+        max_age: nanos(retentionMaxAgeMs),
+        max_bytes: -1,
+        max_msgs: -1,
+        max_msgs_per_subject: maxTicksPerSchedule,
         max_msg_size: -1,
         duplicate_window: nanos(120_000),
         allow_msg_schedules: true,
@@ -169,9 +204,17 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
 
   const loadDef = async (id: string): Promise<{ record: DefRecord; revision: number } | null> => {
     const store = await getKv();
-    const entry = await store.get(defKey(id));
-    if (entry === null || entry.operation !== "PUT") return null;
-    return { record: decodeJson<DefRecord>(entry.value), revision: entry.revision };
+    // A freshly created R3 bucket can briefly have no direct-get responders.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const entry = await store.get(defKey(id));
+        if (entry === null || entry.operation !== "PUT") return null;
+        return { record: decodeJson<DefRecord>(entry.value), revision: entry.revision };
+      } catch (error) {
+        if (attempt >= 4 || !/no responders/i.test(asError(error).message)) throw error;
+        await Bun.sleep(150);
+      }
+    }
   };
 
   const loadRun = async (id: string): Promise<RunRecord> => {
@@ -202,18 +245,24 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
     throw new Error(`${label}: run record for ${id} is contended`);
   };
 
-  /** Publish (or replace, via per-subject rollup) the broker-side schedule message. */
+  /**
+   * Publish (or replace, via per-subject rollup) the broker-side schedule
+   * message, then verify the newest retained schedule message really carries
+   * this (or a newer) definition revision: with per-subject rollup the last
+   * write wins, so a delayed publish of an older revision could otherwise
+   * silently reinstate a stale schedule.
+   */
   const publishSchedule = async (record: DefRecord, revision: number): Promise<void> => {
     const ctx = await runtime.context();
-    const hdrs = natsHeaders();
-    // The schedule message must outlive the stream's tick retention.
-    hdrs.set("Nats-TTL", "never");
-    await ctx.js.publish(
-      schedSubject(record.id),
-      encodeJson(label, { scheduleId: record.id, trigger: "schedule" }, 16 * 1024),
-      {
+    const subject = schedSubject(record.id);
+    const body = encodeJson(label, { scheduleId: record.id, trigger: "schedule", revision }, 16 * 1024);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const hdrs = natsHeaders();
+      // The schedule message must outlive the stream's tick retention.
+      hdrs.set("Nats-TTL", "never");
+      await ctx.js.publish(subject, body, {
         headers: hdrs,
-        msgID: `sched.${subjectToken(record.id, "schedule id")}.${revision}`,
+        msgID: `sched.${subjectToken(record.id, "schedule id")}.${revision}.${attempt}`,
         schedule: {
           // NATS uses six-field cron; Sync's public contract stays five-field.
           specification: { cron: `0 ${record.cron}` },
@@ -221,8 +270,12 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
           timezone: record.timezone,
           rollup: "sub",
         },
-      },
-    );
+      });
+      const last = await ctx.jsm.streams.getMessage(stream, { last_by_subj: subject }).catch(() => null);
+      const lastRevision = last === null ? -1 : (decodeJson<{ revision?: number }>(last.data).revision ?? -1);
+      if (lastRevision >= revision) return;
+    }
+    throw new Error(`${label}: schedule ${record.id} could not be republished consistently`);
   };
 
   // ==========================
@@ -238,7 +291,7 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
     try {
       nextCronTimestamp(definition.cron, timezone, Date.now());
     } catch (error) {
-      throw new InvalidNameError(`invalid cron for schedule ${definition.id}: ${asError(error).message}`);
+      throw new SyncUsageError(`invalid cron for schedule ${definition.id}: ${asError(error).message}`);
     }
     await declaration.ready();
 
@@ -261,14 +314,28 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
       existing.record.misfire === record.misfire &&
       JSON.stringify(existing.record.meta ?? null) === JSON.stringify(record.meta ?? null);
 
-    let revision: number;
-    if (existing === null) {
-      revision = await store.create(defKey(definition.id), encodeJson(label, record, 16 * 1024));
-    } else if (unchanged) {
-      revision = existing.revision;
-    } else {
-      revision = await store.update(defKey(definition.id), encodeJson(label, record, 16 * 1024), existing.revision);
+    let revision: number | null = null;
+    for (let attempt = 0; attempt < 10 && revision === null; attempt++) {
+      try {
+        const current = attempt === 0 ? existing : await loadDef(definition.id);
+        if (current === null) {
+          revision = await store.create(defKey(definition.id), encodeJson(label, record, 16 * 1024));
+        } else if (unchanged) {
+          revision = current.revision;
+        } else {
+          record.createdAt = current.record.createdAt;
+          revision = await store.update(defKey(definition.id), encodeJson(label, record, 16 * 1024), current.revision);
+        }
+      } catch (error) {
+        // Two pods creating/updating the same schedule concurrently is normal
+        // (CAS conflicts), and a freshly created R3 bucket may briefly have no
+        // direct-get responders — reload and retry instead of surfacing raw
+        // transport errors.
+        if (!/wrong last sequence|already exists|no responders/i.test(asError(error).message)) throw error;
+        await Bun.sleep(100);
+      }
     }
+    if (revision === null) throw new Error(`${label}: schedule ${definition.id} is contended`);
     // Always republish: self-heals a lost schedule message; the stable message
     // ID plus per-subject rollup make this idempotent.
     await publishSchedule(record, revision);
@@ -293,6 +360,10 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
     });
     await store.purge(defKey(input.id)).catch(() => {});
     await store.purge(runKey(input.id)).catch(() => {});
+    // Drop retained ticks and manual runs: processed-ness lived in the deleted
+    // consumer, so a later re-create must not resurrect old history.
+    await ctx.jsm.streams.purge(stream, { filter: tickSubject(input.id) }).catch(() => {});
+    await ctx.jsm.streams.purge(stream, { filter: manualSubject(input.id) }).catch(() => {});
     await ctx.jsm.consumers.delete(stream, consumerName(identity, input.id)).catch(() => {});
     return true;
   };
@@ -302,7 +373,7 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
     assertName(input.requestId, "requestId");
     await declaration.ready();
     const existing = await loadDef(input.id);
-    if (existing === null) throw new InvalidNameError(`schedule ${input.id} does not exist`);
+    if (existing === null) throw new NotFoundError(`schedule ${input.id} does not exist`);
     const ctx = await runtime.context();
     const runId = `${input.id}:manual:${input.requestId}`;
     await ctx.js.publish(
@@ -370,12 +441,31 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
     const trigger: "schedule" | "manual" = payload.trigger === "manual" ? "manual" : "schedule";
     const slot = new Date(millis(msg.info.timestampNanos));
 
+    const attempt = msg.info.deliveryCount;
+    if (attempt > delivery.maxAttempts) {
+      // Crash boundary: the handler exhausted its attempts across process
+      // deaths; count the failure and drop the slot.
+      await saveRun(scheduleId, (r) => {
+        r.failureCount += 1;
+      });
+      await confirmedAck(msg, label).catch(() => {});
+      return;
+    }
+
     // Misfire "latest": a scheduled tick with a newer tick behind it on the
     // same subject is a stale slot — skip it explicitly. The newest retained
     // tick always executes, so accepted latest work is never lost.
     if (trigger === "schedule" && existing.record.misfire === "latest") {
       const ctx = await runtime.context();
-      const last = await ctx.jsm.streams.getMessage(stream, { last_by_subj: tickSubject(scheduleId) }).catch(() => null);
+      let last: Awaited<ReturnType<typeof ctx.jsm.streams.getMessage>>;
+      try {
+        last = await ctx.jsm.streams.getMessage(stream, { last_by_subj: tickSubject(scheduleId) });
+      } catch {
+        // "Execute only the newest slot" needs the lookup; retry shortly
+        // instead of guessing and executing a possibly stale slot.
+        msg.nak(2_000);
+        return;
+      }
       if (last !== null && last.seq > msg.seq) {
         runtime.events.emit({
           type: "schedule_misfire",
@@ -402,7 +492,6 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
             }
           })).runNumber;
 
-    const attempt = msg.info.deliveryCount;
     runtime.events.emit({
       type: "schedule_tick",
       resource: config.id,
@@ -422,7 +511,6 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
           msg.working();
         },
       });
-      await confirmedAck(msg, label);
     } catch (error) {
       if (signal.aborted) {
         msg.nak();
@@ -438,34 +526,75 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
       } else {
         msg.nak(backoffDelayMs(delivery, attempt));
       }
+      return;
     }
+    // Success settles outside the failure logic: an unconfirmable ack means
+    // the delivery was superseded — never a handler failure.
+    await settleSuccess(msg, label, runtime.events, "scheduler");
   };
 
   const attachLoop = (active: { wr: WorkerRuntime; served: Set<string> }, scheduleId: string): void => {
     if (active.served.has(scheduleId) || active.wr.stopping) return;
     active.served.add(scheduleId);
     const durable = consumerName(identity, scheduleId);
-    const setup = async (): Promise<void> => {
+    const ensureScheduleConsumer = async (): Promise<void> => {
       const ctx = await runtime.context();
       await ensureConsumer(ctx, stream, {
         durable_name: durable,
         ack_policy: AckPolicy.Explicit,
         filter_subjects: [tickSubject(scheduleId), manualSubject(scheduleId)],
         ack_wait: nanos(delivery.ackWaitMs),
-        max_deliver: delivery.maxAttempts + 1,
+        // No max_deliver: the client-side attempt guard bounds handler runs
+        // and unbounded redelivery keeps failure accounting crash-safe.
         // Serial execution per schedule: no overlapping runs.
         max_ack_pending: 1,
         deliver_policy: DeliverPolicy.All,
       });
+    };
+    const setup = async (): Promise<void> => {
+      await ensureScheduleConsumer();
       await runPullLoop(
         active.wr,
-        () => ctx.js.consumers.get(stream, durable),
-        (msg, signal) => handleTick(scheduleId, msg, signal),
-        { events: runtime.events, resource: config.id },
+        async () => {
+          const ctx = await runtime.context();
+          try {
+            return await ctx.js.consumers.get(stream, durable);
+          } catch (error) {
+            // delete() removes the consumer; a re-create() needs it back.
+            if (registry.has(scheduleId)) {
+              await ensureScheduleConsumer();
+              return ctx.js.consumers.get(stream, durable);
+            }
+            throw error;
+          }
+        },
+        async (msg, signal) => {
+          try {
+            await handleTick(scheduleId, msg, signal);
+          } catch (error) {
+            runtime.events.emit({ type: "handler_error", resource: config.id, kind: "scheduler", error: asError(error).message });
+            msg.nak(5_000);
+          }
+        },
+        {
+          events: runtime.events,
+          resource: config.id,
+          // Stop serving deleted schedules; re-create() re-attaches.
+          shouldStop: () => !registry.has(scheduleId),
+          maxBatch: 1,
+          pollExpiresMs: 1_500,
+        },
       );
+      active.served.delete(scheduleId);
     };
     setup().catch((error) => {
       runtime.events.emit({ type: "handler_error", resource: config.id, kind: "scheduler", error: asError(error).message });
+      active.served.delete(scheduleId);
+      // A transient provisioning failure must not permanently disable the
+      // schedule on this worker.
+      setTimeout(() => {
+        if (!active.wr.stopping && registry.has(scheduleId)) attachLoop(active, scheduleId);
+      }, 5_000);
     });
   };
 

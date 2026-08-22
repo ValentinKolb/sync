@@ -207,3 +207,65 @@ describe("scheduler execution", () => {
     await worker.drain();
   }, 100_000);
 });
+
+describe("hardening regressions", () => {
+  test("tick floods cannot evict the schedule definition — the broker clock survives", async () => {
+    const scheduler = sync.scheduler({
+      id: "evict",
+      retention: { maxAgeMs: 60 * 60 * 1_000, maxTicksPerSchedule: 5 },
+    });
+    await scheduler.create({ id: "survivor", cron: "0 0 1 1 *", process: async () => {} });
+    // Flood far past the per-schedule tick bound.
+    for (let i = 0; i < 25; i++) await publishFakeTick("evict", "survivor");
+
+    const jsm = await jetstreamManager(nc);
+    let schedMessages = 0;
+    let tickMessages = 0;
+    for await (const info of jsm.streams.list()) {
+      const meta = info.config.metadata;
+      if (meta?.["sync.kind"] === "scheduler" && meta["sync.namespace"] === namespace && meta["sync.id"] === "evict" && !info.config.name.startsWith("KV_")) {
+        const detailed = await jsm.streams.info(info.config.name, { subjects_filter: ">" });
+        for (const [subject, count] of Object.entries(detailed.state.subjects ?? {})) {
+          if (subject.includes(".sched.")) schedMessages += count;
+          if (subject.includes(".tick.")) tickMessages += count;
+        }
+      }
+    }
+    // Old ticks were evicted per subject, the schedule definition was not.
+    expect(tickMessages).toBeLessThanOrEqual(5);
+    expect(schedMessages).toBe(1);
+  }, 30_000);
+
+  test("concurrent create of the same schedule from two instances is race-free", async () => {
+    const other = createSync({ connection: nc, namespace, application: "tests" });
+    const a = sync.scheduler({ id: "race" });
+    const b = other.scheduler({ id: "race" });
+    const definition = { id: "shared", cron: "0 5 * * *", process: async () => {} };
+    const [ra, rb] = await Promise.all([a.create(definition), b.create(definition)]);
+    // Exactly one side created; the other saw it as existing/unchanged.
+    expect([ra.created, rb.created].filter(Boolean)).toHaveLength(1);
+    const info = await a.get({ id: "shared" });
+    expect(info!.cron).toBe("0 5 * * *");
+  }, 30_000);
+
+  test("delete then re-create keeps a live worker serving the schedule", async () => {
+    const scheduler = sync.scheduler({ id: "recreate" });
+    const runs: string[] = [];
+    await scheduler.create({ id: "phoenix", cron: "0 0 1 1 *", process: async (context) => {
+      runs.push(context.runId);
+    } });
+    const worker = await scheduler.start();
+    await scheduler.runNow({ id: "phoenix", requestId: "r1" });
+    await waitFor(() => runs.length >= 1, 15_000);
+
+    expect(await scheduler.delete({ id: "phoenix" })).toBe(true);
+    await Bun.sleep(500);
+    await scheduler.create({ id: "phoenix", cron: "0 0 1 1 *", process: async (context) => {
+      runs.push(context.runId);
+    } });
+    await scheduler.runNow({ id: "phoenix", requestId: "r2" });
+    await waitFor(() => runs.length >= 2, 20_000);
+    expect(runs[1]).toBe("phoenix:manual:r2");
+    await worker.drain();
+  }, 45_000);
+});

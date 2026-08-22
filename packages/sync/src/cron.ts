@@ -49,11 +49,12 @@ const getZonedFormatter = (tz: string): Intl.DateTimeFormat => {
 };
 
 const asInt = (value: string, fieldName: string): number => {
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed)) {
+  // Strictly decimal digits: Number() would accept "", "-5", "0x10", "1e1"
+  // and silently turn e.g. "-5 * * * *" into the range 0-5.
+  if (!/^\d+$/.test(value)) {
     throw new Error(`invalid ${fieldName} value: ${value}`);
   }
-  return parsed;
+  return Number(value);
 };
 
 const normalizeDow = (value: number): number => {
