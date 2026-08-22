@@ -43,6 +43,8 @@ type DeliveryConfig = {
   backoffMs?: number[];  // default [1_000, 5_000, 30_000, 120_000]; last entry repeats
 };
 type RetentionConfig = { maxAgeMs: number; maxBytes: number; maxMessages?: number };
+// Queue/topic retention is a hard loss boundary (discard-old; NATS forbids
+// reject-new on streams with message schedules) — size generously.
 type OrderingConfig = { mode: "none" } | { mode: "partitioned"; partitions: number };
 type PublishReceipt = { messageId: string; streamSequence: number; duplicate: boolean };
 ```
@@ -53,7 +55,8 @@ type PublishReceipt = { messageId: string; streamSequence: number; duplicate: bo
 const q = sync.queue<T>({
   id, owner?, delivery?, retention?,        // retention default 7d / 1 GiB
   dedupeWindowMs?,                          // default 120_000
-  ordering?,                                // partitioned ⇒ send() requires orderingKey
+  ordering?,                                // partitioned ⇒ send() requires orderingKey;
+                                            // retries run in place (order survives failures)
   maxPayloadBytes?,                         // default 128 KiB (whole envelope)
   replicas?,
 });
@@ -69,7 +72,7 @@ const worker = await q.process({ concurrency?, signal? }, async (message) => {
 const reader = await q.reader();            // unpartitioned queues only
 const delivery = await reader.receive({ waitMs? }); // null on timeout; min wait 1s
 await delivery.ack();                        // confirmed; StaleDeliveryError on hard failure
-await delivery.retry({ delayMs?, reason? }); // on final attempt: dead-letters instead
+await delivery.retry({ delayMs?, reason? }); // on final attempt: dead-letters ("max attempts exhausted", error=reason)
 await delivery.deadLetter({ reason, error? });
 for await (const d of reader.stream()) { ... }
 await reader.close();
@@ -118,8 +121,11 @@ for await (const e of t.live({ tenantId?, signal? })) {}    // broadcast, no cur
 for await (const e of t.replay({ tenantId?, after?, until?, signal? })) {} // to head-at-start
 for await (const e of t.follow({ tenantId?, after?, signal? })) {}         // stays open
 // events: { data, eventId, cursor, tenantId, orderingKey?, publishedAt, meta? }
-// after below retention → RetentionGapError; foreign cursor → CursorMismatchError
-// mid-follow retention loss → RetentionGapError (never silently skips)
+// after below retention → RetentionGapError (also for a fresh process({start:{after}}) consumer);
+// error.resumeAfter is the cursor that resumes from the first retained event.
+// foreign cursor → CursorMismatchError; mid-follow retention loss → RetentionGapError.
+// tenantId is a client-side filter: replay/follow stream the WHOLE topic from
+// the server — prefer one topic per tenant or process() for high volume.
 
 await t.process({
   consumer,                       // same name competes, different names = independent cursors
@@ -141,6 +147,7 @@ const p = sync.pump<Input, Cursor, Item extends { key: string }>({
   retention?: { terminalMs?, maxPageBytes? },  // 7d / 128 KiB record incl. page
   retry?: { maxAttempts?, backoffMs? },        // default 5 / [1s, 5s, 30s]
   leaseMs?,               // default 60_000, min 2_000 — crash takeover latency
+  // terminal run state expires after retention.terminalMs (KV per-key TTL)
   pull:     async ({ input, cursor, limit, signal }) => ({ items, nextCursor }), // nextCursor null = done
   dispatch: async ({ input, item, signal }) => {},  // idempotent by item.key
 });
@@ -157,7 +164,11 @@ Cursor advances only after every page item is checkpointed; a crash repeats only
 ## scheduler
 
 ```ts
-const s = sync.scheduler({ id, owner?, delivery?, retention? /* tick retention, default 7d / 64 MiB */ });
+const s = sync.scheduler({
+  id, owner?,
+  delivery?,   // maxInFlight is ignored: schedules execute serially (one in-flight tick each)
+  retention?: { maxAgeMs?, maxTicksPerSchedule? },  // default 7d / 10_000 per schedule
+});
 
 await s.create({
   id, cron /* five-field, minute resolution */, timezone? /* IANA, default UTC */,
@@ -168,10 +179,10 @@ await s.create({
 }); // → { created, updated }; republish is self-healing and idempotent
 
 await s.start({ concurrency? });   // serves locally created schedules; serial per schedule
-await s.runNow({ id, requestId }); // → { runId }; durably accepted, idempotent per requestId
+await s.runNow({ id, requestId }); // → { runId }; durably accepted; requestId dedupes within the 120s window
 await s.get({ id });               // ScheduleInfo | null: cron, timezone, misfire, nextRunAt, runNumber, failureCount, handlerAvailable
 await s.list();
-await s.delete({ id });            // cancels the broker schedule; accepted ticks remain
+await s.delete({ id });            // cancels the broker schedule and drops its retained ticks
 ```
 
 The broker produces ticks while every app process is offline; a later `start()` executes them per misfire policy. Handler failure retries per `delivery`, then increments `failureCount` and drops the slot.
@@ -195,13 +206,15 @@ A lease cannot stop an expired owner writing to external systems afterwards — 
 ```ts
 const e = sync.ephemeral<T>({ id, owner?, ttlMs /* required; seconds resolution */, history?, maxEntries? /* snapshot bound, default 10k */, maxValueBytes? /* default 4 KiB */, replicas? });
 
-await e.upsert({ tenantId?, key, value, ttlMs? });  // → EphemeralEntry { key, value, revision, createdAt, updatedAt, expiresAt }
+await e.upsert({ tenantId?, key, value, ttlMs? });  // → EphemeralEntry { key, value, revision, updatedAt, expiresAt }
+// snapshot/watch entries omit expiresAt (custom per-key TTLs are unknowable on read)
 await e.touch({ tenantId?, key, ttlMs? });          // boolean; republishes last value with fresh TTL
 await e.remove({ tenantId?, key });                 // boolean
 await e.snapshot({ tenantId?, prefix? });           // { entries, revision }; SnapshotOverflowError beyond maxEntries
 for await (const ev of e.watch({ tenantId?, prefix?, after?, signal? })) {
   // { type: "upsert", entry } | { type: "delete"|"expire", key } | { type: "resync_required", requested, firstAvailable }
 }
+// watch without `after` first replays current entries as upserts, then streams changes.
 ```
 
 ## objectStore
@@ -215,11 +228,13 @@ const o = sync.objectStore({
 
 const ref = await o.put({ tenantId?, key, body: ReadableStream, metadata?, signal? });
 // → ObjectRef { storeId, tenantId, key, size, digest } — plain JSON, safe in payloads
-const obj = await o.get(ref);        // StoredObject | null (null if deleted OR replaced since)
+const obj = await o.get(ref, { idleTimeoutMs? }); // StoredObject | null (null if deleted OR replaced since);
+// idleTimeoutMs (default 30s) errors a stalled body instead of hanging forever.
+// metadata keys starting with "sync." are rejected.
 await o.info({ tenantId?, key });    // SyncObjectInfo | null
 await o.delete({ tenantId?, key });  // boolean
 for await (const i of o.list({ tenantId?, prefix? })) {}
-for await (const ev of o.watch({ tenantId?, prefix?, signal? })) {} // put | delete
+for await (const ev of o.watch({ tenantId?, prefix?, signal? })) {} // put | delete — changes only, no initial state
 ```
 
 Refs don't pin: pick `retention.maxAgeMs > max queue residence + retry window + margin`.
@@ -240,4 +255,4 @@ isRetryableTransportError(error);   // network-vocabulary heuristics (no Redis c
 
 ## Errors
 
-`SyncError` base; `SyncLifecycleError`, `UnsupportedServerError`, `InvalidNameError`, `ConflictingResourceDeclarationError`, `ResourceIdentityCollisionError`, `ResourceDriftError { resource, differences }`, `PayloadTooLargeError { actualBytes, maxBytes }`, `ObjectTooLargeError`, `StaleDeliveryError`, `RetentionGapError { requested, firstAvailable }`, `CursorMismatchError`, `BatchSubmitError { accepted, duplicates }`, `SnapshotOverflowError { maxEntries }`.
+`SyncError` base; `SyncLifecycleError`, `UnsupportedServerError`, `InvalidNameError` (name/bounds violations), `SyncUsageError` (API misuse: mutually exclusive options, reader on partitioned queues, foreign ObjectRef, reserved metadata, invalid cron), `NotFoundError` (missing dead letter / schedule), `ConflictingResourceDeclarationError`, `ResourceIdentityCollisionError`, `ResourceDriftError { resource, differences }`, `PayloadTooLargeError { actualBytes, maxBytes }`, `ObjectTooLargeError`, `StaleDeliveryError`, `RetentionGapError { requested, firstAvailable, resumeAfter }`, `CursorMismatchError`, `BatchSubmitError { accepted, duplicates }`, `SnapshotOverflowError { maxEntries }`. Config validation throws plain `RangeError`.

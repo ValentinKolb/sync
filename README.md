@@ -9,7 +9,7 @@ Nine primitives: **queue**, **topic**, **job**, **pump**, **scheduler**, **mutex
 ## Requirements
 
 - NATS Server **2.14+** with JetStream enabled (three-node cluster recommended for production)
-- Bun (or Node 22+) with the official NATS.js 3.4+ client for the connection
+- Bun (or Node 22+) with the official NATS.js client for the connection (Sync pins its own `@nats-io/*` dependencies to exactly 3.4.0)
 - An **already connected, caller-owned** `NatsConnection` — Sync never reads environment variables, loads credentials, or creates infrastructure
 
 ## Installation
@@ -83,7 +83,8 @@ await emails.deadLetters.requeue({ messageId: dead[0].messageId, idempotencyKey:
 - `idempotencyKey` deduplicates within `dedupeWindowMs` (default 2 min), scoped per tenant.
 - `delayMs`/`at` use one-shot NATS message schedules — no consumer slot is occupied while waiting.
 - `reader()` gives manual `ack()` / `retry()` / `deadLetter()` settlement per message.
-- `ordering: { mode: "partitioned", partitions: 64 }` hashes `orderingKey` to a stable partition with strictly serial per-partition delivery. The partition count becomes the global in-flight ceiling; this is for per-aggregate processing, not general fan-out.
+- `ordering: { mode: "partitioned", partitions: 64 }` hashes `orderingKey` to a stable partition with strictly serial per-partition delivery — including across handler failures: partitioned retries happen in place (the delivery is held with heartbeats through the backoff) so younger messages can never overtake a retrying one. The partition count becomes the global in-flight ceiling; this is for per-aggregate processing, not general fan-out.
+- Retention limits (`maxAgeMs`/`maxBytes`) are a hard loss boundary: NATS forbids reject-new on streams with message schedules, so at the limits the **oldest pending work is dropped**. Size them generously.
 
 ## Job
 
@@ -141,7 +142,9 @@ for await (const event of events.follow({ tenantId: workspaceId, after: cursor }
 await events.process({ consumer: "search-indexer", concurrency: 4 }, async (event) => index(event));
 ```
 
-Cursors are opaque and resource-bound (`CursorMismatchError` elsewhere). If a cursor points below the retained window, Sync throws `RetentionGapError` instead of silently skipping — re-snapshot and continue. `live()` events carry no cursor and are suitable for invalidate-then-read, not as durable acceptance evidence.
+Cursors are opaque and resource-bound (`CursorMismatchError` elsewhere). If a cursor points below the retained window — in `replay()`, `follow()`, or a fresh `process({ start: { after } })` consumer — Sync throws `RetentionGapError` instead of silently skipping; its `resumeAfter` cursor resumes from the first retained event without losing it. `live()` events carry no cursor and are suitable for invalidate-then-read, not as durable acceptance evidence.
+
+Two costs to know: `tenantId` on replay/follow is a client-side filter, not a partition — a tenant-scoped read streams the whole topic (all tenants) from the server; for high-volume multi-tenant logs prefer one topic per tenant or a durable `process()` consumer. And the per-consumer DLQ stream is write-only through Sync's API — inspect it with NATS tooling.
 
 ## Pump
 
@@ -168,7 +171,13 @@ Wake-ups are repairable: `process()` reconciles lost wake-ups from KV state on s
 NATS 2.14 message schedules are the clock: the broker produces durable ticks **even while every application process is offline**.
 
 ```ts
-const cron = sync.scheduler({ id: "maintenance" });
+const cron = sync.scheduler({
+  id: "maintenance",
+  // Tick retention is per schedule (age + count). Global byte limits are
+  // deliberately not configurable: with discard-old they would eventually
+  // evict the broker-side schedule definitions and silently stop the clock.
+  retention: { maxAgeMs: 7 * 24 * 3_600_000, maxTicksPerSchedule: 10_000 },
+});
 
 await cron.create({
   id: "cleanup",
@@ -181,10 +190,10 @@ await cron.create({
 });
 
 await cron.start({ concurrency: 4 }); // runs of one schedule never overlap
-await cron.runNow({ id: "cleanup", requestId: "manual-1" }); // durably accepted, idempotent per requestId
+await cron.runNow({ id: "cleanup", requestId: "manual-1" }); // durably accepted
 ```
 
-`misfire: "latest"` coalesces ticks that accumulated during downtime and executes only the newest retained slot — the newest accepted slot is never lost. `runNow` returning means the run is durably accepted, not that it started or finished.
+`misfire: "latest"` coalesces ticks that accumulated during downtime and executes only the newest retained slot — the newest accepted slot is never lost. `runNow` returning means the run is durably accepted, not that it started or finished; repeating a `requestId` deduplicates within the 120 s duplicate window (like every other idempotency key in v6). `delete()` cancels the broker schedule and drops its retained ticks; a later `create()` starts fresh.
 
 ## Mutex
 
@@ -218,7 +227,7 @@ for await (const event of registry.watch({ after: snap.revision })) {
 }
 ```
 
-If the watch revision fell out of history, one explicit `resync_required` event is emitted and the watch ends — take a fresh snapshot; Sync never silently skips ahead. TTLs round up to whole seconds (NATS minimum 1s).
+A watch without `after` starts by replaying the current entries as upserts, then streams changes. If the watch revision fell out of history, one explicit `resync_required` event is emitted and the watch ends — take a fresh snapshot; Sync never silently skips ahead. TTLs round up to whole seconds (NATS minimum 1s); entries read back via snapshot/watch report `updatedAt` and omit `expiresAt` (a reader cannot know custom per-key TTLs).
 
 ## Object store
 
@@ -235,6 +244,8 @@ const ref = await artifacts.put({ key: `runs/${runId}/input`, body: readableStre
 await runs.submit({ key: runId, input: { runId, artifact: ref } });
 
 const stored = await artifacts.get(ref); // null if deleted or replaced since
+// get() bounds the wait between body chunks (idleTimeoutMs, default 30 s):
+// an object purged mid-read errors the stream instead of hanging it.
 ```
 
 Streaming both ways, digest-verified, byte-limited mid-stream (`ObjectTooLargeError`). References do not pin objects: choose bucket retention larger than your maximum queue residence plus retry window, and `delete()` explicitly when an artifact is no longer shared. Permanent end-user files belong in your application's object storage, not here.

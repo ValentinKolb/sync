@@ -1246,3 +1246,51 @@ final for v6:
 11. **Client note:** clusters advertising unreachable routes (Docker-internal
     hostnames) require `ignoreClusterUpdates: true` in the caller's connect
     options.
+
+## Hardening amendments (pre-release review round)
+
+A seven-agent adversarial review plus server probes led to these contract
+changes before the first release:
+
+1. **Scheduler retention is per schedule.** Server-verified: with limits +
+   discard-old, global `max_msgs`/`max_bytes` eviction removes the oldest
+   messages — the `Nats-TTL: never` schedule definitions themselves — and the
+   broker clock stops silently. The scheduler stream now bounds ticks with
+   `max_msgs_per_subject` (`retention.maxTicksPerSchedule`, default 10 000)
+   plus `max_age`; global byte limits are not configurable.
+2. **Queue retention is a documented loss boundary.** NATS rejects
+   discard-new on streams with message schedules (delays live in the work
+   stream), so at the limits the oldest pending work is dropped.
+3. **Partitioned retries run in place.** A nak frees the MaxAckPending=1 slot
+   and lets younger messages overtake during the backoff; partitioned failure
+   retries therefore hold the delivery (heartbeats) through the delay so
+   per-key order survives handler failures.
+4. **Success settlement is separated from failure policy.** An unconfirmable
+   ack after a successful handler (superseded delivery) emits a stale
+   redelivery event; it never invokes onError and never dead-letters
+   completed work.
+5. **No consumer `max_deliver`.** The client-side attempt guard bounds handler
+   runs; unbounded redelivery keeps the DLQ transfer (and scheduler failure
+   accounting) crash-safe on the final attempt.
+6. **`RetentionGapError.resumeAfter`** resumes from the first retained event
+   inclusively (`after` is exclusive); `process({ start: { after } })` on a
+   fresh consumer also gap-checks instead of silently skipping.
+7. **Pump wake-ups are presence-deduplicated.** Per-run wake subjects in the
+   work-queue stream make "pending wake exists" checkable, so repairs
+   (`start()` retries, `reconcile()`) are not defeated by the time-based
+   duplicate window. Terminal run records carry a per-key TTL
+   (`retention.terminalMs`); checkpoints are lease-fenced so a canceled or
+   taken-over run stops dispatching at the next checkpoint.
+8. **`runNow` idempotency is windowed** (120 s duplicate window), consistent
+   with every other idempotency key. `delete()` drops the schedule's retained
+   ticks so re-creation cannot resurrect processed history.
+9. **Ephemeral `touch()` is CAS-guarded** (a heartbeat can never revert a
+   concurrent upsert); read paths omit `expiresAt`; snapshots bound work
+   before fetching values.
+10. **Object store reads are honest.** Infrastructure errors propagate instead
+    of reading as "object gone"; `get()` bodies carry an idle watchdog
+    (default 30 s) so purged/replaced objects error instead of hanging;
+    reserved `sync.*` metadata keys are rejected.
+11. **Error taxonomy:** `SyncUsageError` for API misuse and `NotFoundError`
+    for missing referenced entities complement `InvalidNameError` (true
+    name/bounds violations). Config validation stays `RangeError`.

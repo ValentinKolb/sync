@@ -88,6 +88,7 @@ export {
   ConflictingResourceDeclarationError,
   CursorMismatchError,
   InvalidNameError,
+  NotFoundError,
   ObjectTooLargeError,
   PayloadTooLargeError,
   ResourceDriftError,
@@ -97,6 +98,7 @@ export {
   StaleDeliveryError,
   SyncError,
   SyncLifecycleError,
+  SyncUsageError,
   UnsupportedServerError,
 } from "./src/errors.ts";
 export type { ResourceDifference } from "./src/errors.ts";

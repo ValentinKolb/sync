@@ -61,41 +61,29 @@ jobs:
 
       - name: Create dist package.json
         run: |
-          VERSION=$(node -p "require('./packages/sync/package.json').version")
-          cat > packages/sync/dist/package.json << EOF
-          {
-            "name": "@k2b/sync",
-            "version": "$VERSION",
-            "description": "NATS-native distributed sync primitives for TypeScript and Bun — queue, topic, job, pump, scheduler, mutex, ephemeral, object store, retry",
-            "main": "index.js",
-            "module": "index.js",
-            "types": "index.d.ts",
-            "type": "module",
-            "exports": {
-              ".": {
-                "types": "./index.d.ts",
-                "import": "./index.js"
+          node -e '
+            const fs = require("fs");
+            const src = JSON.parse(fs.readFileSync("packages/sync/package.json", "utf8"));
+            const dist = {
+              name: src.name,
+              version: src.version,
+              description: src.description,
+              main: "index.js",
+              module: "index.js",
+              types: "index.d.ts",
+              type: "module",
+              exports: {
+                ".": { types: "./index.d.ts", import: "./index.js" },
+                "./retry": { types: "./retry.d.ts", import: "./retry.js" },
               },
-              "./retry": {
-                "types": "./retry.d.ts",
-                "import": "./retry.js"
-              }
-            },
-            "dependencies": {
-              "@nats-io/jetstream": "3.4.0",
-              "@nats-io/kv": "3.4.0",
-              "@nats-io/nats-core": "3.4.0",
-              "@nats-io/obj": "3.4.0"
-            },
-            "keywords": ["bun", "nats", "jetstream", "queue", "topic", "jobs", "scheduler", "mutex", "ephemeral", "object-store", "distributed"],
-            "author": "Valentin Kolb",
-            "license": "MIT",
-            "repository": {
-              "type": "git",
-              "url": "git+https://github.com/k2b-dev/sync.git"
-            }
-          }
-          EOF
+              dependencies: src.dependencies,
+              keywords: ["bun", "nats", "jetstream", "queue", "topic", "jobs", "scheduler", "mutex", "ephemeral", "object-store", "distributed"],
+              author: "Valentin Kolb",
+              license: "MIT",
+              repository: { type: "git", url: "git+https://github.com/k2b-dev/sync.git" },
+            };
+            fs.writeFileSync("packages/sync/dist/package.json", JSON.stringify(dist, null, 2) + "\n");
+          '
 
       - name: Copy package docs
         run: |
