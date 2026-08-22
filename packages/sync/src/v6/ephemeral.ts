@@ -107,7 +107,13 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
 
   const getKv = async (): Promise<KV> => {
     await declaration.ready();
-    return kv!;
+    if (kv === null) {
+      // Provisioned by another handle for the same declaration in this
+      // process; bind without creating.
+      const ctx = await runtime.context();
+      kv = await ctx.kvm.open(bucket);
+    }
+    return kv;
   };
 
   // Keys are token-encoded so any UTF-8 tenant/key is KV-safe and injective.

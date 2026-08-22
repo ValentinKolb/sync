@@ -3,6 +3,8 @@ import { createRuntime } from "./runtime.ts";
 import type { DrainResult, SyncConfig, SyncHealth, SyncResourceSummary, SyncRuntime } from "./runtime.ts";
 import { createEphemeral } from "./ephemeral.ts";
 import type { Ephemeral, EphemeralConfig } from "./ephemeral.ts";
+import { createObjectStore } from "./object-store.ts";
+import type { ObjectStore, ObjectStoreConfig } from "./object-store.ts";
 import { createQueue } from "./queue.ts";
 import type { Queue, QueueConfig } from "./queue.ts";
 import { createTopic } from "./topic.ts";
@@ -22,6 +24,7 @@ export type Sync = {
   topic<T>(config: TopicConfig): Topic<T>;
   queue<T>(config: QueueConfig): Queue<T>;
   ephemeral<T>(config: EphemeralConfig): Ephemeral<T>;
+  objectStore(config: ObjectStoreConfig): ObjectStore;
 };
 
 /**
@@ -40,5 +43,6 @@ export const createSync = (config: SyncConfig): Sync => {
     topic: <T>(topicConfig: TopicConfig) => createTopic<T>(runtime, topicConfig),
     queue: <T>(queueConfig: QueueConfig) => createQueue<T>(runtime, queueConfig),
     ephemeral: <T>(ephemeralConfig: EphemeralConfig) => createEphemeral<T>(runtime, ephemeralConfig),
+    objectStore: (objectStoreConfig: ObjectStoreConfig) => createObjectStore(runtime, objectStoreConfig),
   };
 };
