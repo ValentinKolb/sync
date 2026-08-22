@@ -103,10 +103,18 @@ export type Queue<T> = {
 // Internal queue core (shared with job)
 // ==========================
 
-export type QueueCore<T> = {
+export type PreparedSend = {
+  messageId: string;
+  bytes: Uint8Array;
+  byteLength: number;
+};
+
+export type QueueCore<T, D = T> = {
   identity: ResourceIdentity;
   declarationReady(): Promise<void>;
-  send(message: QueueSend<T>): Promise<PublishReceipt>;
+  send(message: QueueSend<T>, ext?: Record<string, JsonValue>): Promise<PublishReceipt>;
+  /** Encode a message now (byte size known), publish it later — for bounded fan-out. */
+  prepareSend(message: QueueSend<T>, ext?: Record<string, JsonValue>): Promise<PreparedSend & { publish(): Promise<PublishReceipt> }>;
   process(
     options: ProcessOptions,
     handler: (message: QueueMessage<T>, envelope: Envelope, msg: JsMsg) => Promise<void>,
@@ -117,7 +125,7 @@ export type QueueCore<T> = {
     }) => Promise<{ action: "retry"; delayMs?: number } | { action: "dead_letter"; reason: string }>,
   ): Promise<Worker>;
   reader(options?: { signal?: AbortSignal }): Promise<QueueReader<T>>;
-  deadLetters: DeadLetterStore<T>;
+  deadLetters: DeadLetterStore<D>;
   maxPayloadBytes: number;
   dedupeWindowMs: number;
 };
@@ -130,11 +138,12 @@ const partitionOf = (orderingKey: string, partitions: number): number => {
 export const scopedMessageId = (tenantId: string, key: string): string =>
   `k.${subjectToken(tenantId, "tenantId")}.${subjectToken(key, "idempotencyKey")}`;
 
-export const createQueueCore = <T>(
+export const createQueueCore = <T, D = T>(
   runtime: SyncRuntime,
-  config: QueueConfig,
+  config: QueueConfig & { dlqMaxAgeMs?: number },
   kind: SyncResourceKind,
-): QueueCore<T> => {
+  deadLetterData: (envelope: Envelope) => D = (envelope) => envelope.data as D,
+): QueueCore<T, D> => {
   const identity = resourceIdentity(runtime.namespace, kind, config.id);
   const owner = config.owner ?? runtime.application;
   const delivery = resolveDelivery(config.delivery);
@@ -181,6 +190,7 @@ export const createQueueCore = <T>(
       ordering,
       maxPayloadBytes,
       replicas,
+      config.dlqMaxAgeMs ?? null,
     ]),
     natsNames: [stream, dlqStream],
     provision: async (ctx: ProvisionContext) => {
@@ -206,7 +216,7 @@ export const createQueueCore = <T>(
         discard: DiscardPolicy.Old,
         storage,
         num_replicas: replicas,
-        max_age: nanos(retention.maxAgeMs),
+        max_age: nanos(config.dlqMaxAgeMs ?? retention.maxAgeMs),
         max_bytes: retention.maxBytes,
         max_msgs: -1,
         max_msg_size: -1,
@@ -274,7 +284,7 @@ export const createQueueCore = <T>(
   // Send
   // ==========================
 
-  const send = async (message: QueueSend<T>): Promise<PublishReceipt> => {
+  const prepareSend: QueueCore<T, D>["prepareSend"] = async (message, ext) => {
     runtime.assertActive();
     await declaration.ready();
     const tenantId = message.tenantId ?? DEFAULT_TENANT;
@@ -294,24 +304,33 @@ export const createQueueCore = <T>(
       publishedAt: new Date().toISOString(),
       ...(message.orderingKey !== undefined ? { orderingKey: message.orderingKey } : {}),
       ...(message.meta !== undefined ? { meta: message.meta } : {}),
-      ext: { messageId },
+      ext: { ...ext, messageId },
     };
     const bytes = encodeEnvelope(label, envelope, maxPayloadBytes);
     const partition = ordering.mode === "partitioned" ? partitionOf(message.orderingKey!, ordering.partitions) : null;
     const target = workSubject(tenantId, partition);
-    const ctx = await runtime.context();
-
     const fireAt = message.at ?? (message.delayMs !== undefined ? new Date(Date.now() + message.delayMs) : null);
-    if (fireAt !== null && fireAt.getTime() > Date.now()) {
-      const delaySubject = `${root}.t.${subjectToken(tenantId, "tenantId")}.delay.${crypto.randomUUID()}`;
-      const ack = await ctx.js.publish(delaySubject, bytes, {
-        msgID: messageId,
-        schedule: { specification: { at: fireAt }, target, ttl: "never" },
-      });
+
+    const publish = async (): Promise<PublishReceipt> => {
+      const ctx = await runtime.context();
+      if (fireAt !== null && fireAt.getTime() > Date.now()) {
+        const delaySubject = `${root}.t.${subjectToken(tenantId, "tenantId")}.delay.${crypto.randomUUID()}`;
+        const ack = await ctx.js.publish(delaySubject, bytes, {
+          msgID: messageId,
+          schedule: { specification: { at: fireAt }, target, ttl: "never" },
+        });
+        return { messageId, streamSequence: ack.seq, duplicate: ack.duplicate };
+      }
+      const ack = await ctx.js.publish(target, bytes, { msgID: messageId });
       return { messageId, streamSequence: ack.seq, duplicate: ack.duplicate };
-    }
-    const ack = await ctx.js.publish(target, bytes, { msgID: messageId });
-    return { messageId, streamSequence: ack.seq, duplicate: ack.duplicate };
+    };
+
+    return { messageId, bytes, byteLength: bytes.byteLength, publish };
+  };
+
+  const send: QueueCore<T, D>["send"] = async (message, ext) => {
+    const prepared = await prepareSend(message, ext);
+    return prepared.publish();
   };
 
   // ==========================
@@ -347,6 +366,7 @@ export const createQueueCore = <T>(
       tenantId,
       publishedAt: new Date().toISOString(),
       ext: {
+        ...envelope?.ext,
         messageId,
         attempts: msg.info.deliveryCount,
         reason,
@@ -548,9 +568,9 @@ export const createQueueCore = <T>(
     return null;
   };
 
-  const toDeadLetter = (envelope: Envelope): DeadLetter<T> => ({
+  const toDeadLetter = (envelope: Envelope): DeadLetter<D> => ({
     messageId: (envelope.ext?.messageId as string) ?? "",
-    data: envelope.data as T,
+    data: deadLetterData(envelope),
     tenantId: envelope.tenantId,
     attempts: (envelope.ext?.attempts as number) ?? 0,
     failedAt: new Date((envelope.ext?.failedAt as string) ?? envelope.publishedAt),
@@ -558,11 +578,11 @@ export const createQueueCore = <T>(
     ...(envelope.ext?.error !== undefined ? { error: envelope.ext.error as string } : {}),
   });
 
-  const deadLetters: DeadLetterStore<T> = {
+  const deadLetters: DeadLetterStore<D> = {
     list: async (options = {}) => {
       await declaration.ready();
       const limit = options.limit ?? 100;
-      const entries: DeadLetter<T>[] = [];
+      const entries: DeadLetter<D>[] = [];
       let skipping = options.after !== undefined;
       for await (const entry of scanDeadLetters()) {
         if (skipping) {
@@ -580,13 +600,18 @@ export const createQueueCore = <T>(
       const entry = await findDeadLetter(input.messageId);
       if (entry === null) throw new InvalidNameError(`dead letter ${input.messageId} not found`);
       const ctx = await runtime.context();
-      const receipt = await send({
-        data: entry.envelope.data as T,
-        tenantId: entry.envelope.tenantId,
-        idempotencyKey: input.idempotencyKey,
-        ...(entry.envelope.orderingKey !== undefined ? { orderingKey: entry.envelope.orderingKey } : {}),
-        ...(entry.envelope.meta !== undefined ? { meta: entry.envelope.meta } : {}),
-      });
+      // Preserve primitive-specific ext fields (e.g. a job key) on requeue.
+      const { attempts: _a, reason: _r, failedAt: _f, error: _e, messageId: _m, ...restExt } = entry.envelope.ext ?? {};
+      const receipt = await send(
+        {
+          data: entry.envelope.data as T,
+          tenantId: entry.envelope.tenantId,
+          idempotencyKey: input.idempotencyKey,
+          ...(entry.envelope.orderingKey !== undefined ? { orderingKey: entry.envelope.orderingKey } : {}),
+          ...(entry.envelope.meta !== undefined ? { meta: entry.envelope.meta } : {}),
+        },
+        restExt,
+      );
       await ctx.jsm.streams.deleteMessage(dlqStream, entry.seq).catch(() => {});
       return receipt;
     },
@@ -603,6 +628,7 @@ export const createQueueCore = <T>(
     identity,
     declarationReady: () => declaration.ready(),
     send,
+    prepareSend,
     process,
     reader,
     deadLetters,
@@ -619,7 +645,7 @@ export const createQueue = <T>(runtime: SyncRuntime, config: QueueConfig): Queue
   const core = createQueueCore<T>(runtime, config, "queue");
   return {
     ready: () => core.declarationReady(),
-    send: core.send,
+    send: (message) => core.send(message),
     process: (options, handler) => core.process(options, (message) => handler(message)),
     reader: core.reader,
     deadLetters: core.deadLetters,

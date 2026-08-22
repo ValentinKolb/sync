@@ -3,6 +3,8 @@ import { createRuntime } from "./runtime.ts";
 import type { DrainResult, SyncConfig, SyncHealth, SyncResourceSummary, SyncRuntime } from "./runtime.ts";
 import { createEphemeral } from "./ephemeral.ts";
 import type { Ephemeral, EphemeralConfig } from "./ephemeral.ts";
+import { createJob } from "./job.ts";
+import type { Job, JobConfig } from "./job.ts";
 import { createMutex } from "./mutex.ts";
 import type { Mutex, MutexConfig } from "./mutex.ts";
 import { createObjectStore } from "./object-store.ts";
@@ -25,6 +27,7 @@ export type Sync = {
 
   topic<T>(config: TopicConfig): Topic<T>;
   queue<T>(config: QueueConfig): Queue<T>;
+  job<Input>(config: JobConfig): Job<Input>;
   ephemeral<T>(config: EphemeralConfig): Ephemeral<T>;
   objectStore(config: ObjectStoreConfig): ObjectStore;
   mutex(config: MutexConfig): Mutex;
@@ -45,6 +48,7 @@ export const createSync = (config: SyncConfig): Sync => {
     events: (options) => runtime.events.subscribe(options),
     topic: <T>(topicConfig: TopicConfig) => createTopic<T>(runtime, topicConfig),
     queue: <T>(queueConfig: QueueConfig) => createQueue<T>(runtime, queueConfig),
+    job: <Input>(jobConfig: JobConfig) => createJob<Input>(runtime, jobConfig),
     ephemeral: <T>(ephemeralConfig: EphemeralConfig) => createEphemeral<T>(runtime, ephemeralConfig),
     objectStore: (objectStoreConfig: ObjectStoreConfig) => createObjectStore(runtime, objectStoreConfig),
     mutex: (mutexConfig: MutexConfig) => createMutex(runtime, mutexConfig),
