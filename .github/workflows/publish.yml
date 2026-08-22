@@ -8,52 +8,26 @@ on:
   pull_request:
 
 jobs:
-  test-server:
-    runs-on: ubuntu-latest
-    services:
-      valkey:
-        image: docker.io/valkey/valkey:8-alpine
-        ports:
-          - 6399:6379
-        options: >-
-          --health-cmd "valkey-cli SET sync:test:sentinel k2b-sync-test-v1 >/dev/null && valkey-cli GET sync:test:sentinel | grep -qx k2b-sync-test-v1"
-          --health-interval 2s
-          --health-timeout 2s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - name: Install dependencies
-        run: bun install --frozen-lockfile --registry=https://registry.npmjs.org
-      - name: Run server tests
-        env:
-          REDIS_URL: redis://localhost:6399
-        run: cd packages/sync && bun test --preload ./tests/preload.ts
-
-  test-browser:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - name: Install dependencies
         run: bun install --frozen-lockfile --registry=https://registry.npmjs.org
-      - name: Run browser tests
-        run: cd packages/sync-browser && bun test tests/*.test.ts
-
-  parity:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
-      - name: Install dependencies
-        run: bun install --frozen-lockfile --registry=https://registry.npmjs.org
-      - name: Typecheck + parity
-        run: |
-          bun run typecheck
-          bun test scripts/*.test.ts
+      - name: Start three-node NATS cluster
+        run: docker compose -f compose.nats.yml up -d --wait
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Script tests
+        run: bun test scripts/*.test.ts
+      - name: Cluster tests
+        run: cd packages/sync && bun run test
+      - name: Serial fault tests
+        run: cd packages/sync && bun run test:serial
 
   publish-sync:
-    needs: [test-server, test-browser, parity]
+    needs: [test]
     if: startsWith(github.ref, 'refs/tags/sync-v')
     runs-on: ubuntu-latest
     permissions:
@@ -76,19 +50,14 @@ jobs:
       - name: Set version from tag
         run: cd packages/sync && npm version ${GITHUB_REF#refs/tags/sync-v} --no-git-tag-version --allow-same-version
 
-      - name: Build server bundle
-        run: bun build ./packages/sync/index.ts --outdir ./packages/sync/dist --target bun
+      - name: Build bundles
+        run: bun build ./packages/sync/index.ts ./packages/sync/retry.ts --outdir ./packages/sync/dist --target bun --packages external
 
-      - name: Build browser modules
-        run: |
-          # Use tsc to preserve the browser module graph.
-          bunx tsc --project packages/sync-browser/tsconfig.json \
-            --declaration \
-            --noEmit false \
-            --outDir packages/sync/dist/browser \
-            --verbatimModuleSyntax false \
-            --allowImportingTsExtensions false \
-            --module ESNext
+      - name: Generate type declarations
+        run: bunx tsc --project packages/sync/tsconfig.json --declaration --emitDeclarationOnly --noEmit false --outDir packages/sync/dist
+
+      - name: Finalize ESM imports
+        run: node scripts/rewrite-esm-imports.mjs packages/sync/dist
 
       - name: Create dist package.json
         run: |
@@ -97,22 +66,28 @@ jobs:
           {
             "name": "@k2b/sync",
             "version": "$VERSION",
-            "description": "Distributed sync primitives for TypeScript and Bun — ratelimit, mutex, queue, topic, job, pump, scheduler, ephemeral, retry",
+            "description": "NATS-native distributed sync primitives for TypeScript and Bun — queue, topic, job, pump, scheduler, mutex, ephemeral, object store, retry",
             "main": "index.js",
             "module": "index.js",
             "types": "index.d.ts",
             "type": "module",
             "exports": {
               ".": {
-                "import": "./index.js",
-                "types": "./index.d.ts"
+                "types": "./index.d.ts",
+                "import": "./index.js"
               },
-              "./browser": {
-                "import": "./browser/index.js",
-                "types": "./browser/index.d.ts"
+              "./retry": {
+                "types": "./retry.d.ts",
+                "import": "./retry.js"
               }
             },
-            "keywords": ["bun", "redis", "valkey", "ratelimit", "mutex", "jobs", "queue", "topic", "pump", "scheduler", "ephemeral", "distributed"],
+            "dependencies": {
+              "@nats-io/jetstream": "3.4.0",
+              "@nats-io/kv": "3.4.0",
+              "@nats-io/nats-core": "3.4.0",
+              "@nats-io/obj": "3.4.0"
+            },
+            "keywords": ["bun", "nats", "jetstream", "queue", "topic", "jobs", "scheduler", "mutex", "ephemeral", "object-store", "distributed"],
             "author": "Valentin Kolb",
             "license": "MIT",
             "repository": {
@@ -128,12 +103,6 @@ jobs:
           cp MIGRATION.md packages/sync/dist/MIGRATION.md
           cp LICENSE packages/sync/dist/LICENSE
 
-      - name: Generate type declarations
-        run: bunx tsc --project packages/sync/tsconfig.json --declaration --emitDeclarationOnly --noEmit false --outDir packages/sync/dist
-
-      - name: Finalize ESM imports
-        run: node scripts/rewrite-esm-imports.mjs packages/sync/dist
-
       - name: Verify packed consumer
         run: |
           PACKAGE_TGZ=$(npm pack --silent)
@@ -144,26 +113,29 @@ jobs:
           npm init -y >/dev/null
           npm install "$PACKAGE_PATH" >/dev/null
           cat > index.mjs <<'EOF'
-          import { job, pump, scheduler, topic } from "@k2b/sync";
-          import { createMemoryStore, migrateLegacyPumpState, topic as browserTopic } from "@k2b/sync/browser";
-          if (![job, pump, scheduler, topic, createMemoryStore, migrateLegacyPumpState, browserTopic].every((value) => typeof value === "function")) {
+          import { createSync, retry, ResourceDriftError } from "@k2b/sync";
+          import { retry as retryOnly, expBackoff } from "@k2b/sync/retry";
+          if (typeof createSync !== "function" || typeof retry !== "function" || typeof retryOnly !== "function" || typeof expBackoff !== "function") {
             throw new Error("packed runtime exports are incomplete");
           }
+          if (typeof ResourceDriftError !== "function") throw new Error("packed error exports are incomplete");
           EOF
           bun index.mjs
           test -f node_modules/@k2b/sync/MIGRATION.md
-          node --input-type=module --eval \
-            'import("@k2b/sync/browser").then((mod) => { if (typeof mod.topic !== "function") throw new Error("packed browser ESM export is incomplete"); })'
           cat > index.ts <<'EOF'
-          import type { PumpConfig, SchedulerControlInfo, TopicReaderConfig } from "@k2b/sync";
-          import type { PumpConfig as BrowserPumpConfig, Store, TopicReaderConfig as BrowserTopicReaderConfig } from "@k2b/sync/browser";
-          declare const serverPump: PumpConfig<{ id: string }, string, { key: string }>;
-          declare const browserPump: BrowserPumpConfig<{ id: string }, string, { key: string }>;
-          declare const store: Store;
-          declare const info: SchedulerControlInfo;
-          const serverReader: TopicReaderConfig = {};
-          const browserReader: BrowserTopicReaderConfig = {};
-          void [serverPump, browserPump, store, info, serverReader, browserReader];
+          import { createSync } from "@k2b/sync";
+          import type { JobConfig, QueueConfig, Sync, SyncConfig, TopicConfig, ObjectRef, PumpConfig, ScheduleContext } from "@k2b/sync";
+          import type { RetryConfig } from "@k2b/sync/retry";
+          declare const config: SyncConfig;
+          const sync: Sync = createSync(config);
+          declare const queueConfig: QueueConfig;
+          declare const jobConfig: JobConfig;
+          declare const topicConfig: TopicConfig;
+          declare const pumpConfig: PumpConfig<{ id: string }, string, { key: string }>;
+          declare const ref: ObjectRef;
+          declare const ctx: ScheduleContext;
+          declare const retryConfig: RetryConfig<number>;
+          void [sync.queue(queueConfig), sync.job(jobConfig), sync.topic(topicConfig), sync.pump(pumpConfig), ref, ctx, retryConfig];
           EOF
           cat > tsconfig.json <<'EOF'
           {

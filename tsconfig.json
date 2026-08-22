@@ -1,7 +1,8 @@
 {
   "references": [
-    { "path": "./packages/sync" },
-    { "path": "./packages/sync-browser" }
+    {
+      "path": "./packages/sync"
+    }
   ],
   "files": []
 }

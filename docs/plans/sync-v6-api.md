@@ -1204,3 +1204,45 @@ Before freezing this proposal as implemented API:
 - [NATS subscription and connection drain](https://docs.nats.io/using-nats/developer/receiving/drain)
 - [NATS.js 3.4 release with NATS Server 2.14 message schedules](https://github.com/nats-io/nats.js/releases/tag/v3.4.0)
 - [NATS Server stream configuration, including message schedules and batch publish](https://github.com/nats-io/nats.docs/blob/master/nats-concepts/jetstream/streams.md)
+
+## Implementation deviations (accepted)
+
+The implementation matched this design except where real NATS 2.14.3 / NATS.js
+3.4.0 behavior forced a smaller or different contract. These deviations are
+final for v6:
+
+1. **Stale acknowledgements are not server-detectable.** NATS accepts a late
+   ack of an already-redelivered-and-settled delivery idempotently. Settlement
+   methods therefore throw `StaleDeliveryError` only when an ack cannot be
+   confirmed at all (e.g. the consumer was deleted), not for superseded
+   deliveries. At-least-once + idempotent handlers remain the contract.
+2. **Scheduler misfire "latest" uses the tick stream, not KV.** A scheduled
+   tick is skipped iff a newer tick exists on the same tick subject
+   (last-message sequence comparison). No KV/queue pseudo-transaction exists,
+   ticks cannot be lost between transition and enqueue, and the newest retained
+   slot always executes.
+3. **Schedule-message vs tick TTL.** The schedule message itself carries
+   `Nats-TTL: never` (proven to survive stream `max_age`). Ticks deliberately
+   carry **no** per-message TTL: `never` would make them immortal; unset means
+   the declared stream retention bounds them — which is the design intent.
+4. **Schedule cancellation** publishes on a dedicated `<root>.cancel` subject
+   because NATS.js rejects `cancelSchedule` on the schedule subject itself.
+5. **Delays live in the work stream.** Message-schedule targets must be in the
+   same stream, and one-shot schedule messages self-purge after firing
+   (`Nats-Schedule-Next: purge`), so queue delay subjects add no residue.
+6. **`reader()` is unpartitioned-only.** Manual settlement on partitioned
+   queues would break serial-per-partition semantics; `process()` covers them.
+7. **Ephemeral TTLs are second-resolution** (NATS per-message TTL minimum 1s;
+   values round up). `touch()` republishes the last value with a fresh TTL.
+   Bounded snapshots throw `SnapshotOverflowError` beyond `maxEntries`.
+8. **`submitMany` byte backpressure.** In addition to `publishConcurrency`,
+   `maxPendingBytes` (default 8 MiB) bounds in-flight encoded publish bytes.
+9. **Pump additions.** `leaseMs` (default 60 s, min 2 s) tunes crash-takeover
+   latency, and `reconcile()` is public; `process()` reconciles on start.
+   Wake-up messages use stable ids `wake.<key>.<kvRevision>`; the KV run
+   record (including the in-page `done` checkpoint list) is the single truth.
+10. **`objectStore.get(ref)` returns `null` for replaced objects** (digest or
+    size mismatch) as well as deleted ones: a ref identifies an exact artifact.
+11. **Client note:** clusters advertising unreachable routes (Docker-internal
+    hostnames) require `ignoreClusterUpdates: true` in the caller's connect
+    options.

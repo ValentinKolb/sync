@@ -6,8 +6,10 @@ if (roots.length === 0) {
   throw new Error("usage: node scripts/rewrite-esm-imports.mjs <directory> [...]");
 }
 
-const withJsExtension = (specifier) =>
-  /\.[cm]?js$|\.json$/.test(specifier) ? specifier : `${specifier}.js`;
+const withJsExtension = (specifier) => {
+  if (/\.[cm]?js$|\.json$/.test(specifier)) return specifier;
+  return `${specifier.replace(/\.ts$/, "")}.js`;
+};
 
 const walk = async (dir) => {
   for (const entry of await readdir(dir, { withFileTypes: true })) {

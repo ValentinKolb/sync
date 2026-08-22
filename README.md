@@ -1,445 +1,301 @@
 # @k2b/sync
 
-Synchronization primitives for TypeScript, published as one package with two runtimes:
+NATS-native distributed synchronization primitives for TypeScript and [Bun](https://bun.sh).
 
-- **`@k2b/sync`**: Redis-backed (6.2+, Valkey, Dragonfly), built for [Bun](https://bun.sh). For horizontally scaled systems where multiple service instances coordinate via shared state.
-- **`@k2b/sync/browser`**: fully in-memory, zero dependencies. For local-first browser apps that want the same primitives without a server.
+Sync v6 is a small, explicit layer over [NATS](https://nats.io) Core, JetStream, KV, and Object Store. It does not hide the distributed semantics: durable work is at-least-once, handlers must be idempotent, ordering exists only where you declare it, and resource configuration drift fails loudly instead of being patched silently.
 
-> Package migration: `@valentinkolb/sync` and the retired `@valentinkolb/sync-browser` package are deprecated. Use `@k2b/sync` and its `/browser` export.
+Nine primitives: **queue**, **topic**, **job**, **pump**, **scheduler**, **mutex**, **ephemeral**, **objectStore**, and the local **retry** helper.
 
-Both runtimes share an **identical public API** — change the import, and code generally works. Type parity is enforced at compile-time (see `parity/`).
+## Requirements
 
-Provides nine modules: **ratelimit**, **mutex**, **queue**, **topic**, **ephemeral**, **job**, **pump**, **scheduler**, and **retry**. They compose — `job` uses `queue` internally, `scheduler` uses `mutex` for leader election.
+- NATS Server **2.14+** with JetStream enabled (three-node cluster recommended for production)
+- Bun (or Node 22+) with the official NATS.js 3.4+ client for the connection
+- An **already connected, caller-owned** `NatsConnection` — Sync never reads environment variables, loads credentials, or creates infrastructure
 
 ## Installation
 
 ```bash
-# Server and browser runtimes
-bun add @k2b/sync
+bun add @k2b/sync @nats-io/transport-node
 ```
 
-No runtime dependencies. TypeScript is a peer dependency.
-
-> **Upgrading?** v4 users must migrate the public API. Deployments on `<=5.8.0`
-> must also complete the durable namespace maintenance in
-> [MIGRATION.md](./MIGRATION.md) before rolling out a newer version.
-
-### Agent Skills (optional)
-
-This repository ships a single `sync` agent skill in [`skills/sync/`](./skills/sync) with one reference file per module plus a v4→v5 migration guide. Install with the [Vercel Skills CLI](https://github.com/vercel-labs/skills):
-
-```bash
-bunx skills add https://github.com/k2b-dev/sync --skill sync
-```
-
----
-
-## Rate Limit
-
-Sliding window rate limiter.
+## Getting started
 
 ```ts
-import { ratelimit, RateLimitError } from "@k2b/sync";
+import { connect } from "@nats-io/transport-node";
+import { createSync } from "@k2b/sync";
 
-const limiter = ratelimit({ id: "api", limit: 100, windowSecs: 60 });
+const connection = await connect({ servers: ["nats://nats-0:4222", "nats://nats-1:4222", "nats://nats-2:4222"] });
 
-const result = await limiter.check("user:123");
-// { limited: false, remaining: 99, resetIn: 58432 }
+const sync = createSync({
+  connection,
+  namespace: "cloud-prod",   // deployment isolation (dev / staging / prod)
+  application: "notebooks",  // ownership + diagnostics metadata
+});
 
-await limiter.checkOrThrow("user:123"); // throws RateLimitError if over
+const runs = sync.job<{ runId: string }>({ id: "workflow-runs" });
+
+await sync.ready(); // verifies the server, provisions resources, fails on drift
 ```
 
-## Mutex
+`createSync()` and the primitive factories perform no I/O. `ready()` verifies the connection and server version, creates missing resources, and compares every existing resource against its declaration — an incompatible difference throws `ResourceDriftError` with a field diff and mutates nothing.
 
-Distributed lock with retry, TTL auto-expiry, owner-only release.
+Shutdown order:
 
 ```ts
-import { mutex, LockError } from "@k2b/sync";
-
-const m = mutex({ id: "checkout", defaultTtl: 5000 });
-
-await m.withLock("order:123", async (lock) => {
-  await m.extend(lock, 10_000);
-  await processOrder();
-});
-
-await m.withLockOrThrow("order:123", async () => {
-  await doExclusiveWork();
-});
+await sync.drain({ timeoutMs: 30_000 }); // stop pulls, finish handlers, nak leftovers
+await connection.drain();                // the connection is yours
 ```
+
+## The two concurrency knobs
+
+These have exactly one meaning everywhere:
+
+- **`process({ concurrency: 64 })`** — at most 64 handlers run simultaneously *in this worker handle in this process*. Never a cluster limit.
+- **`delivery.maxInFlight: 512`** — the durable NATS consumer's global unacknowledged-delivery ceiling (`MaxAckPending`), shared by all pods.
+
+Four pods × `concurrency: 64` with `maxInFlight: 512` ⇒ at most `min(256, 512)` running handlers. A dead pod occupies its unacknowledged slots until `ackWaitMs` expires, then the work is redelivered elsewhere.
+
+Sync pulls messages only for currently free local slots — there is no hidden prefetch buffer, so unclaimed work stays on the server for other pods.
 
 ## Queue
 
-Durable work queue with at-least-once delivery, lease-based visibility, delayed messages, idempotency, DLQ.
+Durable work with at-least-once delivery, competing consumers, delay, retries, and a DLQ.
 
 ```ts
-import { queue } from "@k2b/sync";
-
-const q = queue<{ to: string; subject: string }>({
-  id: "mail.send",
-  delivery: { defaultLeaseMs: 60_000, maxDeliveries: 5 },
+const emails = sync.queue<{ to: string }>({
+  id: "emails",
+  delivery: { ackWaitMs: 30_000, maxAttempts: 5, maxInFlight: 1_000, backoffMs: [1_000, 5_000, 30_000] },
+  retention: { maxAgeMs: 7 * 24 * 3_600_000, maxBytes: 1024 ** 3 },
 });
 
-await q.send({
-  data: { to: "user@example.com", subject: "Welcome" },
-  idempotencyKey: "welcome:user@example.com",
-  delayMs: 5_000,
+await emails.send({ data: { to: "a@example.com" }, idempotencyKey: "welcome:42" });
+await emails.send({ data: { to: "b@example.com" }, delayMs: 60_000 }); // broker-side delay
+
+const worker = await emails.process({ concurrency: 8 }, async (message) => {
+  await deliver(message.data);        // resolves → acked; throws → retried, then DLQ
+  await message.heartbeat();          // long handlers reset ackWait
 });
 
-const msg = await q.recv({ wait: true, timeoutMs: 30_000 });
-if (msg) {
-  try {
-    await sendMail(msg.data);
-    await msg.ack();
-  } catch (err) {
-    await msg.nack({ delayMs: 5_000, error: String(err) });
-  }
-}
+const dead = await emails.deadLetters.list();
+await emails.deadLetters.requeue({ messageId: dead[0].messageId, idempotencyKey: "retry-1" });
 ```
 
-Messages exceeding `maxDeliveries` move to DLQ. Extend active leases with `msg.touch()`. Optional `tenantId` for isolated queues.
-
-## Topic
-
-Pub/sub with Redis Streams. Consumer groups for at-least-once delivery, `live()` for best-effort fan-out.
-
-```ts
-import { topic } from "@k2b/sync";
-
-const t = topic<{ type: string; orderId: string }>({
-  id: "order.events",
-  retentionMs: 7 * 24 * 60 * 60 * 1000,
-});
-
-await t.pub({ data: { type: "order.confirmed", orderId: "o1" } });
-
-const startCursor = (await t.latestCursor()) ?? "0-0";
-
-const reader = t.reader("analytics");
-
-// Recover deliveries abandoned by a crashed consumer. Keep nextCursor between
-// calls so one poison prefix cannot starve later pending entries.
-let recoveryCursor = "0-0";
-do {
-  const batch = await reader.reclaim({ minIdleMs: 60_000, cursor: recoveryCursor });
-  for (const entry of batch.entries) {
-    if (entry.kind === "invalid") {
-      await recordPoisonMessage(entry.eventId, entry.error);
-      await entry.commit();
-      continue;
-    }
-    await process(entry.delivery.data);
-    await entry.delivery.commit();
-  }
-  recoveryCursor = batch.nextCursor;
-} while (recoveryCursor !== "0-0");
-
-// Consumer group (at-least-once, acked)
-for await (const msg of reader.stream()) {
-  await process(msg.data);
-  await msg.commit();
-}
-
-// Live (best-effort, all listeners)
-for await (const event of t.live({ after: startCursor })) {
-  console.log(event.data);
-}
-```
-
-Pass `invalidPayload: "throw"` to `recv()` or `stream()` to receive a
-`TopicPayloadError` for malformed transport envelopes and leave the entry
-pending. The default remains `"ack"` for compatibility. `reclaim()` returns
-pending malformed entries with `kind: "invalid"` so the application can record
-or dead-letter them before acknowledging. The browser runtime keeps at most 256
-uncommitted deliveries per group and persists them when a `Store` is configured.
-`reclaim()` can recover their snapshots until topic retention expires; an
-expired snapshot is discarded only after its event has also left the bounded log.
-
-## Ephemeral
-
-TTL-based key/value with tenant isolation, snapshots with optional prefix filter, and change-stream reader.
-
-```ts
-import { ephemeral } from "@k2b/sync";
-
-const presence = ephemeral<{ userId: string; displayName: string }>({
-  id: "notebook.presence",
-  ttlMs: 30_000,
-});
-
-await presence.upsert({
-  tenantId: "notebook-abc",
-  key: "peer-1",
-  value: { userId: "u1", displayName: "Alice" },
-});
-
-await presence.touch({ tenantId: "notebook-abc", key: "peer-1" });
-
-const snap = await presence.snapshot({ tenantId: "notebook-abc" });
-// Filter by prefix (useful for replacing registry patterns):
-const apps = await presence.snapshot({ prefix: "apps/" });
-
-for await (const event of presence.reader({ tenantId: "notebook-abc" }).stream()) {
-  // event.type: "upsert" | "touch" | "delete" | "expire" | "overflow"
-}
-```
-
-`tenantId` isolates event streams, TTL zones, and `maxEntries` quota. `prefix` filters reads inside a tenant.
+- `idempotencyKey` deduplicates within `dedupeWindowMs` (default 2 min), scoped per tenant.
+- `delayMs`/`at` use one-shot NATS message schedules — no consumer slot is occupied while waiting.
+- `reader()` gives manual `ack()` / `retry()` / `deadLetter()` settlement per message.
+- `ordering: { mode: "partitioned", partitions: 64 }` hashes `orderingKey` to a stable partition with strictly serial per-partition delivery. The partition count becomes the global in-flight ceiling; this is for per-aggregate processing, not general fan-out.
 
 ## Job
 
-Durable background tasks with callback-based lifecycle.
+The normal shape for background tasks: a queue plus a **required idempotent key**, retry policy, and bounded fan-out.
 
 ```ts
-import { job, isRetryableTransportError } from "@k2b/sync";
+const runs = sync.job<{ runId: string }>({ id: "workflow-runs" });
 
-const sendMail = job<{ to: string }, { sent: boolean }>({
-  id: "send-mail",
-  defaults: { leaseMs: 30_000 },
-  trace: async (event) => {
-    await cloudTrace({ source: "send-mail", event });
+await runs.submit({ key: `run:${runId}`, input: { runId } }); // duplicate keys dedupe
+
+await runs.submitMany(
+  runIds.map((runId) => ({ key: `run:${runId}`, input: { runId } })),
+  { publishConcurrency: 128, maxPendingBytes: 8 * 1024 * 1024 }, // bounded promises AND bytes
+);
+
+await runs.process(
+  {
+    concurrency: 64,
+    onError: async ({ context, error }) => {
+      await persistFailure(context.jobId, error);
+      return context.failureCount < 2 ? { action: "retry", delayMs: 5_000 } : { action: "dead_letter", reason: "gave up" };
+    },
   },
-
-  process: async ({ ctx }) => {
-    // ctx.input: { to: string } — typed
-    // ctx.key, ctx.jobId, ctx.failureCount, ctx.duration, ctx.signal, ctx.heartbeat
-    return { sent: true };
+  async (context) => {
+    await runWorkflow(context.input.runId, { signal: context.signal });
   },
-
-  after: async ({ ctx }) => {
-    // ctx.data?: result (on success)
-    // ctx.error?: Error (on failure)
-    // ctx.reschedule({ delayMs }) — re-queue, key stays claimed
-    // ctx.expBackoff({ baseMs, maxMs, jitter }) — helper
-    // ctx.metric — live JobMetrics reference
-
-    if (ctx.error && ctx.failureCount < 3) {
-      ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 1000, maxMs: 30_000 }) });
-    }
-  },
-});
-
-await sendMail.submit({ key: "welcome:42", input: { to: "u@x.com" } });
-sendMail.metric(); // { dispatches, failures, reschedules }
+);
 ```
 
-Key lifecycle: claimed on submit, held during run and pending retry, released on terminal (success or failure without reschedule).
-`trace` is observability-only: handler errors are logged and swallowed. On the server, `submitted` is a best-effort first-delivery-attempt event emitted immediately before the first `started`; it can be delayed by `delayMs` or absent if activation fails before tracing. In the browser runtime, `submitted` is emitted after the local queue accepts a new submission. `finished` fires only after terminal transport completion and key release; a job that calls `ctx.reschedule()` emits `rescheduled` instead.
+Jobs do not store results or expose `join()` — durable domain status belongs in your database. `submitMany` is not atomic: on failure a `BatchSubmitError` reports the accepted and duplicate counts and prior accepted items stay accepted.
 
-**Input is optional** — simple jobs can omit both the input generic and the `input` submit field:
+## Topic
+
+A retained event log with four deliberately different reads:
 
 ```ts
-const sync = job({
-  id: "sync",
-  process: async () => { await doSync(); },
+const events = sync.topic<NotebookEvent>({
+  id: "notebook-events",
+  retention: { maxAgeMs: 24 * 3_600_000, maxBytes: 256 * 1024 * 1024 },
 });
-await sync.submit({ key: "daily" });
+
+const receipt = await events.publish({ data: event, tenantId: workspaceId });
+
+// 1. live(): core NATS broadcast — best-effort, no replay, every listener sees it.
+for await (const event of events.live({ tenantId: workspaceId })) notifySockets(event);
+
+// 2. replay(): from a cursor to the head captured at start, then ends.
+for await (const event of events.replay({ tenantId: workspaceId, after: cursor })) apply(event);
+
+// 3. follow(): like replay but stays open for new events.
+for await (const event of events.follow({ tenantId: workspaceId, after: cursor })) apply(event);
+
+// 4. process(): named durable consumer — pods with the same name compete,
+//    different names own independent cursors.
+await events.process({ consumer: "search-indexer", concurrency: 4 }, async (event) => index(event));
 ```
+
+Cursors are opaque and resource-bound (`CursorMismatchError` elsewhere). If a cursor points below the retained window, Sync throws `RetentionGapError` instead of silently skipping — re-snapshot and continue. `live()` events carry no cursor and are suitable for invalidate-then-read, not as durable acceptance evidence.
 
 ## Pump
 
-Durably drain a cursor-based source into an idempotent consumer, one persisted page at a time.
+Checkpointed draining of a finite source (imports, backfills, reindexing). The KV run record is the truth; per-item checkpoints mean a crash repeats only ambiguous items.
 
 ```ts
-import { pump } from "@k2b/sync";
-
-type Cursor = { internalDate: string; id: string };
-
-const messages = pump<
-  { mailboxId: string; workflowId: string },
-  Cursor,
-  { key: string; messageId: string }
->({
-  id: "mail.sender-rule-backfill",
-
-  pull: async ({ input, cursor, limit, signal }) => {
-    const rows = await loadMessages({
-      mailboxId: input.mailboxId,
-      after: cursor,
-      limit,
-      signal,
-    });
-
-    return {
-      items: rows.map((row) => ({ key: row.id, messageId: row.id })),
-      nextCursor: rows.length === limit
-        ? { internalDate: rows.at(-1)!.internalDate, id: rows.at(-1)!.id }
-        : null,
-    };
-  },
-
-  dispatch: async ({ input, item, signal }) => {
-    await emitWorkflowEvent({
-      scopeId: input.mailboxId,
-      targetWorkflowId: input.workflowId,
-      type: "mail.messageReceived",
-      dedupeKey: item.key,
-      data: { messageId: item.messageId },
-      signal,
-    });
-  },
+const reindex = sync.pump<{ mailbox: string }, string, { key: string }>({
+  id: "mail-reindex",
+  batchSize: 100,
+  dispatchConcurrency: 16,
+  pull: async ({ input, cursor, limit }) => fetchPage(input.mailbox, cursor, limit),
+  dispatch: async ({ item }) => indexItem(item.key), // must be idempotent by item.key
 });
 
-await messages.start({
-  key: "sender-rule:rule-1:revision-4",
-  input: { mailboxId: "mailbox-1", workflowId: "workflow-1" },
-});
-
-await messages.get({ key: "sender-rule:rule-1:revision-4" });
-await messages.cancel({ key: "sender-rule:rule-1:revision-4" });
-messages.stop(); // local worker only; the durable execution is not canceled
+await reindex.start({ key: "mailbox:42", input: { mailbox: "42" } });
+await reindex.process({ concurrency: 4 });
+const state = await reindex.get({ key: "mailbox:42" }); // queued | running | waiting | completed | failed | canceled
 ```
 
-`pump` persists each pulled page before dispatching it and checkpoints the item
-index after every successful dispatch. A crashed node can therefore duplicate
-the current item, but cannot skip it; `dispatch` must use `item.key` with an
-idempotent consumer. The committed cursor advances only after the full page.
-`nextCursor: null` completes the run.
-
-Only `id`, `pull`, and `dispatch` are required. Defaults are `batchSize: 100`,
-no delay between successful pages, a 30-second automatically heartbeated lease,
-10 exponential retry attempts, 128 KiB maximum serialized page size, and seven
-days of terminal-state retention. `input`, `cursor`, items, and `meta` must be
-JSON-serializable. Repeated `start()` calls with the same key return the
-existing execution.
-
-Common durable sinks are `queue.send({ idempotencyKey: item.key })`,
-`job.submit({ key: item.key })`, workflow events with a dedupe key, and
-application-owned idempotent writes. See
-[`skills/sync/references/pump.md`](./skills/sync/references/pump.md) for
-reindexing and external-API examples.
+Wake-ups are repairable: `process()` reconciles lost wake-ups from KV state on start, and `reconcile()` is callable explicitly.
 
 ## Scheduler
 
-Distributed cron with leader election, callback-based dispatch.
+NATS 2.14 message schedules are the clock: the broker produces durable ticks **even while every application process is offline**.
 
 ```ts
-import { scheduler, schedulerControl } from "@k2b/sync";
+const cron = sync.scheduler({ id: "maintenance" });
 
-const sched = scheduler({ id: "platform" });
-
-sched.start();
-
-await sched.create<{ cleaned: number }>({
+await cron.create({
   id: "cleanup",
-  cron: "0 * * * *",
-  tz: "Europe/Berlin",
-  trace: async (event) => {
-    await cloudTrace({ source: "cleanup", event });
-  },
-  process: async ({ ctx }) => {
-    // ctx.scheduleId, ctx.slotTs, ctx.runNumber, ctx.failureCount, ctx.duration, ctx.signal
-    const cleaned = await doCleanup();
-    return { cleaned };
-  },
-  after: async ({ ctx }) => {
-    if (ctx.error && ctx.failureCount < 5) {
-      ctx.reschedule({ delayMs: ctx.expBackoff({ maxMs: 5 * 60_000 }) });
-    }
+  cron: "0 3 * * *",            // five-field cron, minute resolution
+  timezone: "Europe/Berlin",
+  misfire: "latest",             // or "all": execute every retained slot
+  process: async (context) => {
+    await cleanup({ signal: context.signal });
   },
 });
 
-await sched.runNow({ id: "cleanup" });        // manual trigger, no cron advance
-await sched.delete({ id: "cleanup" });          // remove schedule
-await sched.list();                             // all schedules
-sched.metric();                                 // { isLeader, leaderChanges, dispatches, ... }
-
-await sched.stop();
+await cron.start({ concurrency: 4 }); // runs of one schedule never overlap
+await cron.runNow({ id: "cleanup", requestId: "manual-1" }); // durably accepted, idempotent per requestId
 ```
 
-- Multiple pods running the same scheduler id coordinate via mutex-based leader election.
-- After downtime, one persisted overdue slot runs; the scheduler then jumps to the next future cron slot.
-- `ctx.runNumber` is 1-indexed and monotonic, persisted across restarts.
-- `ctx.failureCount` tracks consecutive failures, resets on success.
-- `trace` is per schedule and observability-only. Scheduler traces have no `finished` event because schedules are recurring definitions; use `succeeded`, `failed`, and `rescheduled` for run outcomes.
+`misfire: "latest"` coalesces ticks that accumulated during downtime and executes only the newest retained slot — the newest accepted slot is never lost. `runNow` returning means the run is durably accepted, not that it started or finished.
 
-External processes can trigger a live schedule without owning the handler:
+## Mutex
+
+KV compare-and-set leases with monotonic fencing.
 
 ```ts
-const control = schedulerControl();
+const locks = sync.mutex({ id: "provider-refresh", ttlMs: 10_000 });
 
-await control.list(); // [{ schedulerId, scheduleId, state, cron, tz, meta, ... }]
-await control.runNow({ schedulerId: "platform", scheduleId: "cleanup" });
+const result = await locks.withLock("tenant:42", async (lock) => {
+  // lock.fence is a monotonic bigint — persist and compare it if stale
+  // writes to external systems after lease expiry must be excluded.
+  return refresh(lock.fence);
+});
 ```
 
-`schedulerControl.runNow()` waits until a live scheduler instance with the registered handler accepts the request. It does not wait for the handler's business result. Missing schedules throw `SchedulerControlNotFoundError`; schedules without a live handler throw `SchedulerControlUnavailableError`. The manual run still uses `ctx.trigger === "manual"` and does not advance cron unless `after` calls `ctx.reschedule()`.
+A lease alone cannot stop an expired owner from writing to PostgreSQL afterwards. Consumers needing strict exclusion compare the `fence` or make effects idempotent.
 
-### Batch item retry via job fanout
+## Ephemeral
 
-For "process N items, retry only failed ones" patterns, submit one job per item inside the scheduler's `process`:
+Presence, service registry, and transient state on NATS KV with per-key TTL.
 
 ```ts
-const summarize = job<{ chatId: string }>({
-  id: "summarize-chat",
-  process: async ({ ctx }) => {
-    await aiSummarize(ctx.input.chatId);
-  },
-  after: async ({ ctx }) => {
-    if (ctx.error && ctx.failureCount < 5) {
-      ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 60_000, maxMs: 30 * 60_000 }) });
-    }
-  },
-});
+const registry = sync.ephemeral<{ url: string }>({ id: "services", ttlMs: 15_000 });
 
-await sched.create({
-  id: "summarize-dirty-chats",
-  cron: "*/10 * * * *",
-  process: async () => {
-    for (const chat of await getDirtyChats()) {
-      await summarize.submit({
-        key: `chat:${chat.id}`,    // idempotent per chat — concurrent ticks dedupe
-        input: { chatId: chat.id },
-      });
-    }
-  },
-});
+await registry.upsert({ key: "api/pod-1", value: { url } });
+await registry.touch({ key: "api/pod-1" });          // heartbeat: refresh TTL
+
+const snap = await registry.snapshot({ prefix: "api/" });
+for await (const event of registry.watch({ after: snap.revision })) {
+  // upsert | delete | expire | resync_required
+}
 ```
 
-Each item has its own retry lifecycle. Failed items retry independently. Already-running items skip duplicate submits.
+If the watch revision fell out of history, one explicit `resync_required` event is emitted and the watch ends — take a fresh snapshot; Sync never silently skips ahead. TTLs round up to whole seconds (NATS minimum 1s).
+
+## Object store
+
+Explicit large-artifact storage. Sync **never** auto-offloads oversized payloads — you upload explicitly and pass the returned `ObjectRef` (a plain JSON value) through queues and jobs.
+
+```ts
+const artifacts = sync.objectStore({
+  id: "workflow-artifacts",
+  retention: { maxAgeMs: 7 * 24 * 3_600_000, maxBytes: 100 * 1024 ** 3 },
+  maxObjectBytes: 512 * 1024 ** 2,
+});
+
+const ref = await artifacts.put({ key: `runs/${runId}/input`, body: readableStream });
+await runs.submit({ key: runId, input: { runId, artifact: ref } });
+
+const stored = await artifacts.get(ref); // null if deleted or replaced since
+```
+
+Streaming both ways, digest-verified, byte-limited mid-stream (`ObjectTooLargeError`). References do not pin objects: choose bucket retention larger than your maximum queue residence plus retry window, and `delete()` explicitly when an artifact is no longer shared. Permanent end-user files belong in your application's object storage, not here.
 
 ## Retry
 
-General-purpose retry wrapper with the same callback pattern.
+A local, transport-free helper — also importable from the browser-safe subpath `@k2b/sync/retry`.
 
 ```ts
-import { retry, isRetryableTransportError } from "@k2b/sync";
+import { retry, expBackoff, isRetryableTransportError } from "@k2b/sync/retry";
 
-const user = await retry({
-  run: () => fetchUser(id),
-  after: ({ ctx }) => {
+const result = await retry({
+  run: async () => fetchThing(),
+  after: async ({ ctx }) => {
     if (ctx.error && isRetryableTransportError(ctx.error) && ctx.attempt < 5) {
-      ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 100, maxMs: 5_000 }) });
+      ctx.reschedule({ delayMs: ctx.expBackoff() });
     }
   },
-  signal,
 });
 ```
 
-No `after` defined → first error throws immediately. No `ctx.reschedule` call → terminal.
+## Diagnostics
 
-## Differences between server and browser
-
-The browser runtime (`@k2b/sync/browser`) has parity for the shared public API
-with additive persistence and migration helpers:
-
-- State is in-memory by default. `scheduler`/`mutex`/`ratelimit`/`topic`/`pump`
-  optionally accept `store?: Store`; use `createLocalStorageStore()` when that
-  state must survive a reload.
-- Browser leader election coordinates handles through the selected `Store`.
-  Cross-tab ownership with `localStorage` is best-effort because it has no
-  atomic compare-and-set.
-- Default in-memory stores are process-wide. Handles with the same primitive
-  identity share state; an explicit store creates an explicit persistence scope.
-- `queue`, `job`, and `ephemeral` remain in-memory and do not accept `store`.
-- The browser entrypoint additionally exports `createMemoryStore`,
-  `createLocalStorageStore`, `StoreWriteError`, and
-  `migrateLegacyPumpState()`.
-
-Parity is enforced at compile time:
-```bash
-bun run typecheck:parity
+```ts
+sync.health();            // { state, connection, pendingResources, driftedResources, activeWorkers, activeHandlers, droppedEvents }
+await sync.resources();   // sanitized per-resource summaries (messages, bytes, consumers, DLQ depth, ...)
+for await (const event of sync.events()) { ... } // bounded structured events; slow readers drop events, never block work
 ```
+
+Observers are contained: a throwing or slow observer can never alter transport settlement.
+
+## Resource model
+
+User-provided ids never become raw NATS names. Every resource is identified by `{ namespace, kind, id }`, hashed into stable stream/KV/bucket names (`S6_Q_…`, `KV_S6_E_…`) and lower-case subject tokens (`sync.v6.<ns>.queue.<hash>.t.<tenant>.work`). The full identity, owner, and API version are stamped into resource metadata.
+
+- `owner` defaults to `application`; every application opening a shared resource must declare the same configuration **and** owner.
+- Drift (any semantic difference between declaration and live resource) throws `ResourceDriftError` and never mutates the resource.
+- Two conflicting declarations of one resource in the same process fail before any I/O.
+
+## Semantics you must build on
+
+- Durable delivery (queue, job, durable topic consumers, pump, scheduler) is **at-least-once**. Handlers and sinks must be idempotent.
+- A successful publish/submit means the stream quorum accepted the message — not that a handler ran.
+- A late ack of a delivery that was already redelivered and settled elsewhere is accepted idempotently by NATS; it is not detectable as "stale". `StaleDeliveryError` is thrown when an ack cannot be confirmed at all (e.g. the consumer was deleted).
+- Ordering exists only in partitioned queues (per key) and within a single topic reader.
+- Payload limits are enforced locally on the complete encoded envelope (default 128 KiB; ephemeral values 4 KiB) before publish.
+
+## Development
+
+```bash
+docker compose -f compose.nats.yml up -d --wait  # persistent 3-node NATS 2.14 cluster (ports 14222-14224)
+cd packages/sync
+bun run test         # parallel suite against the real cluster
+bun run test:serial  # fault suite (node restarts) — must run alone
+bun run typecheck
+```
+
+## Migrating from v5
+
+v6 is a hard cut: Redis is gone, `@k2b/sync/browser` is gone, `ratelimit` is gone, and no v5 state is migrated. See [MIGRATION.md](./MIGRATION.md).
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT
