@@ -1,6 +1,8 @@
 import type { SyncEvent } from "./events.ts";
 import { createRuntime } from "./runtime.ts";
 import type { DrainResult, SyncConfig, SyncHealth, SyncResourceSummary, SyncRuntime } from "./runtime.ts";
+import { createEphemeral } from "./ephemeral.ts";
+import type { Ephemeral, EphemeralConfig } from "./ephemeral.ts";
 import { createQueue } from "./queue.ts";
 import type { Queue, QueueConfig } from "./queue.ts";
 import { createTopic } from "./topic.ts";
@@ -19,6 +21,7 @@ export type Sync = {
 
   topic<T>(config: TopicConfig): Topic<T>;
   queue<T>(config: QueueConfig): Queue<T>;
+  ephemeral<T>(config: EphemeralConfig): Ephemeral<T>;
 };
 
 /**
@@ -36,5 +39,6 @@ export const createSync = (config: SyncConfig): Sync => {
     events: (options) => runtime.events.subscribe(options),
     topic: <T>(topicConfig: TopicConfig) => createTopic<T>(runtime, topicConfig),
     queue: <T>(queueConfig: QueueConfig) => createQueue<T>(runtime, queueConfig),
+    ephemeral: <T>(ephemeralConfig: EphemeralConfig) => createEphemeral<T>(runtime, ephemeralConfig),
   };
 };

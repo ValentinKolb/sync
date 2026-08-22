@@ -101,3 +101,13 @@ export class BatchSubmitError extends SyncError {
 }
 
 export const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
+
+/** A bounded snapshot exceeded the configured maxEntries. */
+export class SnapshotOverflowError extends SyncError {
+  readonly maxEntries: number;
+
+  constructor(resource: string, maxEntries: number) {
+    super(`${resource} snapshot exceeds maxEntries (${maxEntries}); narrow the tenant/prefix or raise maxEntries`);
+    this.maxEntries = maxEntries;
+  }
+}
