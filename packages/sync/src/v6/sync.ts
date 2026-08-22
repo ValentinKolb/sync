@@ -3,6 +3,8 @@ import { createRuntime } from "./runtime.ts";
 import type { DrainResult, SyncConfig, SyncHealth, SyncResourceSummary, SyncRuntime } from "./runtime.ts";
 import { createEphemeral } from "./ephemeral.ts";
 import type { Ephemeral, EphemeralConfig } from "./ephemeral.ts";
+import { createMutex } from "./mutex.ts";
+import type { Mutex, MutexConfig } from "./mutex.ts";
 import { createObjectStore } from "./object-store.ts";
 import type { ObjectStore, ObjectStoreConfig } from "./object-store.ts";
 import { createQueue } from "./queue.ts";
@@ -25,6 +27,7 @@ export type Sync = {
   queue<T>(config: QueueConfig): Queue<T>;
   ephemeral<T>(config: EphemeralConfig): Ephemeral<T>;
   objectStore(config: ObjectStoreConfig): ObjectStore;
+  mutex(config: MutexConfig): Mutex;
 };
 
 /**
@@ -44,5 +47,6 @@ export const createSync = (config: SyncConfig): Sync => {
     queue: <T>(queueConfig: QueueConfig) => createQueue<T>(runtime, queueConfig),
     ephemeral: <T>(ephemeralConfig: EphemeralConfig) => createEphemeral<T>(runtime, ephemeralConfig),
     objectStore: (objectStoreConfig: ObjectStoreConfig) => createObjectStore(runtime, objectStoreConfig),
+    mutex: (mutexConfig: MutexConfig) => createMutex(runtime, mutexConfig),
   };
 };
