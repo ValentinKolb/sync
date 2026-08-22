@@ -248,3 +248,84 @@ describe("resource declarations", () => {
     expect(pub?.detail?.messages).toBeGreaterThan(0);
   });
 });
+
+describe("hardening regressions", () => {
+  test("follow on a never-written topic yields the first event ever published", async () => {
+    const topic = sync.topic<Event>(topicConfig("empty-follow"));
+    await topic.ready();
+    const controller = new AbortController();
+    const followed = collect(topic.follow({ signal: controller.signal }), 1);
+    await Bun.sleep(300);
+    await topic.publish({ data: { n: 1 } });
+    expect((await followed).map((e) => e.data.n)).toEqual([1]);
+    controller.abort();
+    // replay on the still-almost-empty topic terminates normally too
+    const replayed = await collect(sync.topic<Event>(topicConfig("empty-follow")).replay());
+    expect(replayed.map((e) => e.data.n)).toEqual([1]);
+  }, 20_000);
+
+  test("RetentionGapError.resumeAfter resumes at the first retained event without losing it", async () => {
+    const topic = sync.topic<Event>(topicConfig("gap-resume"));
+    const first = await topic.publish({ data: { n: 1 } });
+    await topic.publish({ data: { n: 2 } });
+    const third = await topic.publish({ data: { n: 3 } });
+    const jsm = await jetstreamManager(nc);
+    for await (const info of jsm.streams.list()) {
+      if (info.config.metadata?.["sync.id"] === "gap-resume" && !info.config.name.includes("D_")) {
+        await jsm.streams.purge(info.config.name, { seq: Number(third.streamSequence) });
+      }
+    }
+    let gap: RetentionGapError | null = null;
+    try {
+      await collect(topic.replay({ after: first.cursor }));
+    } catch (error) {
+      gap = error as RetentionGapError;
+    }
+    expect(gap).toBeInstanceOf(RetentionGapError);
+    // The documented recovery includes the first retained event (n=3).
+    const resumed = await collect(topic.replay({ after: gap!.resumeAfter }));
+    expect(resumed.map((e) => e.data.n)).toEqual([3]);
+  }, 20_000);
+
+  test("process start.after below the retained window fails instead of skipping", async () => {
+    const topic = sync.topic<Event>(topicConfig("proc-gap"));
+    const first = await topic.publish({ data: { n: 1 } });
+    await topic.publish({ data: { n: 2 } });
+    const third = await topic.publish({ data: { n: 3 } });
+    const jsm = await jetstreamManager(nc);
+    for await (const info of jsm.streams.list()) {
+      if (info.config.metadata?.["sync.id"] === "proc-gap" && !info.config.name.includes("D_")) {
+        await jsm.streams.purge(info.config.name, { seq: Number(third.streamSequence) });
+      }
+    }
+    await expect(
+      topic.process({ consumer: "gapper", start: { after: first.cursor } }, async () => {}),
+    ).rejects.toBeInstanceOf(RetentionGapError);
+  }, 20_000);
+
+  test("pre-aborted signals return immediately instead of hanging", async () => {
+    const topic = sync.topic<Event>(topicConfig("pre-aborted"));
+    await topic.publish({ data: { n: 1 } });
+    const aborted = AbortSignal.abort();
+    const live = await collect(topic.live({ signal: aborted }));
+    expect(live).toEqual([]);
+    const followed = await collect(topic.follow({ signal: aborted }));
+    expect(followed).toEqual([]);
+  }, 15_000);
+
+  test("start latest skips history", async () => {
+    const topic = sync.topic<Event>(topicConfig("latest-start"));
+    await topic.publish({ data: { n: 1 } });
+    await topic.publish({ data: { n: 2 } });
+    const seen: number[] = [];
+    const w = await topic.process({ consumer: "tail", start: "latest" }, async (event) => {
+      seen.push(event.data.n);
+    });
+    await Bun.sleep(400);
+    await topic.publish({ data: { n: 3 } });
+    await waitFor(() => seen.length >= 1, 15_000);
+    await Bun.sleep(200);
+    expect(seen).toEqual([3]);
+    await w.drain();
+  }, 30_000);
+});

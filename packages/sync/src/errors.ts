@@ -73,14 +73,19 @@ export class StaleDeliveryError extends SyncError {}
 /** The requested cursor is older than the retained stream state. */
 export class RetentionGapError extends SyncError {
   readonly requested: string;
+  /** Cursor of the first event that is still retained. */
   readonly firstAvailable: string;
+  /** Pass this as `after` to resume from the first retained event (inclusive). */
+  readonly resumeAfter?: string;
 
-  constructor(requested: string, firstAvailable: string) {
+  constructor(requested: string, firstAvailable: string, resumeAfter?: string) {
     super(
-      `cursor ${requested} is no longer retained; first available is ${firstAvailable} — re-snapshot and continue from there`,
+      `cursor ${requested} is no longer retained; first available is ${firstAvailable}` +
+        (resumeAfter !== undefined ? ` — resume with after=${resumeAfter}` : " — re-snapshot and continue from there"),
     );
     this.requested = requested;
     this.firstAvailable = firstAvailable;
+    if (resumeAfter !== undefined) this.resumeAfter = resumeAfter;
   }
 }
 

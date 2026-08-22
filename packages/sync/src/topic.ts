@@ -2,7 +2,7 @@ import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType }
 import type { Consumer, JsMsg } from "@nats-io/jetstream";
 import { decodeEnvelope, encodeEnvelope } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
-import { confirmedAck, runPullLoop } from "./consume.ts";
+import { confirmedAck, runPullLoop, settleSuccess } from "./consume.ts";
 import { CursorMismatchError, RetentionGapError, asError } from "./errors.ts";
 import { assertName, resourceIdentity, streamName, dlqStreamName, consumerName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
 import type { ResourceIdentity } from "./naming.ts";
@@ -89,6 +89,14 @@ export type Topic<T> = {
 
 const cursorOf = (identity: ResourceIdentity, seq: number): TopicCursor => `s6t.${identity.subjectHash}.${seq}`;
 
+const gapError = (identity: ResourceIdentity, requestedSeq: number, firstRetainedSeq: number): RetentionGapError =>
+  new RetentionGapError(
+    cursorOf(identity, requestedSeq),
+    cursorOf(identity, firstRetainedSeq),
+    // `after` is exclusive: resuming must include the first retained event.
+    cursorOf(identity, Math.max(0, firstRetainedSeq - 1)),
+  );
+
 const parseCursor = (identity: ResourceIdentity, cursor: TopicCursor, label: string): number => {
   const parts = cursor.split(".");
   const seq = Number(parts[2]);
@@ -117,6 +125,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
   const stream = streamName(identity);
   const dlqStream = dlqStreamName(identity);
   const root = subjectRoot(identity);
+  const label = `topic ${config.id}`;
   const eventSubject = (tenantId: string): string => {
     const subject = `${root}.t.${subjectToken(tenantId, "tenantId")}.event`;
     assertSubjectLength(subject);
@@ -212,15 +221,11 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
   const latestCursor: Topic<T>["latestCursor"] = async (options = {}) => {
     await declaration.ready();
     const ctx = await runtime.context();
-    try {
-      const msg = await ctx.jsm.streams.getMessage(stream, {
-        last_by_subj: eventSubject(options.tenantId ?? DEFAULT_TENANT),
-      });
-      return msg === null ? null : cursorOf(identity, msg.seq);
-    } catch (error) {
-      if (/no message found/i.test(asError(error).message)) return null;
-      throw error;
-    }
+    // getMessage maps "no message found" to null in NATS.js 3.4.
+    const msg = await ctx.jsm.streams.getMessage(stream, {
+      last_by_subj: eventSubject(options.tenantId ?? DEFAULT_TENANT),
+    });
+    return msg === null ? null : cursorOf(identity, msg.seq);
   };
 
   const live: Topic<T>["live"] = (options = {}) => {
@@ -233,12 +238,14 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
   async function* liveIterator(tenantId: string, signal?: AbortSignal): AsyncGenerator<TopicLiveEvent<T>> {
     runtime.assertActive();
     await declaration.ready();
+    if (signal?.aborted) return;
     const sub = runtime.nc.subscribe(eventSubject(tenantId));
     runtime.registerLiveSubscription(sub);
     const onAbort = (): void => {
       sub.unsubscribe();
     };
     signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
     try {
       for await (const msg of sub) {
         let envelope: Envelope;
@@ -247,9 +254,13 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
         } catch {
           continue;
         }
+        // Foreign v6-shaped messages without a Sync event identity are skipped
+        // rather than being given a fabricated per-listener id.
+        const eventId = envelope.ext?.eventId;
+        if (typeof eventId !== "string") continue;
         yield {
           data: envelope.data as T,
-          eventId: (envelope.ext?.eventId as string) ?? crypto.randomUUID(),
+          eventId,
           tenantId: envelope.tenantId,
           orderingKey: envelope.orderingKey,
           publishedAt: new Date(envelope.publishedAt),
@@ -268,6 +279,13 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
    * a server-side subject filter so stream sequences stay contiguous: any gap
    * proves messages were removed by retention and is reported explicitly.
    */
+  /**
+   * Durable-log read shared by replay() and follow(). Reads the stream without
+   * a server-side subject filter so stream sequences stay contiguous: any gap
+   * proves messages were removed and is reported explicitly. When the log is
+   * idle, a watchdog re-checks the stream so gaps caused by retention (rather
+   * than observed via a delivered message) surface instead of hanging.
+   */
   async function* logIterator(options: {
     tenantId: string;
     after?: TopicCursor;
@@ -277,15 +295,16 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
   }): AsyncGenerator<TopicEvent<T>> {
     runtime.assertActive();
     await declaration.ready();
+    if (options.signal?.aborted) return;
     const ctx = await runtime.context();
     const info = await ctx.jsm.streams.info(stream);
     const firstSeq = info.state.first_seq;
     const lastSeq = info.state.last_seq;
 
     const afterSeq = options.after === undefined ? null : parseCursor(identity, options.after, "after");
-    let startSeq = afterSeq === null ? firstSeq : afterSeq + 1;
+    const startSeq = afterSeq === null ? firstSeq : afterSeq + 1;
     if (afterSeq !== null && startSeq < firstSeq) {
-      throw new RetentionGapError(cursorOf(identity, startSeq), cursorOf(identity, firstSeq));
+      throw gapError(identity, startSeq, firstSeq);
     }
     const untilSeq = options.until === undefined ? lastSeq : parseCursor(identity, options.until, "until");
     if (!options.follow && (untilSeq < startSeq || lastSeq === 0)) return;
@@ -297,12 +316,42 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     const messages = await consumer.consume({ max_messages: 256 });
     const onAbort = (): void => messages.stop();
     options.signal?.addEventListener("abort", onAbort, { once: true });
-    let expectedSeq = Math.max(startSeq, firstSeq);
+    if (options.signal?.aborted) onAbort();
+    // A brand-new stream reports first_seq 0; the first real sequence is 1.
+    let expectedSeq = Math.max(startSeq, firstSeq, 1);
+    // Without an explicit cursor the caller asked for "earliest available":
+    // the first delivered sequence fixes the baseline (retention may advance
+    // between the info call and delivery).
+    let baselineFixed = afterSeq !== null;
+    const iterator = messages[Symbol.asyncIterator]();
+    let pendingNext: Promise<IteratorResult<Awaited<ReturnType<typeof iterator.next>>["value"]>> | null = null;
     try {
-      for await (const msg of messages) {
+      while (true) {
+        pendingNext ??= iterator.next();
+        const winner = await Promise.race([
+          pendingNext,
+          Bun.sleep(5_000).then(() => "idle" as const),
+        ]);
+        if (winner === "idle") {
+          if (options.signal?.aborted) return;
+          const state = (await ctx.jsm.streams.info(stream)).state;
+          if (state.first_seq > expectedSeq) {
+            // The events we are waiting for were removed while nothing new
+            // arrived to make the gap observable through a delivered message.
+            throw gapError(identity, expectedSeq, state.first_seq);
+          }
+          continue;
+        }
+        pendingNext = null;
+        if (winner.done === true) return;
+        const msg = winner.value;
+        if (!baselineFixed) {
+          expectedSeq = msg.seq;
+          baselineFixed = true;
+        }
         if (msg.seq > expectedSeq) {
-          // Contiguity broken: retention removed messages while reading.
-          throw new RetentionGapError(cursorOf(identity, expectedSeq), cursorOf(identity, msg.seq));
+          // Contiguity broken: messages were removed while reading.
+          throw gapError(identity, expectedSeq, msg.seq);
         }
         expectedSeq = msg.seq + 1;
         let envelope: Envelope | null = null;
@@ -350,18 +399,29 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     const ctx = await runtime.context();
     const delivery = resolveDelivery(options.delivery);
     const tenantId = options.tenantId ?? DEFAULT_TENANT;
-    const durable = consumerName(identity, `${options.consumer}.${tenantId}`);
+    // JSON-encoding keeps ("a.b", "c") and ("a", "b.c") distinct.
+    const durable = consumerName(identity, JSON.stringify([options.consumer, tenantId]));
     const start = options.start ?? "earliest";
     const startSeq = typeof start === "object" ? parseCursor(identity, start.after, "start.after") + 1 : null;
+    if (startSeq !== null) {
+      // A cursor below the retained window must fail like replay/follow do —
+      // a fresh durable would otherwise silently skip to the first retained
+      // event. Only relevant while the consumer does not exist yet; an
+      // existing durable resumes from its own progress.
+      const existing = await ctx.jsm.consumers.info(stream, durable).catch(() => null);
+      if (existing === null) {
+        const state = (await ctx.jsm.streams.info(stream)).state;
+        if (startSeq < state.first_seq) throw gapError(identity, startSeq, state.first_seq);
+      }
+    }
 
     await ensureConsumer(ctx, stream, {
       durable_name: durable,
       ack_policy: AckPolicy.Explicit,
       filter_subject: eventSubject(tenantId),
       ack_wait: nanos(delivery.ackWaitMs),
-      // One extra delivery beyond the handler attempts guarantees the DLQ
-      // transfer happens even when the process dies on the final attempt.
-      max_deliver: delivery.maxAttempts + 1,
+      // No max_deliver: the client-side attempt guard bounds handler runs and
+      // unbounded redelivery keeps the DLQ transfer crash-safe.
       max_ack_pending: delivery.maxInFlight,
       deliver_policy:
         startSeq !== null ? DeliverPolicy.StartSequence : start === "latest" ? DeliverPolicy.New : DeliverPolicy.All,
@@ -391,7 +451,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
       await ctx.js.publish(dlqSubject(options.consumer), bytes, {
         msgID: `dlq.${subjectToken(options.consumer, "consumer")}.${eventId}`,
       });
-      await confirmedAck(msg, config.id).catch(() => {});
+      await confirmedAck(msg, label).catch(() => {});
       runtime.events.emit({
         type: "dead_letter",
         resource: config.id,
@@ -415,7 +475,6 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
       }
       try {
         await handler({ ...toEvent(envelope, msg.seq), attempt, signal });
-        await confirmedAck(msg, config.id);
       } catch (error) {
         if (signal.aborted) {
           msg.nak();
@@ -434,7 +493,11 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
             detail: { consumer: options.consumer, attempt },
           });
         }
+        return;
       }
+      // Success settles outside the failure logic: an unconfirmable ack means
+      // the delivery was superseded — never a handler failure.
+      await settleSuccess(msg, label, runtime.events, "topic");
     };
 
     const getConsumer = (): Promise<Consumer> => ctx.js.consumers.get(stream, durable);
