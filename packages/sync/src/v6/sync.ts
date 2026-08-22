@@ -1,6 +1,8 @@
 import type { SyncEvent } from "./events.ts";
 import { createRuntime } from "./runtime.ts";
 import type { DrainResult, SyncConfig, SyncHealth, SyncResourceSummary, SyncRuntime } from "./runtime.ts";
+import { createQueue } from "./queue.ts";
+import type { Queue, QueueConfig } from "./queue.ts";
 import { createTopic } from "./topic.ts";
 import type { Topic, TopicConfig } from "./topic.ts";
 
@@ -16,6 +18,7 @@ export type Sync = {
   events(options?: { signal?: AbortSignal }): AsyncIterable<SyncEvent>;
 
   topic<T>(config: TopicConfig): Topic<T>;
+  queue<T>(config: QueueConfig): Queue<T>;
 };
 
 /**
@@ -32,5 +35,6 @@ export const createSync = (config: SyncConfig): Sync => {
     resources: () => runtime.resources(),
     events: (options) => runtime.events.subscribe(options),
     topic: <T>(topicConfig: TopicConfig) => createTopic<T>(runtime, topicConfig),
+    queue: <T>(queueConfig: QueueConfig) => createQueue<T>(runtime, queueConfig),
   };
 };

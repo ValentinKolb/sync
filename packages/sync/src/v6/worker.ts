@@ -132,6 +132,14 @@ export const createWorkerRuntime = (
           setTimeout(resolve, 50);
         });
       }
+      if (active > 0 && !finished) {
+        // A handler ignored its abort signal. Count it as aborted and finish
+        // the worker so later drains do not wait for it again; its deliveries
+        // are recovered by other processes after ackWait expiry.
+        aborted += active;
+        finished = true;
+        hooks.onFinished?.();
+      }
     }
   };
 
