@@ -1,7 +1,7 @@
 {
   "name": "@k2b/sync",
   "version": "5.7.0",
-  "description": "Distributed sync primitives for TypeScript and Bun — ratelimit, mutex, queue, topic, job, pump, scheduler, ephemeral, retry",
+  "description": "Distributed sync primitives for TypeScript and Bun \u2014 ratelimit, mutex, queue, topic, job, pump, scheduler, ephemeral, retry",
   "module": "index.ts",
   "type": "module",
   "exports": {
@@ -12,7 +12,9 @@
     "test": "REDIS_URL=redis://127.0.0.1:6399 bun test --preload ./tests/preload.ts",
     "test:fault": "REDIS_URL=redis://127.0.0.1:6399 bun test --preload ./tests/preload.ts tests/fault-*.test.ts",
     "test:all": "REDIS_URL=redis://127.0.0.1:6399 bun test --preload ./tests/preload.ts tests/*.test.ts",
-    "typecheck": "bunx tsc --noEmit"
+    "typecheck": "bunx tsc --noEmit",
+    "test:v6": "bun test --preload ./tests/v6/preload.ts tests/v6/*.test.ts",
+    "test:v6:serial": "bun test --preload ./tests/v6/preload.ts tests/v6/serial/fault.test.ts && bun test --preload ./tests/v6/preload.ts tests/v6/serial/probe.test.ts"
   },
   "peerDependencies": {
     "typescript": "^5"
