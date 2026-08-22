@@ -1,0 +1,75 @@
+# Persistent three-node NATS JetStream cluster for @k2b/sync v6 tests.
+#
+# Pinned to NATS Server 2.14.x (message schedules, per-key KV TTL).
+# Ports are intentionally non-default so running Cloud containers and any
+# local NATS installation are never touched:
+#   clients    127.0.0.1:14222-14224
+#   monitoring 127.0.0.1:18222-18224
+#
+# Usage: docker compose -f compose.nats.yml up -d --wait
+
+x-nats-common: &nats-common
+  image: nats:2.14.3-alpine
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8222/healthz?js-enabled-only=true"]
+    interval: 2s
+    timeout: 2s
+    retries: 15
+
+services:
+  nats-1:
+    <<: *nats-common
+    container_name: sync_test_nats_1
+    command: >-
+      --name sync-test-nats-1
+      --cluster_name sync-test
+      --jetstream
+      --store_dir /data
+      --cluster nats://0.0.0.0:6222
+      --routes nats-route://nats-1:6222,nats-route://nats-2:6222,nats-route://nats-3:6222
+      --http_port 8222
+    ports:
+      - "127.0.0.1:14222:4222"
+      - "127.0.0.1:18222:8222"
+    volumes:
+      - sync_test_nats_1:/data
+
+  nats-2:
+    <<: *nats-common
+    container_name: sync_test_nats_2
+    command: >-
+      --name sync-test-nats-2
+      --cluster_name sync-test
+      --jetstream
+      --store_dir /data
+      --cluster nats://0.0.0.0:6222
+      --routes nats-route://nats-1:6222,nats-route://nats-2:6222,nats-route://nats-3:6222
+      --http_port 8222
+    ports:
+      - "127.0.0.1:14223:4222"
+      - "127.0.0.1:18223:8222"
+    volumes:
+      - sync_test_nats_2:/data
+
+  nats-3:
+    <<: *nats-common
+    container_name: sync_test_nats_3
+    command: >-
+      --name sync-test-nats-3
+      --cluster_name sync-test
+      --jetstream
+      --store_dir /data
+      --cluster nats://0.0.0.0:6222
+      --routes nats-route://nats-1:6222,nats-route://nats-2:6222,nats-route://nats-3:6222
+      --http_port 8222
+    ports:
+      - "127.0.0.1:14224:4222"
+      - "127.0.0.1:18224:8222"
+    volumes:
+      - sync_test_nats_3:/data
+
+volumes:
+  sync_test_nats_1:
+  sync_test_nats_2:
+  sync_test_nats_3:
