@@ -1,10 +1,11 @@
 import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType } from "@nats-io/jetstream";
 import type { JsMsg } from "@nats-io/jetstream";
 import type { KV } from "@nats-io/kv";
+import { headers as natsHeaders } from "@nats-io/nats-core";
 import { decodeJson, encodeJson } from "./codec.ts";
 import type { JsonValue } from "./codec.ts";
 import { runPullLoop } from "./consume.ts";
-import { asError } from "./errors.ts";
+import { PayloadTooLargeError, asError } from "./errors.ts";
 import { assertName, resourceIdentity, subjectRoot, subjectToken, decodeSubjectToken } from "./naming.ts";
 import { ensureConsumer, ensureKv, ensureStream } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
@@ -57,6 +58,7 @@ export type PumpState<Input, Cursor> = {
   dispatched: number;
   failureCount: number;
   lastError?: string;
+  meta?: MessageMeta;
   createdAt: Date;
   updatedAt: Date;
 };
@@ -106,6 +108,9 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
   const terminalMs = config.retention?.terminalMs ?? 7 * 24 * 60 * 60 * 1_000;
   const maxAttempts = config.retry?.maxAttempts ?? 5;
   const backoffMs = config.retry?.backoffMs ?? [1_000, 5_000, 30_000];
+  if (!Array.isArray(backoffMs) || backoffMs.length === 0 || backoffMs.some((ms) => !Number.isSafeInteger(ms) || ms <= 0)) {
+    throw new RangeError("retry.backoffMs must be a non-empty array of positive integers");
+  }
   const leaseMs = config.leaseMs ?? 60_000;
   if (!Number.isSafeInteger(leaseMs) || leaseMs < 2_000) {
     throw new RangeError("leaseMs must be an integer of at least 2000");
@@ -125,7 +130,8 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
   const wakeStream = `S6_PQ_${identity.hash}`;
   const wakeDurable = `S6_PQC_${identity.hash}`;
   const root = subjectRoot(identity);
-  const wakeSubject = `${root}.wake`;
+  const wakeFilter = `${root}.wake.>`;
+  const wakeSubject = (key: string): string => `${root}.wake.${subjectToken(key, "pump key")}`;
   const label = `pump ${config.id}`;
 
   let kv: KV | null = null;
@@ -156,16 +162,16 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
       });
       await ensureStream(ctx, identity, owner, {
         name: wakeStream,
-        subjects: [wakeSubject],
+        subjects: [wakeFilter],
         retention: RetentionPolicy.Workqueue,
         discard: DiscardPolicy.Old,
         storage,
         num_replicas: replicas,
-        max_age: nanos(terminalMs),
+        // Wake-ups live until consumed; the KV record is the actual state.
+        max_age: 0,
         max_bytes: 64 * 1024 * 1024,
         max_msgs: -1,
         max_msg_size: -1,
-        duplicate_window: nanos(120_000),
       });
     },
     summary: async (ctx: ProvisionContext) => {
@@ -205,33 +211,46 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
     }
   };
 
-  /** CAS write; returns the new revision or null when the record moved underneath us. */
+  /**
+   * CAS write; returns the new revision or null when the record moved
+   * underneath us. Terminal records carry a per-key TTL so run state expires
+   * after retention.terminalMs instead of growing the bucket forever.
+   */
   const casWrite = async (
     key: string,
     record: PumpRecord<Input, Cursor, Item>,
     previousRevision: number,
   ): Promise<number | null> => {
-    const store = await getKv();
+    await getKv();
     record.updatedAt = new Date().toISOString();
     const bytes = encodeJson(label, record, maxPageBytes);
+    const ctx = await runtime.context();
+    const hdrs = natsHeaders();
+    hdrs.set("Nats-Expected-Last-Subject-Sequence", String(previousRevision));
+    if (TERMINAL.includes(record.status)) {
+      hdrs.set("Nats-TTL", `${Math.max(1, Math.ceil(terminalMs / 1_000))}s`);
+    }
     try {
-      if (previousRevision === 0) {
-        return await store.create(runKey(key), bytes);
-      }
-      return await store.update(runKey(key), bytes, previousRevision);
+      const ack = await ctx.js.publish(`$KV.${bucket}.${runKey(key)}`, bytes, { headers: hdrs });
+      return ack.seq;
     } catch (error) {
-      if (/wrong last sequence|already exists/i.test(asError(error).message)) return null;
+      if (/wrong last sequence/i.test(asError(error).message)) return null;
       throw error;
     }
   };
 
-  const publishWake = async (key: string, revision: number): Promise<void> => {
+  /**
+   * Enqueue a wake-up unless one is already pending. Work-queue retention
+   * makes presence meaningful: a consumed wake-up is gone, a pending or
+   * in-flight one is still in the stream — so repair publishes (start()
+   * retries, reconcile) are deduplicated by presence, not by a time window.
+   */
+  const publishWake = async (key: string): Promise<void> => {
     const ctx = await runtime.context();
-    // The stable message ID makes wake-ups repairable: re-enqueueing the same
-    // run revision dedupes, a new revision wakes again.
-    await ctx.js.publish(wakeSubject, encodeJson(label, { key }, 4_096), {
-      msgID: `wake.${subjectToken(key, "pump key")}.${revision}`,
-    });
+    const subject = wakeSubject(key);
+    const pending = await ctx.jsm.streams.getMessage(wakeStream, { last_by_subj: subject }).catch(() => null);
+    if (pending !== null) return;
+    await ctx.js.publish(subject, encodeJson(label, { key }, 4_096));
   };
 
   const toState = (record: PumpRecord<Input, Cursor, Item>): PumpState<Input, Cursor> => ({
@@ -242,6 +261,7 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
     dispatched: record.dispatched,
     failureCount: record.failureCount,
     ...(record.lastError !== undefined ? { lastError: record.lastError } : {}),
+    ...(record.meta !== undefined ? { meta: record.meta } : {}),
     createdAt: new Date(record.createdAt),
     updatedAt: new Date(record.updatedAt),
   });
@@ -254,7 +274,12 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
     runtime.assertActive();
     await declaration.ready();
     const existing = await load(input.key);
-    if (existing !== null && !TERMINAL.includes(existing.record.status)) return; // idempotent
+    if (existing !== null && !TERMINAL.includes(existing.record.status)) {
+      // Idempotent — but re-enqueue the wake-up: if the original one was lost
+      // (crash between record write and publish), retrying start() repairs it.
+      await publishWake(input.key);
+      return;
+    }
     const now = new Date().toISOString();
     const record: PumpRecord<Input, Cursor, Item> = {
       key: input.key,
@@ -268,8 +293,8 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
       updatedAt: now,
     };
     const revision = await casWrite(input.key, record, existing?.revision ?? 0);
-    if (revision === null) return; // lost a concurrent start — that start enqueued the wake-up
-    await publishWake(input.key, revision);
+    if (revision === null) return; // lost a concurrent start — that start enqueues the wake-up
+    await publishWake(input.key);
   };
 
   const get: Pump<Input, Cursor>["get"] = async (input) => {
@@ -295,11 +320,15 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
     let requeued = 0;
     const keys = await store.keys("run.>");
     for await (const rawKey of keys) {
-      const key = decodeSubjectToken(rawKey.slice("run.".length));
-      const loaded = await load(key);
-      if (loaded === null || TERMINAL.includes(loaded.record.status)) continue;
-      await publishWake(key, loaded.revision);
-      requeued += 1;
+      try {
+        const key = decodeSubjectToken(rawKey.slice("run.".length));
+        const loaded = await load(key);
+        if (loaded === null || TERMINAL.includes(loaded.record.status)) continue;
+        await publishWake(key);
+        requeued += 1;
+      } catch {
+        // A foreign/tampered key must not block reconciliation of the rest.
+      }
     }
     if (requeued > 0) {
       runtime.events.emit({ type: "pump_recovered", resource: config.id, kind: "pump", detail: { requeued } });
@@ -311,7 +340,7 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
   // Run execution
   // ==========================
 
-  /** Executes one run to a terminal, waiting, or lease-blocked outcome. */
+  /** Executes one run to a terminal, waiting, lease-blocked, or lease-lost outcome. */
   const executeRun = async (key: string, msg: JsMsg, signal: AbortSignal): Promise<void> => {
     const leaseToken = crypto.randomUUID();
     let loaded = await load(key);
@@ -342,48 +371,72 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
     }
 
     let { record, revision } = loaded;
+    /** Set once this worker no longer owns the run (canceled or lease taken over). */
+    let lost = false;
+    /** Serialized so concurrent dispatch checkpoints never race their own CAS. */
+    let checkpointChain: Promise<boolean> = Promise.resolve(true);
 
-    /** CAS with lease refresh; on external change reloads and returns false. */
-    const checkpoint = async (mutate: (r: PumpRecord<Input, Cursor, Item>) => void): Promise<boolean> => {
-      const next = { ...record, lease: { token: leaseToken, until: new Date(Date.now() + leaseMs).toISOString() } };
-      mutate(next);
-      const newRevision = await casWrite(key, next, revision);
-      msg.working();
-      if (newRevision === null) {
-        const reloaded = await load(key);
-        if (reloaded !== null) ({ record, revision } = reloaded);
-        return false;
-      }
-      record = next;
-      revision = newRevision;
-      return true;
+    /**
+     * CAS with lease refresh. Returns false and marks the run as lost when the
+     * record was changed by someone else (cancel, takeover): after that this
+     * worker must stop dispatching and must not write again.
+     */
+    const checkpoint = (mutate: (r: PumpRecord<Input, Cursor, Item>) => void): Promise<boolean> => {
+      const step = checkpointChain.then(async () => {
+        if (lost) return false;
+        const next = { ...record, lease: { token: leaseToken, until: new Date(Date.now() + leaseMs).toISOString() } };
+        mutate(next);
+        const newRevision = await casWrite(key, next, revision);
+        if (newRevision === null) {
+          const reloaded = await load(key);
+          if (reloaded !== null) ({ record, revision } = reloaded);
+          if (
+            reloaded === null ||
+            TERMINAL.includes(reloaded.record.status) ||
+            reloaded.record.lease?.token !== leaseToken
+          ) {
+            lost = true;
+          }
+          return false;
+        }
+        record = next;
+        revision = newRevision;
+        msg.working();
+        return true;
+      });
+      checkpointChain = step.catch(() => false);
+      return step;
     };
 
-    const fail = async (error: Error): Promise<void> => {
+    const fail = async (error: Error, options: { dropPage?: boolean } = {}): Promise<void> => {
       const failureCount = record.failureCount + 1;
-      if (failureCount >= maxAttempts) {
-        await checkpoint((r) => {
-          r.status = "failed";
-          r.failureCount = failureCount;
-          r.lastError = error.message;
-          r.lease = undefined;
-        });
-        runtime.events.emit({ type: "handler_error", resource: config.id, kind: "pump", error: error.message });
-        msg.ack();
+      const terminal = failureCount >= maxAttempts;
+      await checkpoint((r) => {
+        r.status = terminal ? "failed" : "waiting";
+        r.failureCount = failureCount;
+        r.lastError = error.message.slice(0, 2_048);
+        r.lease = undefined;
+        // Only when the page itself cannot be persisted (oversized) is it
+        // dropped; ordinary failures keep the per-item done[] checkpoints.
+        if (options.dropPage) delete r.page;
+      });
+      if (lost) {
+        msg.nak();
         return;
       }
-      await checkpoint((r) => {
-        r.status = "waiting";
-        r.failureCount = failureCount;
-        r.lastError = error.message;
-        r.lease = undefined;
-      });
-      msg.nak(backoffMs[Math.min(failureCount - 1, backoffMs.length - 1)]!);
+      runtime.events.emit({ type: "handler_error", resource: config.id, kind: "pump", error: error.message });
+      if (terminal) msg.ack();
+      else msg.nak(backoffMs[Math.min(failureCount - 1, backoffMs.length - 1)]!);
     };
 
     while (true) {
+      if (lost) {
+        // Canceled or taken over: the current owner's state stands; this
+        // delivery is stale and simply returns to the wake queue.
+        msg.nak();
+        return;
+      }
       if (signal.aborted || TERMINAL.includes(record.status)) {
-        // Canceled externally or shutting down: release the lease, keep state.
         if (TERMINAL.includes(record.status)) msg.ack();
         else {
           await checkpoint((r) => {
@@ -413,23 +466,40 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
             r.status = "completed";
             r.lease = undefined;
           });
+          if (lost) {
+            msg.nak();
+            return;
+          }
           msg.ack();
           return;
         }
-        if (!(await checkpoint((r) => {
-          r.page = { items: pulled.items, done: [], nextCursor: pulled.nextCursor };
-        }))) continue; // externally changed (e.g. canceled) — re-evaluate
+        let wrote: boolean;
+        try {
+          wrote = await checkpoint((r) => {
+            r.page = { items: pulled.items, done: [], nextCursor: pulled.nextCursor };
+          });
+        } catch (error) {
+          if (error instanceof PayloadTooLargeError) {
+            // An unpersistable page must go through the retry/failure policy,
+            // never into an infinite redelivery loop.
+            await fail(error, { dropPage: true });
+            return;
+          }
+          throw error;
+        }
+        if (!wrote) continue; // externally changed — re-evaluate at loop head
       }
 
       // 2. Dispatch remaining page items with bounded concurrency, checkpointing
       //    each completed item key individually. A crash repeats only items
       //    whose sink succeeded after their last confirmed checkpoint.
       const page = record.page!;
-      const remaining = page.items.filter((item) => !page.done.includes(item.key));
+      const doneKeys = new Set(page.done);
+      const remaining = page.items.filter((item) => !doneKeys.has(item.key));
       let dispatchError: Error | null = null;
       let index = 0;
       const workers = Array.from({ length: Math.min(dispatchConcurrency, remaining.length) }, async () => {
-        while (dispatchError === null && !signal.aborted) {
+        while (dispatchError === null && !signal.aborted && !lost) {
           const item = remaining[index++];
           if (item === undefined) return;
           try {
@@ -438,17 +508,27 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
             dispatchError = asError(error);
             return;
           }
-          await checkpoint((r) => {
-            r.page?.done.push(item.key);
-          });
+          try {
+            await checkpoint((r) => {
+              r.page?.done.push(item.key);
+            });
+          } catch (error) {
+            if (error instanceof PayloadTooLargeError) {
+              dispatchError = error;
+              return;
+            }
+            throw error;
+          }
         }
       });
       await Promise.all(workers);
-      if (dispatchError !== null) {
-        await fail(dispatchError);
+      // TS cannot see the closure writes above and narrows to null.
+      const failedDispatch = dispatchError as Error | null;
+      if (failedDispatch !== null) {
+        await fail(failedDispatch, { dropPage: failedDispatch instanceof PayloadTooLargeError });
         return;
       }
-      if (signal.aborted || TERMINAL.includes(record.status)) continue; // handled at loop head
+      if (lost || signal.aborted || TERMINAL.includes(record.status)) continue; // handled at loop head
 
       // 3. Page complete: advance the committed cursor, clear the page.
       const finished = record.page!;
@@ -478,7 +558,7 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
     await ensureConsumer(ctx, wakeStream, {
       durable_name: wakeDurable,
       ack_policy: AckPolicy.Explicit,
-      filter_subject: wakeSubject,
+      filter_subject: wakeFilter,
       ack_wait: nanos(leaseMs),
       max_ack_pending: maxActiveRuns,
       deliver_policy: DeliverPolicy.All,
