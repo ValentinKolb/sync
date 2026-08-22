@@ -13,6 +13,8 @@ import { createObjectStore } from "./object-store.ts";
 import type { ObjectStore, ObjectStoreConfig } from "./object-store.ts";
 import { createQueue } from "./queue.ts";
 import type { Queue, QueueConfig } from "./queue.ts";
+import { createScheduler } from "./scheduler.ts";
+import type { Scheduler, SchedulerConfig } from "./scheduler.ts";
 import { createTopic } from "./topic.ts";
 import type { Topic, TopicConfig } from "./topic.ts";
 
@@ -34,6 +36,7 @@ export type Sync = {
   objectStore(config: ObjectStoreConfig): ObjectStore;
   mutex(config: MutexConfig): Mutex;
   pump<Input, Cursor, Item extends PumpItem>(config: PumpConfig<Input, Cursor, Item>): Pump<Input, Cursor>;
+  scheduler(config: SchedulerConfig): Scheduler;
 };
 
 /**
@@ -57,5 +60,6 @@ export const createSync = (config: SyncConfig): Sync => {
     mutex: (mutexConfig: MutexConfig) => createMutex(runtime, mutexConfig),
     pump: <Input, Cursor, Item extends PumpItem>(pumpConfig: PumpConfig<Input, Cursor, Item>) =>
       createPump<Input, Cursor, Item>(runtime, pumpConfig),
+    scheduler: (schedulerConfig: SchedulerConfig) => createScheduler(runtime, schedulerConfig),
   };
 };
