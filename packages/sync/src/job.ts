@@ -60,9 +60,9 @@ export type Job<Input> = {
     options?: JobSubmitManyOptions,
   ): Promise<{ accepted: number; duplicates: number }>;
   /**
-   * Atomic all-or-nothing submission of up to 1000 jobs. Unlike submit(), keys
-   * are NOT deduplicated (NATS batches carry no message ids) — resubmitting a
-   * committed batch duplicates its jobs.
+   * Atomic all-or-nothing submission of up to 1000 jobs (no delays). Unlike
+   * submit(), keys are NOT deduplicated (NATS batches carry no message ids) —
+   * resubmitting a committed batch duplicates its jobs.
    */
   submitBatch(jobs: JobSubmit<Input>[]): Promise<BatchReceipt>;
   /** Pause delivery on the durable consumer — global, all pods. Submissions continue. */

@@ -392,15 +392,28 @@ export const createQueueCore = <T, D = T>(
       return { lastSequence: receipt.streamSequence, count: 1, messageIds };
     }
     const ctx = await runtime.context();
+    const headersFor = (entry: PreparedSend) => {
+      if (entry.ttl === undefined) return {};
+      const h = natsHeaders();
+      h.set("Nats-TTL", entry.ttl);
+      return { headers: h };
+    };
     const first = prepared[0]!;
     const last = prepared[prepared.length - 1]!;
-    // NATS atomic batch: nothing is persisted unless the commit succeeds.
-    const batch = await ctx.js.startBatch(first.target, first.bytes);
-    for (const entry of prepared.slice(1, -1)) {
-      batch.add(entry.target, entry.bytes);
+    try {
+      // NATS atomic batch: nothing is persisted unless the commit succeeds.
+      const batch = await ctx.js.startBatch(first.target, first.bytes, headersFor(first));
+      for (const entry of prepared.slice(1, -1)) {
+        batch.add(entry.target, entry.bytes, headersFor(entry));
+      }
+      const ack = await batch.commit(last.target, last.bytes, headersFor(last));
+      return { lastSequence: ack.seq, count: ack.count, messageIds };
+    } catch (error) {
+      if (/atomic publish is disabled/i.test(asError(error).message)) {
+        throw new SyncUsageError(`${label}: the stream predates atomic batches (allow_atomic off); recreate it`);
+      }
+      throw error;
     }
-    const ack = await batch.commit(last.target, last.bytes);
-    return { lastSequence: ack.seq, count: ack.count, messageIds };
   };
 
   const pause: QueueCore<T, D>["pause"] = async (options = {}) => {
@@ -421,10 +434,13 @@ export const createQueueCore = <T, D = T>(
     runtime.assertActive();
     await declaration.ready();
     const ctx = await runtime.context();
+    await ensureWorkConsumers(ctx);
+    // Partial failure leaves earlier partitions resumed; the call is
+    // idempotent — retry until it succeeds.
     let result: { paused: boolean; pause_until?: string } = { paused: false };
     const partitions = ordering.mode === "partitioned" ? ordering.partitions : 1;
     for (let p = 0; p < partitions; p++) {
-      result = await ctx.jsm.consumers.resume(stream, durableFor(ordering.mode === "partitioned" ? p : null)).catch(() => ({ paused: false }));
+      result = await ctx.jsm.consumers.resume(stream, durableFor(ordering.mode === "partitioned" ? p : null));
     }
     return { paused: result.paused };
   };

@@ -3,7 +3,7 @@ import type { Consumer, JsMsg } from "@nats-io/jetstream";
 import { decodeEnvelope, encodeEnvelope, extString } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
 import { confirmedAck, runPullLoop, settleSuccess } from "./consume.ts";
-import { ConflictError, CursorMismatchError, RetentionGapError, SyncUsageError, asError } from "./errors.ts";
+import { ConflictError, CursorMismatchError, NotFoundError, RetentionGapError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, resourceIdentity, streamName, dlqStreamName, consumerName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
 import type { ResourceIdentity } from "./naming.ts";
 import { ensureConsumer, ensureStream, toStorageType } from "./resources.ts";
@@ -58,9 +58,10 @@ export type TopicPublish<T> = {
   meta?: MessageMeta;
   /**
    * Optimistic concurrency: the publish succeeds only while the given cursor
-   * is still the tenant's latest event (`null` = the tenant must have no
-   * events yet). On a lost race the publish throws ConflictError and nothing
-   * is written — re-read, rebase, retry.
+   * is still the tenant's latest event. `null` means "no events currently
+   * retained" — with retention limits that can also match a tenant whose
+   * history aged out. On a lost race the publish throws ConflictError and
+   * nothing is written — re-read, rebase, retry.
    */
   expectedAfter?: TopicCursor | null;
 };
@@ -607,10 +608,19 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
       const ack = await batch.commit(subject, encoded[encoded.length - 1]!);
       return { lastSequence: ack.seq, count: ack.count, cursor: cursorOf(identity, ack.seq), eventIds };
     } catch (error) {
-      if (expect !== undefined && /wrong last sequence|batch/i.test(asError(error).message)) {
-        throw new ConflictError(
-          `topic ${config.id}: expectedAfter no longer matches the tenant's latest event — re-read and retry`,
-        );
+      if (/atomic publish is disabled/i.test(asError(error).message)) {
+        throw new SyncUsageError(`topic ${config.id}: the stream predates atomic batches (allow_atomic off); recreate it`);
+      }
+      // The batch commit error is generic in NATS.js 3.4 — disambiguate a
+      // lost OCC race from real faults by re-reading the subject head.
+      if (expect !== undefined) {
+        const head = await ctx.jsm.streams.getMessage(stream, { last_by_subj: subject }).catch(() => null);
+        const headSeq = head === null ? 0 : head.seq;
+        if (headSeq !== expect.lastSubjectSequence) {
+          throw new ConflictError(
+            `topic ${config.id}: expectedAfter no longer matches the tenant's latest event — re-read and retry`,
+          );
+        }
       }
       throw error;
     }
@@ -623,8 +633,15 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     const ctx = await runtime.context();
     const durable = consumerName(identity, JSON.stringify([input.consumer, input.tenantId ?? DEFAULT_TENANT]));
     const until = new Date(Date.now() + (input.untilMs ?? 365 * 24 * 60 * 60 * 1_000));
-    const result = await ctx.jsm.consumers.pause(stream, durable, until);
-    return { paused: result.paused, ...(result.pause_until !== undefined ? { pauseUntil: new Date(result.pause_until) } : {}) };
+    try {
+      const result = await ctx.jsm.consumers.pause(stream, durable, until);
+      return { paused: result.paused, ...(result.pause_until !== undefined ? { pauseUntil: new Date(result.pause_until) } : {}) };
+    } catch (error) {
+      if (/consumer not found/i.test(asError(error).message)) {
+        throw new NotFoundError(`topic ${config.id}: consumer ${input.consumer} has not been created yet (no process() ran)`);
+      }
+      throw error;
+    }
   };
 
   const resumeConsumer: Topic<T>["resumeConsumer"] = async (input) => {
@@ -633,8 +650,15 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     await declaration.ready();
     const ctx = await runtime.context();
     const durable = consumerName(identity, JSON.stringify([input.consumer, input.tenantId ?? DEFAULT_TENANT]));
-    const result = await ctx.jsm.consumers.resume(stream, durable);
-    return { paused: result.paused };
+    try {
+      const result = await ctx.jsm.consumers.resume(stream, durable);
+      return { paused: result.paused };
+    } catch (error) {
+      if (/consumer not found/i.test(asError(error).message)) {
+        throw new NotFoundError(`topic ${config.id}: consumer ${input.consumer} has not been created yet (no process() ran)`);
+      }
+      throw error;
+    }
   };
 
   return {

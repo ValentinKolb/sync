@@ -324,3 +324,21 @@ describe("nats feature surface", () => {
     await w.drain();
   }, 15_000);
 });
+
+describe("batch ttl regression", () => {
+  test("ttlMs expires every member of a multi-message batch", async () => {
+    const queue = sync.queue<Task>({ id: "batch-ttl" });
+    await queue.sendBatch([
+      { data: { n: 1 }, ttlMs: 1_000 },
+      { data: { n: 2 }, ttlMs: 1_000 },
+    ]);
+    await Bun.sleep(2_500);
+    const seen: number[] = [];
+    const w = await queue.process({}, async (m) => {
+      seen.push(m.data.n);
+    });
+    await Bun.sleep(1_500);
+    expect(seen).toEqual([]);
+    await w.drain();
+  }, 15_000);
+});
