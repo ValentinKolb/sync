@@ -1,3 +1,7 @@
+// ==========================
+// Types
+// ==========================
+
 type CronField = {
   any: boolean;
   values: Set<number>;
@@ -47,6 +51,10 @@ const getZonedFormatter = (tz: string): Intl.DateTimeFormat => {
   zonedFormatterCache.set(tz, formatter);
   return formatter;
 };
+
+// ==========================
+// Parsing
+// ==========================
 
 const asInt = (value: string, fieldName: string): number => {
   // Strictly decimal digits: Number() would accept "", "-5", "0x10", "1e1"
@@ -237,6 +245,10 @@ const matchesCron = (spec: CronSpec, timestampMs: number, tz: string): boolean =
  * The symmetric case still applies: a local slot that a spring-forward skips
  * does not exist that day and does not run.
  */
+// ==========================
+// Public API
+// ==========================
+
 export const nextCronTimestamp = (cron: string, tz: string, afterTimestampMs: number): number => {
   const spec = parseCron(cron);
   const startMs = floorToMinute(afterTimestampMs);

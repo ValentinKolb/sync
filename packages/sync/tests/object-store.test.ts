@@ -185,3 +185,13 @@ describe("hardening regressions", () => {
     ).rejects.toThrow('must not start with "sync."');
   });
 });
+
+describe("watch signal handling", () => {
+  test("a pre-aborted signal ends the watch immediately instead of hanging", async () => {
+    const artifacts = store();
+    await artifacts.ready();
+    const events = [];
+    for await (const event of artifacts.watch({ signal: AbortSignal.abort() })) events.push(event);
+    expect(events).toEqual([]);
+  }, 10_000);
+});

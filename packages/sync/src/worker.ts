@@ -46,7 +46,7 @@ export type WorkerRuntime = {
   readonly stopped: Promise<void>;
 };
 
-export const assertConcurrency = (value: number): void => {
+const assertConcurrency = (value: number): void => {
   if (!Number.isSafeInteger(value) || value < 1 || value > 1_024) {
     throw new RangeError("concurrency must be an integer between 1 and 1024");
   }
@@ -70,10 +70,7 @@ export const createWorkerRuntime = (
   let finished = false;
   const controllers = new Set<AbortController>();
   const waiters = new Set<() => void>();
-  let resolveStopped: () => void;
-  const stopped = new Promise<void>((resolve) => {
-    resolveStopped = resolve;
-  });
+  const { promise: stopped, resolve: resolveStopped } = Promise.withResolvers<void>();
 
   const notifyWaiters = (): void => {
     for (const waiter of waiters) waiter();
@@ -90,7 +87,7 @@ export const createWorkerRuntime = (
   const stop = (): void => {
     if (stopping) return;
     stopping = true;
-    resolveStopped!();
+    resolveStopped();
     notifyWaiters();
     maybeFinish();
   };
@@ -107,7 +104,9 @@ export const createWorkerRuntime = (
     fn(controller.signal)
       .then(
         () => {
-          completed += 1;
+          // Handlers bulk-counted as aborted in a forced drain must not also
+          // count as completed when they eventually resolve.
+          if (!finished) completed += 1;
         },
         () => {
           // Force-aborted handlers were already bulk-counted in drain().
@@ -125,6 +124,7 @@ export const createWorkerRuntime = (
 
   const drain = async (drainOptions: { timeoutMs?: number } = {}): Promise<void> => {
     stop();
+    if (finished) return; // a prior forced drain already abandoned the leftovers
     const timeoutMs = drainOptions.timeoutMs ?? 30_000;
     const deadline = Date.now() + timeoutMs;
     while (active > 0 && Date.now() < deadline) {

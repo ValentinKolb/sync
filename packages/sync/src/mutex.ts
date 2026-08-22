@@ -1,11 +1,9 @@
-import { JetStreamApiError } from "@nats-io/jetstream";
-import { headers as natsHeaders } from "@nats-io/nats-core";
-import { StorageType } from "@nats-io/jetstream";
 import type { KV } from "@nats-io/kv";
 import { decodeJson, encodeJson } from "./codec.ts";
+import { kvCasPut } from "./kv.ts";
 import { asError } from "./errors.ts";
 import { assertName, assertSubjectLength, kvBucketName, resourceIdentity, subjectToken } from "./naming.ts";
-import { ensureKv } from "./resources.ts";
+import { ensureKv, toStorageType } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
 import type { JsonValue } from "./codec.ts";
@@ -31,19 +29,19 @@ export type MutexConfig = {
   owner?: string;
   /** Lease TTL. Rounded up to whole seconds (NATS minimum 1s). Default 10_000. */
   ttlMs?: number;
-  retry?: { attempts?: number; delayMs?: number };
+  /** Acquisition retries: total tries including the first. Default { maxAttempts: 10, delayMs: 200 }. */
+  retry?: { maxAttempts?: number; delayMs?: number };
   replicas?: number;
 };
 
 export type Mutex = {
   ready(): Promise<void>;
-  acquire(resource: string, options?: { ttlMs?: number; signal?: AbortSignal }): Promise<Lock | null>;
+  acquire(input: { resource: string; ttlMs?: number; signal?: AbortSignal }): Promise<Lock | null>;
   extend(lock: Lock, options?: { ttlMs?: number }): Promise<boolean>;
   release(lock: Lock): Promise<boolean>;
   withLock<T>(
-    resource: string,
+    input: { resource: string; ttlMs?: number; signal?: AbortSignal },
     fn: (lock: Lock) => Promise<T>,
-    options?: { ttlMs?: number; signal?: AbortSignal },
   ): Promise<T | null>;
 };
 
@@ -63,10 +61,13 @@ export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex =>
   if (!Number.isSafeInteger(defaultTtlMs) || defaultTtlMs <= 0) {
     throw new RangeError("ttlMs must be a positive integer");
   }
-  const retryAttempts = config.retry?.attempts ?? 10;
+  const maxAttempts = config.retry?.maxAttempts ?? 10;
   const retryDelayMs = config.retry?.delayMs ?? 200;
+  if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1) {
+    throw new RangeError("retry.maxAttempts must be a positive integer");
+  }
   const replicas = config.replicas ?? runtime.defaults.replicas;
-  const storage = runtime.defaults.storage === "memory" ? StorageType.Memory : StorageType.File;
+  const storage = toStorageType(runtime.defaults.storage);
   const bucket = kvBucketName(identity);
   const label = `mutex ${config.id}`;
 
@@ -109,25 +110,10 @@ export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex =>
 
   const ttlSeconds = (ttlMs: number): number => Math.max(1, Math.ceil(ttlMs / 1_000));
 
-  // 10071/10164 = wrong last sequence; the numeric codes are the stable
-  // contract, the message text is only a fallback.
-  const isCasConflict = (error: unknown): boolean =>
-    (error instanceof JetStreamApiError && (error.code === 10071 || error.code === 10164)) ||
-    /wrong last sequence/i.test(asError(error).message);
-
   /** CAS put with per-key TTL: expected-last-subject-sequence plus Nats-TTL headers. */
   const casPutWithTtl = async (key: string, record: LockRecord, previousSeq: number, ttlMs: number): Promise<number | null> => {
     const ctx = await runtime.context();
-    const hdrs = natsHeaders();
-    hdrs.set("Nats-Expected-Last-Subject-Sequence", String(previousSeq));
-    hdrs.set("Nats-TTL", `${ttlSeconds(ttlMs)}s`);
-    try {
-      const ack = await ctx.js.publish(`$KV.${bucket}.${key}`, encodeJson(label, record, 4_096), { headers: hdrs });
-      return ack.seq;
-    } catch (error) {
-      if (isCasConflict(error)) return null;
-      throw error;
-    }
+    return kvCasPut(ctx, bucket, key, encodeJson(label, record, 4_096), previousSeq, { ttl: `${ttlSeconds(ttlMs)}s` });
   };
 
   /** Last KV state of the resource key: live record, tombstone revision, or nothing. */
@@ -159,25 +145,25 @@ export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex =>
     return { resource, ownerToken, fence: BigInt(seq), expiresAt };
   };
 
-  const acquire: Mutex["acquire"] = async (resource, options = {}) => {
+  const acquire: Mutex["acquire"] = async (input) => {
     runtime.assertActive();
     await declaration.ready();
-    const ttlMs = options.ttlMs ?? defaultTtlMs;
-    for (let attempt = 0; attempt <= retryAttempts; attempt++) {
-      if (options.signal?.aborted) return null;
-      const lock = await tryAcquire(resource, ttlMs);
+    const ttlMs = input.ttlMs ?? defaultTtlMs;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (input.signal?.aborted) return null;
+      const lock = await tryAcquire(input.resource, ttlMs);
       if (lock !== null) return lock;
-      if (attempt < retryAttempts) {
+      if (attempt < maxAttempts) {
         await new Promise<void>((resolve) => {
           const onAbort = (): void => {
             clearTimeout(timer);
             resolve();
           };
           const timer = setTimeout(() => {
-            options.signal?.removeEventListener("abort", onAbort);
+            input.signal?.removeEventListener("abort", onAbort);
             resolve();
           }, retryDelayMs);
-          options.signal?.addEventListener("abort", onAbort, { once: true });
+          input.signal?.addEventListener("abort", onAbort, { once: true });
         });
       }
     }
@@ -189,14 +175,14 @@ export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex =>
     const ttlMs = options.ttlMs ?? defaultTtlMs;
     const current = await readKey(lock.resource);
     if (current.record === null || current.record.ownerToken !== lock.ownerToken) {
-      runtime.events.emit({ type: "lock_lost", resource: config.id, kind: "mutex", detail: { resource: lock.resource } });
+      runtime.events.emit({ type: "lock_lost", resource: config.id, kind: "mutex", detail: { lock: lock.resource } });
       return false;
     }
     const expiresAt = new Date(Date.now() + ttlSeconds(ttlMs) * 1_000);
     const record: LockRecord = { ...current.record, expiresAt: expiresAt.toISOString() };
     const seq = await casPutWithTtl(keyOf(lock.resource), record, current.lastRevision, ttlMs);
     if (seq === null) {
-      runtime.events.emit({ type: "lock_lost", resource: config.id, kind: "mutex", detail: { resource: lock.resource } });
+      runtime.events.emit({ type: "lock_lost", resource: config.id, kind: "mutex", detail: { lock: lock.resource } });
       return false;
     }
     lock.expiresAt = expiresAt;
@@ -216,8 +202,8 @@ export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex =>
     }
   };
 
-  const withLock: Mutex["withLock"] = async (resource, fn, options = {}) => {
-    const lock = await acquire(resource, options);
+  const withLock: Mutex["withLock"] = async (input, fn) => {
+    const lock = await acquire(input);
     if (lock === null) return null;
     try {
       return await fn(lock);

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json",
+  "entry": [
+    "packages/sync/index.ts",
+    "packages/sync/retry.ts",
+    "packages/sync/tests/**/*.test.ts",
+    "packages/sync/tests/preload.ts",
+    "packages/sync/tests/fixtures/*.ts",
+    "scripts/rewrite-esm-imports.mjs",
+    "scripts/*.test.ts"
+  ]
+}

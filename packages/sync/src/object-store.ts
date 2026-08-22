@@ -1,8 +1,7 @@
-import { StorageType } from "@nats-io/jetstream";
 import type { ObjectInfo as NatsObjectInfo, ObjectStore as NatsObjectStore } from "@nats-io/obj";
 import { InvalidNameError, ObjectTooLargeError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, decodeSubjectToken, objBucketName, resourceIdentity, subjectToken } from "./naming.ts";
-import { ensureObjectStore } from "./resources.ts";
+import { ensureObjectStore, toStorageType } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
 import { DEFAULT_TENANT, nanos } from "./types.ts";
@@ -44,7 +43,7 @@ export type ObjectMetadata = Record<string, string>;
 export type StoredObject = {
   ref: ObjectRef;
   metadata: ObjectMetadata;
-  modifiedAt: Date;
+  updatedAt: Date;
   body: ReadableStream<Uint8Array>;
 };
 
@@ -93,7 +92,7 @@ export const createObjectStore = (runtime: SyncRuntime, config: ObjectStoreConfi
   }
   const replicas = config.replicas ?? runtime.defaults.replicas;
   const storageKind = config.storage ?? runtime.defaults.storage;
-  const storage = storageKind === "memory" ? StorageType.Memory : StorageType.File;
+  const storage = toStorageType(storageKind);
   const compression = (config.compression ?? "none") === "s2";
   const bucket = objBucketName(identity);
   const label = `object-store ${config.id}`;
@@ -176,7 +175,7 @@ export const createObjectStore = (runtime: SyncRuntime, config: ObjectStoreConfi
         digest: info.digest,
       },
       metadata,
-      modifiedAt: new Date(info.mtime),
+      updatedAt: new Date(info.mtime),
     };
   };
 
@@ -251,7 +250,8 @@ export const createObjectStore = (runtime: SyncRuntime, config: ObjectStoreConfi
     if (info === null) return null;
     const idleTimeoutMs = options.idleTimeoutMs ?? 30_000;
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
-    const watchdog = new TransformStream<Uint8Array, Uint8Array>({
+    // `cancel` is honored by Bun but missing from the TS lib's Transformer.
+    const transformer: Transformer<Uint8Array, Uint8Array> & { cancel?(): void } = {
       start: (controller) => {
         idleTimer = setTimeout(() => controller.error(new Error(`object body stalled for ${idleTimeoutMs}ms`)), idleTimeoutMs);
       },
@@ -263,7 +263,11 @@ export const createObjectStore = (runtime: SyncRuntime, config: ObjectStoreConfi
       flush: () => {
         if (idleTimer !== null) clearTimeout(idleTimer);
       },
-    });
+      cancel: () => {
+        if (idleTimer !== null) clearTimeout(idleTimer);
+      },
+    };
+    const watchdog = new TransformStream<Uint8Array, Uint8Array>(transformer);
     const body =
       options.signal !== undefined
         ? result.data.pipeThrough(watchdog).pipeThrough(new TransformStream(), { signal: options.signal })
@@ -291,46 +295,57 @@ export const createObjectStore = (runtime: SyncRuntime, config: ObjectStoreConfi
     return response.success;
   };
 
-  const list: ObjectStore["list"] = (input = {}) => ({
-    async *[Symbol.asyncIterator]() {
-      runtime.assertActive();
-      const tenantId = input.tenantId ?? DEFAULT_TENANT;
-      const store = await getStore();
-      for (const raw of await store.list()) {
-        if (raw.deleted) continue;
-        const entry = toInfo(raw);
-        if (entry === null || entry.ref.tenantId !== tenantId) continue;
-        if (input.prefix !== undefined && !entry.ref.key.startsWith(input.prefix)) continue;
-        yield entry;
+  async function* listIterator(input: { tenantId: string; prefix?: string }): AsyncGenerator<SyncObjectInfo> {
+    runtime.assertActive();
+    const store = await getStore();
+    for (const raw of await store.list()) {
+      if (raw.deleted) continue;
+      const entry = toInfo(raw);
+      if (entry === null || entry.ref.tenantId !== input.tenantId) continue;
+      if (input.prefix !== undefined && !entry.ref.key.startsWith(input.prefix)) continue;
+      yield entry;
+    }
+  }
+
+  /** Emits changes only (no initial state) — pair with list() for the current inventory. */
+  async function* watchIterator(input: {
+    tenantId: string;
+    prefix?: string;
+    signal?: AbortSignal;
+  }): AsyncGenerator<ObjectStoreEvent> {
+    runtime.assertActive();
+    const store = await getStore();
+    if (input.signal?.aborted) return;
+    const iterator = await store.watch({ includeHistory: false, ignoreDeletes: false });
+    const onAbort = (): void => iterator.stop();
+    input.signal?.addEventListener("abort", onAbort, { once: true });
+    if (input.signal?.aborted) onAbort();
+    try {
+      for await (const raw of iterator) {
+        const decoded = decodeName(raw.name);
+        if (decoded === null || decoded.tenantId !== input.tenantId) continue;
+        if (input.prefix !== undefined && !decoded.key.startsWith(input.prefix)) continue;
+        if (raw.deleted) {
+          yield { type: "delete", tenantId: decoded.tenantId, key: decoded.key };
+        } else {
+          const entry = toInfo(raw);
+          if (entry !== null) yield { type: "put", object: entry };
+        }
       }
-    },
+    } finally {
+      input.signal?.removeEventListener("abort", onAbort);
+      iterator.stop();
+    }
+  }
+
+  const list: ObjectStore["list"] = (input = {}) => ({
+    [Symbol.asyncIterator]: () =>
+      listIterator({ tenantId: input.tenantId ?? DEFAULT_TENANT, prefix: input.prefix }),
   });
 
   const watch: ObjectStore["watch"] = (input = {}) => ({
-    async *[Symbol.asyncIterator]() {
-      runtime.assertActive();
-      const tenantId = input.tenantId ?? DEFAULT_TENANT;
-      const store = await getStore();
-      const iterator = await store.watch({ includeHistory: false, ignoreDeletes: false });
-      const onAbort = (): void => iterator.stop();
-      input.signal?.addEventListener("abort", onAbort, { once: true });
-      try {
-        for await (const raw of iterator) {
-          const decoded = decodeName(raw.name);
-          if (decoded === null || decoded.tenantId !== tenantId) continue;
-          if (input.prefix !== undefined && !decoded.key.startsWith(input.prefix)) continue;
-          if (raw.deleted) {
-            yield { type: "delete", tenantId: decoded.tenantId, key: decoded.key } as ObjectStoreEvent;
-          } else {
-            const entry = toInfo(raw);
-            if (entry !== null) yield { type: "put", object: entry } as ObjectStoreEvent;
-          }
-        }
-      } finally {
-        input.signal?.removeEventListener("abort", onAbort);
-        iterator.stop();
-      }
-    },
+    [Symbol.asyncIterator]: () =>
+      watchIterator({ tenantId: input.tenantId ?? DEFAULT_TENANT, prefix: input.prefix, signal: input.signal }),
   });
 
   return {

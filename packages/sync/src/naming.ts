@@ -6,9 +6,9 @@ import { InvalidNameError } from "./errors.ts";
 // ==========================
 
 /** Maximum bytes for user-supplied ids, tenant ids, keys, and consumer names. */
-export const MAX_NAME_BYTES = 96;
+const MAX_NAME_BYTES = 96;
 /** Maximum characters for a complete encoded NATS subject or KV key. */
-export const MAX_SUBJECT_CHARS = 255;
+const MAX_SUBJECT_CHARS = 255;
 
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const encoder = new TextEncoder();
@@ -35,7 +35,7 @@ const base32 = (bytes: Uint8Array): string => {
 
 const sha256 = (input: string): Uint8Array => new Uint8Array(createHash("sha256").update(input, "utf8").digest());
 
-export const sha256Hex = (input: string): string => createHash("sha256").update(input, "utf8").digest("hex");
+const sha256Hex = (input: string): string => createHash("sha256").update(input, "utf8").digest("hex");
 
 /**
  * Injective base64url (no padding) encoding for user-supplied values used as
@@ -155,6 +155,7 @@ export const subjectRoot = (identity: ResourceIdentity): string => {
 // Resource metadata
 // ==========================
 
+// fallow-ignore-next-line unused-type -- part of exported signatures; required for declaration emit
 export type ResourceMetadata = {
   "sync.api": "6";
   "sync.namespace": string;

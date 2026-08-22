@@ -1,3 +1,4 @@
+import { StorageType } from "@nats-io/jetstream";
 import type {
   ConsumerConfig,
   JetStreamClient,
@@ -25,6 +26,9 @@ export type ProvisionContext = {
   objm: Objm;
 };
 
+export const toStorageType = (storage: "file" | "memory"): StorageType =>
+  storage === "memory" ? StorageType.Memory : StorageType.File;
+
 const isNotFound = (error: unknown): boolean => {
   const err = error as { code?: unknown; message?: string };
   // JetStreamApiError exposes the JetStream error code; 10059 = stream not
@@ -50,15 +54,15 @@ const normalize = (field: string, value: unknown): unknown => {
   return value;
 };
 
-const compareFields = (
-  declared: Record<string, unknown>,
-  actual: Record<string, unknown>,
-  fields: string[],
-): ResourceDifference[] => {
+const compareFields = (declared: object, actual: object, fields: string[]): ResourceDifference[] => {
+  // NATS config interfaces carry no index signature; widen once here instead
+  // of casting at every call site.
+  const declaredFields = declared as Record<string, unknown>;
+  const actualFields = actual as Record<string, unknown>;
   const differences: ResourceDifference[] = [];
   for (const field of fields) {
-    const d = normalize(field, declared[field]);
-    const a = normalize(field, actual[field]);
+    const d = normalize(field, declaredFields[field]);
+    const a = normalize(field, actualFields[field]);
     if (JSON.stringify(d) !== JSON.stringify(a)) {
       differences.push({ field, declared: d, actual: a });
     }
@@ -100,7 +104,7 @@ const checkIdentityMetadata = (
 // Streams
 // ==========================
 
-export const STREAM_DRIFT_FIELDS = [
+const STREAM_DRIFT_FIELDS = [
   "subjects",
   "retention",
   "storage",
@@ -153,11 +157,7 @@ export const ensureStream = async (
   if (!created) {
     const differences = [
       ...checkIdentityMetadata(config.name, identity, info.config.metadata),
-      ...compareFields(
-        declared as unknown as Record<string, unknown>,
-        info.config as unknown as Record<string, unknown>,
-        STREAM_DRIFT_FIELDS.filter((f) => f in declared),
-      ),
+      ...compareFields(declared, info.config, STREAM_DRIFT_FIELDS.filter((f) => f in declared)),
     ];
     if (info.config.metadata?.["sync.owner"] !== owner) {
       differences.push({
@@ -175,7 +175,7 @@ export const ensureStream = async (
 // Consumers
 // ==========================
 
-export const CONSUMER_DRIFT_FIELDS = [
+const CONSUMER_DRIFT_FIELDS = [
   "filter_subject",
   "filter_subjects",
   "ack_policy",
@@ -209,11 +209,7 @@ export const ensureConsumer = async (
     }
   }
   if (!created) {
-    const differences = compareFields(
-      config as unknown as Record<string, unknown>,
-      info.config as unknown as Record<string, unknown>,
-      CONSUMER_DRIFT_FIELDS.filter((f) => f in config),
-    );
+    const differences = compareFields(config, info.config, CONSUMER_DRIFT_FIELDS.filter((f) => f in config));
     if (differences.length > 0) {
       throw new ResourceDriftError(`${stream}/${config.durable_name}`, differences);
     }
@@ -244,7 +240,7 @@ export const ensureKv = async (
   const differences = [
     ...checkIdentityMetadata(`KV_${bucket}`, identity, existingMeta),
     ...compareFields(
-      declared as unknown as Record<string, unknown>,
+      declared,
       {
         history: status.history,
         ttl: status.ttl,
@@ -285,7 +281,7 @@ export const ensureObjectStore = async (
   const differences = [
     ...checkIdentityMetadata(`OBJ_${bucket}`, identity, existingMeta),
     ...compareFields(
-      declared as unknown as Record<string, unknown>,
+      declared,
       {
         ttl: status.ttl,
         replicas: status.replicas,

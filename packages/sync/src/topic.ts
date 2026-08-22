@@ -1,12 +1,12 @@
-import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from "@nats-io/jetstream";
 import type { Consumer, JsMsg } from "@nats-io/jetstream";
-import { decodeEnvelope, encodeEnvelope } from "./codec.ts";
+import { decodeEnvelope, encodeEnvelope, extString } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
 import { confirmedAck, runPullLoop, settleSuccess } from "./consume.ts";
 import { CursorMismatchError, RetentionGapError, asError } from "./errors.ts";
 import { assertName, resourceIdentity, streamName, dlqStreamName, consumerName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
 import type { ResourceIdentity } from "./naming.ts";
-import { ensureConsumer, ensureStream } from "./resources.ts";
+import { ensureConsumer, ensureStream, toStorageType } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
 import {
@@ -97,6 +97,20 @@ const gapError = (identity: ResourceIdentity, requestedSeq: number, firstRetaine
     cursorOf(identity, Math.max(0, firstRetainedSeq - 1)),
   );
 
+/** next() that resolves "idle" after idleMs while keeping the pending pull alive across races. */
+const withIdleTimeout = (
+  iterator: AsyncIterator<JsMsg>,
+  idleMs: number,
+): (() => Promise<IteratorResult<JsMsg> | "idle">) => {
+  let pending: Promise<IteratorResult<JsMsg>> | null = null;
+  return async () => {
+    pending ??= iterator.next();
+    const winner = await Promise.race([pending, Bun.sleep(idleMs).then(() => "idle" as const)]);
+    if (winner !== "idle") pending = null;
+    return winner;
+  };
+};
+
 const parseCursor = (identity: ResourceIdentity, cursor: TopicCursor, label: string): number => {
   const parts = cursor.split(".");
   const seq = Number(parts[2]);
@@ -120,7 +134,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
   const dedupeWindowMs = config.dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS;
   const maxPayloadBytes = config.maxPayloadBytes ?? DEFAULT_MESSAGE_PAYLOAD_BYTES;
   const replicas = config.replicas ?? runtime.defaults.replicas;
-  const storage = runtime.defaults.storage === "memory" ? StorageType.Memory : StorageType.File;
+  const storage = toStorageType(runtime.defaults.storage);
 
   const stream = streamName(identity);
   const dlqStream = dlqStreamName(identity);
@@ -182,7 +196,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
 
   const toEvent = (envelope: Envelope, seq: number): TopicEvent<T> => ({
     data: envelope.data as T,
-    eventId: (envelope.ext?.eventId as string) ?? String(seq),
+    eventId: extString(envelope, "eventId") ?? String(seq),
     cursor: cursorOf(identity, seq),
     tenantId: envelope.tenantId,
     orderingKey: envelope.orderingKey,
@@ -277,11 +291,6 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
   /**
    * Durable-log read shared by replay() and follow(). Reads the stream without
    * a server-side subject filter so stream sequences stay contiguous: any gap
-   * proves messages were removed by retention and is reported explicitly.
-   */
-  /**
-   * Durable-log read shared by replay() and follow(). Reads the stream without
-   * a server-side subject filter so stream sequences stay contiguous: any gap
    * proves messages were removed and is reported explicitly. When the log is
    * idle, a watchdog re-checks the stream so gaps caused by retention (rather
    * than observed via a delivered message) surface instead of hanging.
@@ -323,26 +332,25 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     // the first delivered sequence fixes the baseline (retention may advance
     // between the info call and delivery).
     let baselineFixed = afterSeq !== null;
-    const iterator = messages[Symbol.asyncIterator]();
-    let pendingNext: Promise<IteratorResult<Awaited<ReturnType<typeof iterator.next>>["value"]>> | null = null;
+    const next = withIdleTimeout(messages[Symbol.asyncIterator](), 5_000);
     try {
       while (true) {
-        pendingNext ??= iterator.next();
-        const winner = await Promise.race([
-          pendingNext,
-          Bun.sleep(5_000).then(() => "idle" as const),
-        ]);
+        const winner = await next();
         if (winner === "idle") {
           if (options.signal?.aborted) return;
           const state = (await ctx.jsm.streams.info(stream)).state;
           if (state.first_seq > expectedSeq) {
+            if (!baselineFixed) {
+              // No cursor was requested: "earliest available" simply moved.
+              expectedSeq = state.first_seq;
+              continue;
+            }
             // The events we are waiting for were removed while nothing new
             // arrived to make the gap observable through a delivered message.
             throw gapError(identity, expectedSeq, state.first_seq);
           }
           continue;
         }
-        pendingNext = null;
         if (winner.done === true) return;
         const msg = winner.value;
         if (!baselineFixed) {
@@ -433,7 +441,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     runtime.events.emit({ type: "worker_started", resource: config.id, kind: "topic" });
 
     const deadLetter = async (msg: JsMsg, envelope: Envelope | null, reason: string, error?: string): Promise<void> => {
-      const eventId = (envelope?.ext?.eventId as string) ?? `seq-${msg.seq}`;
+      const eventId = extString(envelope, "eventId") ?? `seq-${msg.seq}`;
       const dlqEnvelope: Envelope = {
         v: 6,
         data: envelope?.data ?? null,
@@ -444,10 +452,12 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
           consumer: options.consumer,
           attempts: msg.info.deliveryCount,
           reason,
-          ...(error !== undefined ? { error } : {}),
+          ...(error !== undefined ? { error: error.slice(0, 2_048) } : {}),
         },
       };
-      const bytes = encodeEnvelope(`topic ${config.id} dlq`, dlqEnvelope, maxPayloadBytes);
+      // Headroom: the transfer adds bookkeeping on top of the original payload
+      // and must never be the reason an event cannot be dead-lettered.
+      const bytes = encodeEnvelope(`topic ${config.id} dlq`, dlqEnvelope, maxPayloadBytes + 4_096);
       await ctx.js.publish(dlqSubject(options.consumer), bytes, {
         msgID: `dlq.${subjectToken(options.consumer, "consumer")}.${eventId}`,
       });

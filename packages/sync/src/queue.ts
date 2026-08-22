@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
-import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from "@nats-io/jetstream";
 import type { JsMsg } from "@nats-io/jetstream";
-import { decodeEnvelope, encodeEnvelope } from "./codec.ts";
+import { decodeEnvelope, encodeEnvelope, extNumber, extString } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
 import { confirmedAck, runPullLoop, settleSuccess } from "./consume.ts";
 import { NotFoundError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, dlqStreamName, resourceIdentity, streamName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
 import type { SyncResourceKind } from "./naming.ts";
-import { ensureConsumer, ensureStream } from "./resources.ts";
+import { ensureConsumer, ensureStream, toStorageType } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
 import {
@@ -109,6 +109,7 @@ type PreparedSend = {
   byteLength: number;
 };
 
+// fallow-ignore-next-line unused-type -- part of exported signatures; required for declaration emit
 export type QueueCore<T, D = T> = {
   declarationReady(): Promise<void>;
   send(message: QueueSend<T>, ext?: Record<string, JsonValue>): Promise<PublishReceipt>;
@@ -148,7 +149,7 @@ export const createQueueCore = <T, D = T>(
   const dedupeWindowMs = config.dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS;
   const maxPayloadBytes = config.maxPayloadBytes ?? DEFAULT_MESSAGE_PAYLOAD_BYTES;
   const replicas = config.replicas ?? runtime.defaults.replicas;
-  const storage = runtime.defaults.storage === "memory" ? StorageType.Memory : StorageType.File;
+  const storage = toStorageType(runtime.defaults.storage);
   const ordering: OrderingConfig = config.ordering ?? { mode: "none" };
   if (ordering.mode === "partitioned") {
     if (!Number.isSafeInteger(ordering.partitions) || ordering.partitions < 1 || ordering.partitions > 1_024) {
@@ -292,8 +293,12 @@ export const createQueueCore = <T, D = T>(
     if (message.delayMs !== undefined && message.at !== undefined) {
       throw new SyncUsageError("delayMs and at are mutually exclusive");
     }
-    if (ordering.mode === "partitioned" && message.orderingKey === undefined) {
-      throw new SyncUsageError(`${label} is partitioned; send() requires an orderingKey`);
+    let partition: number | null = null;
+    if (ordering.mode === "partitioned") {
+      if (message.orderingKey === undefined) {
+        throw new SyncUsageError(`${label} is partitioned; send() requires an orderingKey`);
+      }
+      partition = partitionOf(message.orderingKey, ordering.partitions);
     }
     const messageId = message.idempotencyKey
       ? scopedMessageId(tenantId, message.idempotencyKey)
@@ -308,7 +313,6 @@ export const createQueueCore = <T, D = T>(
       ext: { ...ext, messageId },
     };
     const bytes = encodeEnvelope(label, envelope, maxPayloadBytes);
-    const partition = ordering.mode === "partitioned" ? partitionOf(message.orderingKey!, ordering.partitions) : null;
     const target = workSubject(tenantId, partition);
     const fireAt = message.at ?? (message.delayMs !== undefined ? new Date(Date.now() + message.delayMs) : null);
 
@@ -340,7 +344,7 @@ export const createQueueCore = <T, D = T>(
 
   const toMessage = (envelope: Envelope, msg: JsMsg, signal: AbortSignal, attempt: number): QueueMessage<T> => ({
     data: envelope.data as T,
-    messageId: (envelope.ext?.messageId as string) ?? `seq-${msg.seq}`,
+    messageId: extString(envelope, "messageId") ?? `seq-${msg.seq}`,
     attempt,
     publishedAt: new Date(envelope.publishedAt),
     tenantId: envelope.tenantId,
@@ -359,7 +363,7 @@ export const createQueueCore = <T, D = T>(
     reason: string,
     error?: string,
   ): Promise<void> => {
-    const messageId = (envelope?.ext?.messageId as string) ?? `seq-${msg.seq}`;
+    const messageId = extString(envelope, "messageId") ?? `seq-${msg.seq}`;
     const tenantId = envelope?.tenantId ?? DEFAULT_TENANT;
     const dlqEnvelope: Envelope = {
       v: 6,
@@ -403,12 +407,19 @@ export const createQueueCore = <T, D = T>(
     /** Sleep out a retry delay while holding the delivery alive. */
     const holdWithHeartbeat = async (msg: JsMsg, delayMs: number, signal: AbortSignal): Promise<void> => {
       const step = Math.max(1_000, Math.floor(delivery.ackWaitMs / 2));
-      let remaining = delayMs;
-      while (remaining > 0 && !signal.aborted) {
-        const slice = Math.min(step, remaining);
-        await Promise.race([Bun.sleep(slice), new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }))]);
-        remaining -= slice;
-        msg.working();
+      const { promise: abortedPromise, resolve: resolveAborted } = Promise.withResolvers<void>();
+      const onAbort = (): void => resolveAborted();
+      signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        let remaining = delayMs;
+        while (remaining > 0 && !signal.aborted) {
+          const slice = Math.min(step, remaining);
+          await Promise.race([Bun.sleep(slice), abortedPromise]);
+          remaining -= slice;
+          msg.working();
+        }
+      } finally {
+        signal.removeEventListener("abort", onAbort);
       }
     };
 
@@ -469,7 +480,9 @@ export const createQueueCore = <T, D = T>(
           // A nak would free the MaxAckPending=1 slot and let younger messages
           // of the same partition overtake during the backoff. Retry in place:
           // the delivery is held with heartbeats, so per-key order survives
-          // handler failures.
+          // handler failures. A crash mid-hold restarts counting from the
+          // NATS deliveryCount, so maxAttempts bounds attempts per lease,
+          // not globally across crashes.
           await holdWithHeartbeat(msg, delayMs, signal);
           if (signal.aborted) {
             msg.nak();
@@ -509,7 +522,8 @@ export const createQueueCore = <T, D = T>(
     }
     await declaration.ready();
     const ctx = await runtime.context();
-    const [durable] = await ensureWorkConsumers(ctx);
+    await ensureWorkConsumers(ctx);
+    const durable = durableFor(null);
     let closed = false;
     const controller = new AbortController();
     options.signal?.addEventListener("abort", () => controller.abort(), { once: true });
@@ -543,7 +557,7 @@ export const createQueueCore = <T, D = T>(
       while (!closed && !controller.signal.aborted && !receiveOptions.signal?.aborted) {
         const remaining = deadline - Date.now();
         if (remaining <= 0) return null;
-        const consumer = await ctx.js.consumers.get(stream, durable!);
+        const consumer = await ctx.js.consumers.get(stream, durable);
         // NATS requires a fetch expiry of at least one second.
         const batch = await consumer.fetch({ max_messages: 1, expires: Math.max(remaining, 1_000) });
         const stop = (): void => batch.stop();
@@ -596,20 +610,22 @@ export const createQueueCore = <T, D = T>(
     const info = await ctx.jsm.streams.info(dlqStream).catch(() => null);
     if (info === null || info.state.messages === 0) return;
     const consumer = await ctx.js.consumers.get(dlqStream);
-    const messages = await consumer.consume({ max_messages: 256 });
-    try {
-      for await (const msg of messages) {
+    // Bounded fetch rounds: per-delivery pending gives deterministic
+    // termination, and an empty round covers entries deleted between the
+    // info call and the read (an open-ended consume would hang there).
+    while (true) {
+      const batch = await consumer.fetch({ max_messages: 256, expires: 2_000 });
+      let delivered = 0;
+      for await (const msg of batch) {
+        delivered += 1;
         try {
           yield { seq: msg.seq, envelope: decodeEnvelope(msg.data) };
         } catch {
           // Skip foreign messages.
         }
-        // pending counts the remaining deliverable messages — deterministic
-        // termination even when entries were deleted (last_seq never shrinks).
         if (msg.info.pending === 0) return;
       }
-    } finally {
-      messages.stop();
+      if (delivered === 0) return;
     }
   };
 
@@ -620,15 +636,18 @@ export const createQueueCore = <T, D = T>(
     return null;
   };
 
-  const toDeadLetter = (envelope: Envelope): DeadLetter<D> => ({
-    messageId: (envelope.ext?.messageId as string) ?? "",
-    data: deadLetterData(envelope),
-    tenantId: envelope.tenantId,
-    attempts: (envelope.ext?.attempts as number) ?? 0,
-    failedAt: new Date((envelope.ext?.failedAt as string) ?? envelope.publishedAt),
-    reason: (envelope.ext?.reason as string) ?? "unknown",
-    ...(envelope.ext?.error !== undefined ? { error: envelope.ext.error as string } : {}),
-  });
+  const toDeadLetter = (envelope: Envelope): DeadLetter<D> => {
+    const error = extString(envelope, "error");
+    return {
+      messageId: extString(envelope, "messageId") ?? "",
+      data: deadLetterData(envelope),
+      tenantId: envelope.tenantId,
+      attempts: extNumber(envelope, "attempts") ?? 0,
+      failedAt: new Date(extString(envelope, "failedAt") ?? envelope.publishedAt),
+      reason: extString(envelope, "reason") ?? "unknown",
+      ...(error !== undefined ? { error } : {}),
+    };
+  };
 
   const deadLetters: DeadLetterStore<D> = {
     list: async (options = {}) => {

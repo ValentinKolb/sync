@@ -50,7 +50,11 @@ export const runPullLoop = async (
       const consumer = await getConsumer();
       const batch = await consumer.fetch({ max_messages: granted, expires: Math.max(options.pollExpiresMs ?? 5_000, 1_000) });
       currentBatch = batch;
+      // stop() may have fired while the fetch call was in flight — the
+      // one-shot stop hook saw currentBatch === null then.
+      if (wr.stopping) batch.stop();
       for await (const msg of batch) {
+        if (wr.stopping) break; // unhandled deliveries redeliver after ackWait
         started += 1;
         wr.track((signal) => onMessage(msg, signal), { fromReservation: true });
       }

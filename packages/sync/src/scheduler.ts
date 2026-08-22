@@ -1,5 +1,5 @@
-import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType } from "@nats-io/jetstream";
-import type { JsMsg } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from "@nats-io/jetstream";
+import type { JsMsg, StoredMsg } from "@nats-io/jetstream";
 import { headers as natsHeaders } from "@nats-io/nats-core";
 import type { KV } from "@nats-io/kv";
 import { assertValidTimeZone, nextCronTimestamp } from "./cron.ts";
@@ -8,7 +8,7 @@ import type { JsonValue } from "./codec.ts";
 import { confirmedAck, runPullLoop, settleSuccess } from "./consume.ts";
 import { NotFoundError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, consumerName, resourceIdentity, streamName, subjectRoot, subjectToken, decodeSubjectToken } from "./naming.ts";
-import { ensureConsumer, ensureKv, ensureStream } from "./resources.ts";
+import { ensureConsumer, ensureKv, ensureStream, toStorageType } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
 import { backoffDelayMs, millis, nanos, resolveDelivery } from "./types.ts";
@@ -25,6 +25,7 @@ export type SchedulerConfig = {
   owner?: string;
   /** Handler delivery policy. `maxInFlight` is ignored: schedules execute serially (one in-flight tick per schedule). */
   delivery?: DeliveryConfig;
+  replicas?: number;
   /**
    * Tick retention. Global size limits are deliberately not configurable:
    * with discard-old they would eventually evict the broker-side schedule
@@ -74,7 +75,8 @@ export type ScheduleInfo = {
 export type Scheduler = {
   ready(): Promise<void>;
   create(config: ScheduleDefinition): Promise<{ created: boolean; updated: boolean }>;
-  start(options?: ProcessOptions): Promise<Worker>;
+  /** Serve locally created schedules. Like every process(), returns a Worker. */
+  process(options?: ProcessOptions): Promise<Worker>;
   delete(input: { id: string }): Promise<boolean>;
   /**
    * Durably accept a manual run. Repeating the same requestId within the
@@ -119,8 +121,8 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
   if (!Number.isSafeInteger(maxTicksPerSchedule) || maxTicksPerSchedule <= 0) {
     throw new RangeError("retention.maxTicksPerSchedule must be a positive integer");
   }
-  const replicas = runtime.defaults.replicas;
-  const storage = runtime.defaults.storage === "memory" ? StorageType.Memory : StorageType.File;
+  const replicas = config.replicas ?? runtime.defaults.replicas;
+  const storage = toStorageType(runtime.defaults.storage);
   const stream = streamName(identity);
   const bucket = `S6_SK_${identity.hash}`;
   const root = subjectRoot(identity);
@@ -252,15 +254,15 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
    * write wins, so a delayed publish of an older revision could otherwise
    * silently reinstate a stale schedule.
    */
-  const publishSchedule = async (record: DefRecord, revision: number): Promise<void> => {
+  const publishScheduleMessage = async (record: DefRecord, revision: number, attempt: number): Promise<void> => {
     const ctx = await runtime.context();
-    const subject = schedSubject(record.id);
-    const body = encodeJson(label, { scheduleId: record.id, trigger: "schedule", revision }, 16 * 1024);
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const hdrs = natsHeaders();
-      // The schedule message must outlive the stream's tick retention.
-      hdrs.set("Nats-TTL", "never");
-      await ctx.js.publish(subject, body, {
+    const hdrs = natsHeaders();
+    // The schedule message must outlive the stream's tick retention.
+    hdrs.set("Nats-TTL", "never");
+    await ctx.js.publish(
+      schedSubject(record.id),
+      encodeJson(label, { scheduleId: record.id, trigger: "schedule", revision }, 16 * 1024),
+      {
         headers: hdrs,
         msgID: `sched.${subjectToken(record.id, "schedule id")}.${revision}.${attempt}`,
         schedule: {
@@ -270,10 +272,28 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
           timezone: record.timezone,
           rollup: "sub",
         },
-      });
+      },
+    );
+  };
+
+  /**
+   * Publish (via per-subject rollup) the broker-side schedule message and
+   * converge: last-write-wins means a delayed publish of an OLDER definition
+   * can land after a newer one, so the loop compares the retained message
+   * against the current KV head and republishes the head until they match.
+   */
+  const publishSchedule = async (record: DefRecord, revision: number): Promise<void> => {
+    const ctx = await runtime.context();
+    const subject = schedSubject(record.id);
+    let current = { record, revision };
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await publishScheduleMessage(current.record, current.revision, attempt);
       const last = await ctx.jsm.streams.getMessage(stream, { last_by_subj: subject }).catch(() => null);
-      const lastRevision = last === null ? -1 : (decodeJson<{ revision?: number }>(last.data).revision ?? -1);
-      if (lastRevision >= revision) return;
+      const retained = last === null ? -1 : (decodeJson<{ revision?: number }>(last.data).revision ?? -1);
+      const head = await loadDef(record.id);
+      if (head === null) return; // deleted concurrently — delete() cancels the schedule
+      if (retained >= head.revision) return;
+      current = head; // a newer definition exists or the rollup lost — publish the head
     }
     throw new Error(`${label}: schedule ${record.id} could not be republished consistently`);
   };
@@ -457,7 +477,7 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
     // tick always executes, so accepted latest work is never lost.
     if (trigger === "schedule" && existing.record.misfire === "latest") {
       const ctx = await runtime.context();
-      let last: Awaited<ReturnType<typeof ctx.jsm.streams.getMessage>>;
+      let last: StoredMsg | null;
       try {
         last = await ctx.jsm.streams.getMessage(stream, { last_by_subj: tickSubject(scheduleId) });
       } catch {
@@ -592,13 +612,14 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
       active.served.delete(scheduleId);
       // A transient provisioning failure must not permanently disable the
       // schedule on this worker.
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (!active.wr.stopping && registry.has(scheduleId)) attachLoop(active, scheduleId);
       }, 5_000);
+      timer.unref?.();
     });
   };
 
-  const start: Scheduler["start"] = async (options = {}) => {
+  const process: Scheduler["process"] = async (options = {}) => {
     runtime.assertActive();
     await declaration.ready();
     const wr = createWorkerRuntime(options, {
@@ -618,7 +639,7 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
   return {
     ready: () => declaration.ready(),
     create,
-    start,
+    process,
     delete: deleteSchedule,
     runNow,
     get,

@@ -67,6 +67,7 @@ export type SyncResourceSummary = {
 // Internal runtime
 // ==========================
 
+// fallow-ignore-next-line unused-type -- part of exported signatures; required for declaration emit
 export type Declaration = {
   identity: ResourceIdentity;
   owner: string;
@@ -269,8 +270,10 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
   };
 
   const entryReady = async (entry: DeclarationEntry): Promise<void> => {
-    assertActive();
+    // Already-provisioned declarations stay usable during drain so in-flight
+    // handlers can settle (checkpoint, ack); only new provisioning is refused.
     if (entry.state === "ready") return;
+    assertActive();
     // Global readiness first: verifies the server exactly once and provisions
     // everything declared before ready(). Late declarations provision here.
     await baseReady();
@@ -359,6 +362,8 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
     events,
     ready,
     context: async () => {
+      // The built context stays available during drain for the same reason.
+      if (ctxPromise !== null) return ctxPromise;
       await ready();
       return buildContext();
     },

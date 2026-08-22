@@ -1,4 +1,4 @@
-import { PayloadTooLargeError } from "./errors.ts";
+import { PayloadTooLargeError, asError } from "./errors.ts";
 
 // ==========================
 // JSON envelope codec
@@ -29,7 +29,7 @@ export const encodeEnvelope = (label: string, envelope: Envelope, maxBytes: numb
   try {
     json = JSON.stringify(envelope);
   } catch (error) {
-    throw new TypeError(`${label} payload is not JSON-serializable: ${(error as Error).message}`);
+    throw new TypeError(`${label} payload is not JSON-serializable: ${asError(error).message}`);
   }
   if (json === undefined) throw new TypeError(`${label} payload is not JSON-serializable`);
   const bytes = encoder.encode(json);
@@ -61,3 +61,14 @@ export const encodeJson = (label: string, value: unknown, maxBytes: number): Uin
 };
 
 export const decodeJson = <T>(bytes: Uint8Array): T => JSON.parse(decoder.decode(bytes)) as T;
+
+/** Typed reads of primitive-specific ext fields; wrong-typed values read as absent. */
+export const extString = (envelope: Envelope | null, key: string): string | undefined => {
+  const value = envelope?.ext?.[key];
+  return typeof value === "string" ? value : undefined;
+};
+
+export const extNumber = (envelope: Envelope | null, key: string): number | undefined => {
+  const value = envelope?.ext?.[key];
+  return typeof value === "number" ? value : undefined;
+};

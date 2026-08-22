@@ -6,7 +6,7 @@
 import { connect } from "@nats-io/transport-node";
 import type { NatsConnection } from "@nats-io/nats-core";
 
-export const CLUSTER_SERVERS = [
+const CLUSTER_SERVERS = [
   "nats://127.0.0.1:14222",
   "nats://127.0.0.1:14223",
   "nats://127.0.0.1:14224",

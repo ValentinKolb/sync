@@ -56,7 +56,8 @@ const q = sync.queue<T>({
   id, owner?, delivery?, retention?,        // retention default 7d / 1 GiB
   dedupeWindowMs?,                          // default 120_000
   ordering?,                                // partitioned ⇒ send() requires orderingKey;
-                                            // retries run in place (order survives failures)
+                                            // retries run in place (order survives failures;
+                                            // maxAttempts bounds attempts per lease, not across crashes)
   maxPayloadBytes?,                         // default 128 KiB (whole envelope)
   replicas?,
 });
@@ -85,7 +86,7 @@ await q.deadLetters.delete({ messageId });                       // boolean
 ## job
 
 ```ts
-const j = sync.job<Input>({ ...QueueConfig without ordering, ordering?, terminalRetentionMs? /* DLQ retention, default 7d */ });
+const j = sync.job<Input>({ ...QueueConfig, terminalRetentionMs? /* DLQ retention, default 7d */ });
 
 await j.submit({ key, input, tenantId?, delayMs?, at?, orderingKey?, meta? });
 // → PublishReceipt & { jobId }; key = NATS msgID within dedupe window, per tenant
@@ -144,16 +145,17 @@ const p = sync.pump<Input, Cursor, Item extends { key: string }>({
   batchSize?,             // default 100 (pull limit)
   dispatchConcurrency?,   // default 1, per active run
   maxActiveRuns?,         // default 100 — global leased runs (consumer MaxAckPending)
-  retention?: { terminalMs?, maxPageBytes? },  // 7d / 128 KiB record incl. page
+  retention?: { terminalMs? },    // terminal run state expires after this (default 7d)
+  maxPageBytes?,                  // persisted run record incl. page, default 128 KiB
+  replicas?,
   retry?: { maxAttempts?, backoffMs? },        // default 5 / [1s, 5s, 30s]
   leaseMs?,               // default 60_000, min 2_000 — crash takeover latency
-  // terminal run state expires after retention.terminalMs (KV per-key TTL)
   pull:     async ({ input, cursor, limit, signal }) => ({ items, nextCursor }), // nextCursor null = done
   dispatch: async ({ input, item, signal }) => {},  // idempotent by item.key
 });
 
 await p.start({ key, input, meta? });   // idempotent while active; restarts terminal runs
-await p.process({ concurrency? });      // reconciles lost wake-ups on start
+await p.process({ concurrency?, signal? }); // reconciles lost wake-ups on start
 await p.get({ key });                   // PumpState | null: status queued|running|waiting|completed|failed|canceled
 await p.cancel({ key });                // boolean, stops at the next checkpoint
 await p.reconcile();                    // { requeued } — re-enqueue wake-ups from KV truth
@@ -165,7 +167,7 @@ Cursor advances only after every page item is checkpointed; a crash repeats only
 
 ```ts
 const s = sync.scheduler({
-  id, owner?,
+  id, owner?, replicas?,
   delivery?,   // maxInFlight is ignored: schedules execute serially (one in-flight tick each)
   retention?: { maxAgeMs?, maxTicksPerSchedule? },  // default 7d / 10_000 per schedule
 });
@@ -178,7 +180,7 @@ await s.create({
   // context: { scheduleId, runId, runNumber, slot, trigger: "schedule"|"manual", attempt, signal, heartbeat() }
 }); // → { created, updated }; republish is self-healing and idempotent
 
-await s.start({ concurrency? });   // serves locally created schedules; serial per schedule
+await s.process({ concurrency?, signal? }); // serves locally created schedules; serial per schedule
 await s.runNow({ id, requestId }); // → { runId }; durably accepted; requestId dedupes within the 120s window
 await s.get({ id });               // ScheduleInfo | null: cron, timezone, misfire, nextRunAt, runNumber, failureCount, handlerAvailable
 await s.list();
@@ -190,13 +192,13 @@ The broker produces ticks while every app process is offline; a later `start()` 
 ## mutex
 
 ```ts
-const m = sync.mutex({ id, owner?, ttlMs? /* default 10_000, rounds up to seconds */, retry? /* { attempts: 10, delayMs: 200 } */, replicas? });
+const m = sync.mutex({ id, owner?, ttlMs? /* default 10_000, rounds up to seconds */, retry? /* { maxAttempts: 10, delayMs: 200 } — total tries incl. the first */, replicas? });
 
-const lock = await m.acquire(resource, { ttlMs?, signal? }); // Lock | null
+const lock = await m.acquire({ resource, ttlMs?, signal? }); // Lock | null
 // Lock: { resource, ownerToken, fence: bigint /* monotonic, stable across extends */, expiresAt }
 await m.extend(lock, { ttlMs? });   // boolean; false = lease lost
 await m.release(lock);              // boolean; owner-only
-await m.withLock(resource, async (lock) => value, { ttlMs?, signal? }); // value | null; always releases
+await m.withLock({ resource, ttlMs?, signal? }, async (lock) => value); // value | null; always releases
 ```
 
 A lease cannot stop an expired owner writing to external systems afterwards — persist and compare `fence`, or make effects idempotent.
@@ -208,13 +210,14 @@ const e = sync.ephemeral<T>({ id, owner?, ttlMs /* required; seconds resolution 
 
 await e.upsert({ tenantId?, key, value, ttlMs? });  // → EphemeralEntry { key, value, revision, updatedAt, expiresAt }
 // snapshot/watch entries omit expiresAt (custom per-key TTLs are unknowable on read)
-await e.touch({ tenantId?, key, ttlMs? });          // boolean; republishes last value with fresh TTL
-await e.remove({ tenantId?, key });                 // boolean
+await e.touch({ tenantId?, key, ttlMs? });          // boolean; CAS-guarded republish with fresh TTL
+await e.delete({ tenantId?, key });                 // boolean
 await e.snapshot({ tenantId?, prefix? });           // { entries, revision }; SnapshotOverflowError beyond maxEntries
 for await (const ev of e.watch({ tenantId?, prefix?, after?, signal? })) {
   // { type: "upsert", entry } | { type: "delete"|"expire", key } | { type: "resync_required", requested, firstAvailable }
 }
 // watch without `after` first replays current entries as upserts, then streams changes.
+// snapshot/watch entries carry updatedAt only; expiresAt exists on upsert results.
 ```
 
 ## objectStore
@@ -228,7 +231,7 @@ const o = sync.objectStore({
 
 const ref = await o.put({ tenantId?, key, body: ReadableStream, metadata?, signal? });
 // → ObjectRef { storeId, tenantId, key, size, digest } — plain JSON, safe in payloads
-const obj = await o.get(ref, { idleTimeoutMs? }); // StoredObject | null (null if deleted OR replaced since);
+const obj = await o.get(ref, { signal?, idleTimeoutMs? }); // StoredObject | null (null if deleted OR replaced since);
 // idleTimeoutMs (default 30s) errors a stalled body instead of hanging forever.
 // metadata keys starting with "sync." are rejected.
 await o.info({ tenantId?, key });    // SyncObjectInfo | null
@@ -255,4 +258,4 @@ isRetryableTransportError(error);   // network-vocabulary heuristics (no Redis c
 
 ## Errors
 
-`SyncError` base; `SyncLifecycleError`, `UnsupportedServerError`, `InvalidNameError` (name/bounds violations), `SyncUsageError` (API misuse: mutually exclusive options, reader on partitioned queues, foreign ObjectRef, reserved metadata, invalid cron), `NotFoundError` (missing dead letter / schedule), `ConflictingResourceDeclarationError`, `ResourceIdentityCollisionError`, `ResourceDriftError { resource, differences }`, `PayloadTooLargeError { actualBytes, maxBytes }`, `ObjectTooLargeError`, `StaleDeliveryError`, `RetentionGapError { requested, firstAvailable, resumeAfter }`, `CursorMismatchError`, `BatchSubmitError { accepted, duplicates }`, `SnapshotOverflowError { maxEntries }`. Config validation throws plain `RangeError`.
+`SyncError` base; `SyncLifecycleError`, `UnsupportedServerError`, `InvalidNameError` (name/bounds violations), `SyncUsageError` (API misuse: mutually exclusive options, reader on partitioned queues, foreign ObjectRef, reserved metadata, invalid cron), `NotFoundError` (missing dead letter / schedule), `ConflictingResourceDeclarationError`, `ResourceIdentityCollisionError`, `ResourceDriftError { resource, differences }`, `PayloadTooLargeError { actualBytes, maxBytes }`, `ObjectTooLargeError`, `StaleDeliveryError`, `RetentionGapError { requested, firstAvailable, resumeAfter }`, `CursorMismatchError`, `BatchSubmitError { accepted, duplicates }`, `SnapshotOverflowError { maxEntries }`. Config validation throws plain `RangeError`; empty namespace/application throws `SyncLifecycleError`; non-serializable payloads throw `TypeError`.

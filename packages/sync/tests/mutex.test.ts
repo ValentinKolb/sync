@@ -24,37 +24,37 @@ afterAll(async () => {
 
 describe("mutex", () => {
   test("exclusive acquire; second holder waits for release", async () => {
-    const mutex = sync.mutex({ id: "excl", retry: { attempts: 0 } });
-    const lock = await mutex.acquire("resource-a");
+    const mutex = sync.mutex({ id: "excl", retry: { maxAttempts: 1 } });
+    const lock = await mutex.acquire({ resource: "resource-a" });
     expect(lock).not.toBeNull();
-    expect(await mutex.acquire("resource-a")).toBeNull();
+    expect(await mutex.acquire({ resource: "resource-a" })).toBeNull();
     // Independent resources do not contend.
-    const other = await mutex.acquire("resource-b");
+    const other = await mutex.acquire({ resource: "resource-b" });
     expect(other).not.toBeNull();
     expect(await mutex.release(lock!)).toBe(true);
-    const next = await mutex.acquire("resource-a");
+    const next = await mutex.acquire({ resource: "resource-a" });
     expect(next).not.toBeNull();
     await mutex.release(next!);
     await mutex.release(other!);
   });
 
   test("expired lease frees the resource; fencing token grows monotonically", async () => {
-    const mutex = sync.mutex({ id: "expiry", ttlMs: 1_000, retry: { attempts: 0 } });
-    const first = await mutex.acquire("job-runner");
+    const mutex = sync.mutex({ id: "expiry", ttlMs: 1_000, retry: { maxAttempts: 1 } });
+    const first = await mutex.acquire({ resource: "job-runner" });
     expect(first).not.toBeNull();
     await Bun.sleep(2_500);
-    const second = await mutex.acquire("job-runner");
+    const second = await mutex.acquire({ resource: "job-runner" });
     expect(second).not.toBeNull();
     expect(second!.fence).toBeGreaterThan(first!.fence);
     await mutex.release(second!);
   }, 15_000);
 
   test("stale owner cannot extend or release after expiry and reacquisition", async () => {
-    const mutex = sync.mutex({ id: "stale", ttlMs: 1_000, retry: { attempts: 0 } });
-    const stale = await mutex.acquire("shared");
+    const mutex = sync.mutex({ id: "stale", ttlMs: 1_000, retry: { maxAttempts: 1 } });
+    const stale = await mutex.acquire({ resource: "shared" });
     expect(stale).not.toBeNull();
     await Bun.sleep(2_500);
-    const fresh = await mutex.acquire("shared");
+    const fresh = await mutex.acquire({ resource: "shared" });
     expect(fresh).not.toBeNull();
     expect(await mutex.extend(stale!)).toBe(false);
     expect(await mutex.release(stale!)).toBe(false);
@@ -64,8 +64,8 @@ describe("mutex", () => {
   }, 15_000);
 
   test("extend keeps the lease alive beyond the original TTL and preserves the fence", async () => {
-    const mutex = sync.mutex({ id: "extend", ttlMs: 1_000, retry: { attempts: 0 } });
-    const lock = await mutex.acquire("renewing");
+    const mutex = sync.mutex({ id: "extend", ttlMs: 1_000, retry: { maxAttempts: 1 } });
+    const lock = await mutex.acquire({ resource: "renewing" });
     expect(lock).not.toBeNull();
     const fence = lock!.fence;
     for (let i = 0; i < 3; i++) {
@@ -73,38 +73,38 @@ describe("mutex", () => {
       expect(await mutex.extend(lock!)).toBe(true);
     }
     expect(lock!.fence).toBe(fence);
-    expect(await mutex.acquire("renewing")).toBeNull();
+    expect(await mutex.acquire({ resource: "renewing" })).toBeNull();
     await mutex.release(lock!);
   }, 15_000);
 
   test("withLock runs the function under the lock and always releases", async () => {
-    const mutex = sync.mutex({ id: "with", retry: { attempts: 0 } });
-    const result = await mutex.withLock("crit", async (lock: Lock) => {
-      expect(await mutex.acquire("crit")).toBeNull();
+    const mutex = sync.mutex({ id: "with", retry: { maxAttempts: 1 } });
+    const result = await mutex.withLock({ resource: "crit" }, async (lock: Lock) => {
+      expect(await mutex.acquire({ resource: "crit" })).toBeNull();
       return "done";
     });
     expect(result).toBe("done");
-    const after = await mutex.acquire("crit");
+    const after = await mutex.acquire({ resource: "crit" });
     expect(after).not.toBeNull();
     await mutex.release(after!);
 
     // Function failure still releases.
     await expect(
-      mutex.withLock("crit", async () => {
+      mutex.withLock({ resource: "crit" }, async () => {
         throw new Error("inner");
       }),
     ).rejects.toThrow("inner");
-    const again = await mutex.acquire("crit");
+    const again = await mutex.acquire({ resource: "crit" });
     expect(again).not.toBeNull();
     await mutex.release(again!);
   });
 
   test("contending acquirers serialize on one resource", async () => {
-    const mutex = sync.mutex({ id: "contend", ttlMs: 5_000, retry: { attempts: 50, delayMs: 50 } });
+    const mutex = sync.mutex({ id: "contend", ttlMs: 5_000, retry: { maxAttempts: 50, delayMs: 50 } });
     let holders = 0;
     let maxHolders = 0;
     const critical = async (): Promise<void> => {
-      const value = await mutex.withLock("hot", async () => {
+      const value = await mutex.withLock({ resource: "hot" }, async () => {
         holders += 1;
         maxHolders = Math.max(maxHolders, holders);
         await Bun.sleep(50);

@@ -1,13 +1,13 @@
-import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType } from "@nats-io/jetstream";
+import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from "@nats-io/jetstream";
 import type { JsMsg } from "@nats-io/jetstream";
 import type { KV } from "@nats-io/kv";
-import { headers as natsHeaders } from "@nats-io/nats-core";
 import { decodeJson, encodeJson } from "./codec.ts";
 import type { JsonValue } from "./codec.ts";
 import { runPullLoop } from "./consume.ts";
 import { PayloadTooLargeError, asError } from "./errors.ts";
-import { assertName, resourceIdentity, subjectRoot, subjectToken, decodeSubjectToken } from "./naming.ts";
-import { ensureConsumer, ensureKv, ensureStream } from "./resources.ts";
+import { kvCasPut } from "./kv.ts";
+import { assertName, kvBucketName, resourceIdentity, subjectRoot, subjectToken, decodeSubjectToken } from "./naming.ts";
+import { ensureConsumer, ensureKv, ensureStream, toStorageType } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
 import { DEFAULT_MESSAGE_PAYLOAD_BYTES, nanos } from "./types.ts";
@@ -33,9 +33,10 @@ export type PumpConfig<Input, Cursor, Item extends PumpItem> = {
   retention?: {
     /** How long terminal run state stays readable. Default 7 days. */
     terminalMs?: number;
-    /** Maximum encoded bytes of one persisted run record incl. its page. Default 128 KiB. */
-    maxPageBytes?: number;
   };
+  /** Maximum encoded bytes of one persisted run record incl. its page. Default 128 KiB. */
+  maxPageBytes?: number;
+  replicas?: number;
   retry?: { maxAttempts?: number; backoffMs?: number[] };
   /** Run lease duration: crash takeover latency vs. duplicate-claim safety. Default 60_000, min 2_000. */
   leaseMs?: number;
@@ -104,7 +105,7 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
   const batchSize = config.batchSize ?? 100;
   const dispatchConcurrency = config.dispatchConcurrency ?? 1;
   const maxActiveRuns = config.maxActiveRuns ?? 100;
-  const maxPageBytes = config.retention?.maxPageBytes ?? DEFAULT_MESSAGE_PAYLOAD_BYTES;
+  const maxPageBytes = config.maxPageBytes ?? DEFAULT_MESSAGE_PAYLOAD_BYTES;
   const terminalMs = config.retention?.terminalMs ?? 7 * 24 * 60 * 60 * 1_000;
   const maxAttempts = config.retry?.maxAttempts ?? 5;
   const backoffMs = config.retry?.backoffMs ?? [1_000, 5_000, 30_000];
@@ -124,9 +125,9 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
     if (!Number.isSafeInteger(value) || value < 1) throw new RangeError(`${label} must be a positive integer`);
   }
 
-  const replicas = runtime.defaults.replicas;
-  const storage = runtime.defaults.storage === "memory" ? StorageType.Memory : StorageType.File;
-  const bucket = `S6_P_${identity.hash}`;
+  const replicas = config.replicas ?? runtime.defaults.replicas;
+  const storage = toStorageType(runtime.defaults.storage);
+  const bucket = kvBucketName(identity);
   const wakeStream = `S6_PQ_${identity.hash}`;
   const wakeDurable = `S6_PQC_${identity.hash}`;
   const root = subjectRoot(identity);
@@ -201,20 +202,35 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
   type Loaded = { record: PumpRecord<Input, Cursor, Item>; revision: number } | null;
 
   const load = async (key: string): Promise<Loaded> => {
+    const state = await readRunKey(key);
+    return state.record === null ? null : { record: state.record, revision: state.lastRevision };
+  };
+
+  /**
+   * Raw KV state of a run key. A DEL/PURGE marker (e.g. the terminalMs expiry
+   * marker) still owns the subject's last revision — CAS creates must expect
+   * it, not 0, or every start() during the marker window silently loses.
+   */
+  const readRunKey = async (
+    key: string,
+  ): Promise<{ record: PumpRecord<Input, Cursor, Item> | null; lastRevision: number }> => {
     const store = await getKv();
     const entry = await store.get(runKey(key));
-    if (entry === null || entry.operation !== "PUT") return null;
+    if (entry === null) return { record: null, lastRevision: 0 };
+    if (entry.operation !== "PUT") return { record: null, lastRevision: entry.revision };
     try {
-      return { record: decodeJson<PumpRecord<Input, Cursor, Item>>(entry.value), revision: entry.revision };
+      return { record: decodeJson<PumpRecord<Input, Cursor, Item>>(entry.value), lastRevision: entry.revision };
     } catch {
-      return null;
+      return { record: null, lastRevision: entry.revision };
     }
   };
 
   /**
    * CAS write; returns the new revision or null when the record moved
    * underneath us. Terminal records carry a per-key TTL so run state expires
-   * after retention.terminalMs instead of growing the bucket forever.
+   * after retention.terminalMs instead of growing the bucket forever. The
+   * encode limit gets headroom so lease/status/lastError bookkeeping can
+   * never be the write that pushes a page-sized record over the edge.
    */
   const casWrite = async (
     key: string,
@@ -223,20 +239,10 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
   ): Promise<number | null> => {
     await getKv();
     record.updatedAt = new Date().toISOString();
-    const bytes = encodeJson(label, record, maxPageBytes);
+    const bytes = encodeJson(label, record, maxPageBytes + 8_192);
     const ctx = await runtime.context();
-    const hdrs = natsHeaders();
-    hdrs.set("Nats-Expected-Last-Subject-Sequence", String(previousRevision));
-    if (TERMINAL.includes(record.status)) {
-      hdrs.set("Nats-TTL", `${Math.max(1, Math.ceil(terminalMs / 1_000))}s`);
-    }
-    try {
-      const ack = await ctx.js.publish(`$KV.${bucket}.${runKey(key)}`, bytes, { headers: hdrs });
-      return ack.seq;
-    } catch (error) {
-      if (/wrong last sequence/i.test(asError(error).message)) return null;
-      throw error;
-    }
+    const ttl = TERMINAL.includes(record.status) ? `${Math.max(1, Math.ceil(terminalMs / 1_000))}s` : undefined;
+    return kvCasPut(ctx, bucket, runKey(key), bytes, previousRevision, ttl !== undefined ? { ttl } : {});
   };
 
   /**
@@ -292,9 +298,23 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
       createdAt: now,
       updatedAt: now,
     };
-    const revision = await casWrite(input.key, record, existing?.revision ?? 0);
-    if (revision === null) return; // lost a concurrent start — that start enqueues the wake-up
-    await publishWake(input.key);
+    // Retry the create: the CAS can lose against a concurrent start() OR
+    // against the terminalMs expiry marker still holding the last revision.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const state = attempt === 0 ? null : await readRunKey(input.key);
+      if (state !== null && state.record !== null && !TERMINAL.includes(state.record.status)) {
+        // A concurrent start won; make sure its wake-up exists and stop.
+        await publishWake(input.key);
+        return;
+      }
+      const previous = state === null ? (existing !== null ? existing.revision : (await readRunKey(input.key)).lastRevision) : state.lastRevision;
+      const revision = await casWrite(input.key, record, previous);
+      if (revision !== null) {
+        await publishWake(input.key);
+        return;
+      }
+    }
+    throw new Error(`${label}: start(${input.key}) is contended`);
   };
 
   const get: Pump<Input, Cursor>["get"] = async (input) => {
@@ -362,7 +382,16 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
         status: "running",
         lease: { token: leaseToken, until: new Date(Date.now() + leaseMs).toISOString() },
       };
-      const revision = await casWrite(key, claimed, loaded.revision);
+      let revision: number | null;
+      try {
+        revision = await casWrite(key, claimed, loaded.revision);
+      } catch (error) {
+        // A record that cannot even hold its lease bookkeeping is faulty
+        // data, not transient contention — surface it and retry later.
+        runtime.events.emit({ type: "handler_error", resource: config.id, kind: "pump", error: asError(error).message });
+        msg.nak(5_000);
+        return;
+      }
       if (revision !== null) {
         loaded = { record: claimed, revision };
         break;
@@ -411,15 +440,24 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
     const fail = async (error: Error, options: { dropPage?: boolean } = {}): Promise<void> => {
       const failureCount = record.failureCount + 1;
       const terminal = failureCount >= maxAttempts;
-      await checkpoint((r) => {
-        r.status = terminal ? "failed" : "waiting";
-        r.failureCount = failureCount;
-        r.lastError = error.message.slice(0, 2_048);
-        r.lease = undefined;
-        // Only when the page itself cannot be persisted (oversized) is it
-        // dropped; ordinary failures keep the per-item done[] checkpoints.
-        if (options.dropPage) delete r.page;
-      });
+      const writeFailure = (dropPage: boolean): Promise<boolean> =>
+        checkpoint((r) => {
+          r.status = terminal ? "failed" : "waiting";
+          r.failureCount = failureCount;
+          r.lastError = error.message.slice(0, 2_048);
+          r.lease = undefined;
+          // Only when the page itself cannot be persisted (oversized) is it
+          // dropped; ordinary failures keep the per-item done[] checkpoints.
+          if (dropPage) delete r.page;
+        });
+      try {
+        await writeFailure(options.dropPage ?? false);
+      } catch (writeError) {
+        if (!(writeError instanceof PayloadTooLargeError) || options.dropPage) throw writeError;
+        // The failure bookkeeping itself did not fit next to the page: the
+        // page has to go, or the run wedges outside the retry policy.
+        await writeFailure(true);
+      }
       if (lost) {
         msg.nak();
         return;
@@ -427,6 +465,41 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
       runtime.events.emit({ type: "handler_error", resource: config.id, kind: "pump", error: error.message });
       if (terminal) msg.ack();
       else msg.nak(backoffMs[Math.min(failureCount - 1, backoffMs.length - 1)]!);
+    };
+
+    /** Dispatch remaining page items with bounded concurrency; returns the first error or null. */
+    const dispatchPage = async (
+      page: NonNullable<PumpRecord<Input, Cursor, Item>["page"]>,
+    ): Promise<Error | null> => {
+      const doneKeys = new Set(page.done);
+      const remaining = page.items.filter((item) => !doneKeys.has(item.key));
+      // Element writes are not flow-narrowed, so no cast is needed to read
+      // the closure-written result after the workers settle.
+      const errors: Error[] = [];
+      let index = 0;
+      const workers = Array.from({ length: Math.min(dispatchConcurrency, remaining.length) }, async () => {
+        while (errors.length === 0 && !signal.aborted && !lost) {
+          const item = remaining[index++];
+          if (item === undefined) return;
+          try {
+            await config.dispatch({ input: record.input, item, signal });
+          } catch (error) {
+            errors.push(asError(error));
+            return;
+          }
+          try {
+            await checkpoint((r) => {
+              r.page?.done.push(item.key);
+            });
+          } catch (error) {
+            if (!(error instanceof PayloadTooLargeError)) throw error;
+            errors.push(error);
+            return;
+          }
+        }
+      });
+      await Promise.all(workers);
+      return errors[0] ?? null;
     };
 
     while (true) {
@@ -531,7 +604,8 @@ export const createPump = <Input, Cursor, Item extends PumpItem>(
       if (lost || signal.aborted || TERMINAL.includes(record.status)) continue; // handled at loop head
 
       // 3. Page complete: advance the committed cursor, clear the page.
-      const finished = record.page!;
+      const finished = record.page;
+      if (finished === undefined) continue; // reloaded without a page — re-evaluate
       const advanced = await checkpoint((r) => {
         r.cursor = finished.nextCursor;
         r.dispatched += finished.items.length;

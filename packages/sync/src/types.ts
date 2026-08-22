@@ -15,6 +15,7 @@ export type DeliveryConfig = {
   backoffMs?: number[];
 };
 
+// fallow-ignore-next-line unused-type -- part of exported signatures; required for declaration emit
 export type ResolvedDelivery = Required<DeliveryConfig>;
 
 export type RetentionConfig = {
@@ -35,7 +36,7 @@ export type PublishReceipt = {
 // Defaults and validation
 // ==========================
 
-export const DEFAULT_DELIVERY: ResolvedDelivery = {
+const DEFAULT_DELIVERY: ResolvedDelivery = {
   ackWaitMs: 30_000,
   maxAttempts: 5,
   maxInFlight: 1_000,

@@ -1,3 +1,4 @@
+import { extString } from "./codec.ts";
 import type { JsonValue } from "./codec.ts";
 import { BatchSubmitError, asError } from "./errors.ts";
 import { assertName } from "./naming.ts";
@@ -72,7 +73,7 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
     runtime,
     { ...config, dlqMaxAgeMs: terminalRetentionMs },
     "job",
-    (envelope) => ({ key: (envelope.ext?.key as string) ?? "", input: envelope.data as Input }),
+    (envelope) => ({ key: extString(envelope, "key") ?? "", input: envelope.data as Input }),
   );
 
   const toSend = (job: JobSubmit<Input>) => {
@@ -125,7 +126,7 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
     };
 
     try {
-      for await (const job of jobs as AsyncIterable<JobSubmit<Input>>) {
+      for await (const job of jobs) {
         if (options.signal?.aborted) throw new Error("submitMany aborted");
         const { message, ext } = toSend(job);
         const prepared = await core.prepareSend(message, ext);
@@ -178,13 +179,13 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
     return core.process(
       processOptions,
       async (message, envelope) => {
-        await handler(toContext(message, (envelope.ext?.key as string) ?? ""));
+        await handler(toContext(message, extString(envelope, "key") ?? ""));
       },
       onError === undefined
         ? undefined
         : async ({ message, envelope, error }) => {
             const decision = await onError({
-              context: toContext(message, (envelope.ext?.key as string) ?? ""),
+              context: toContext(message, extString(envelope, "key") ?? ""),
               error,
             });
             return decision.action === "retry"

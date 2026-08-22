@@ -85,7 +85,7 @@ describe("scheduler execution", () => {
     await scheduler.create({ id: "task", cron: "0 0 1 1 *", process: async (context) => {
       runs.push(context);
     } });
-    const worker = await scheduler.start();
+    const worker = await scheduler.process();
 
     const first = await scheduler.runNow({ id: "task", requestId: "req-1" });
     const dup = await scheduler.runNow({ id: "task", requestId: "req-1" });
@@ -116,7 +116,7 @@ describe("scheduler execution", () => {
     await publishFakeTick("latest", "coalesce");
     await publishFakeTick("latest", "coalesce");
     await publishFakeTick("latest", "coalesce");
-    const worker = await scheduler.start();
+    const worker = await scheduler.process();
     await waitFor(() => executed.length >= 1, 15_000);
     await Bun.sleep(700);
     expect(executed).toHaveLength(1); // only the newest slot ran
@@ -132,7 +132,7 @@ describe("scheduler execution", () => {
     await publishFakeTick("all", "each");
     await publishFakeTick("all", "each");
     await publishFakeTick("all", "each");
-    const worker = await scheduler.start();
+    const worker = await scheduler.process();
     await waitFor(() => executed.length >= 3, 20_000);
     expect(executed).toEqual([1, 2, 3]);
     await worker.drain();
@@ -148,7 +148,7 @@ describe("scheduler execution", () => {
       attempts.push(context.attempt);
       throw new Error("handler down");
     } });
-    const worker = await scheduler.start();
+    const worker = await scheduler.process();
     await scheduler.runNow({ id: "broken", requestId: "go" });
     await waitFor(() => attempts.length >= 2, 15_000);
     await waitFor(async () => (await scheduler.get({ id: "broken" }))!.failureCount === 1, 15_000);
@@ -168,7 +168,7 @@ describe("scheduler execution", () => {
       active -= 1;
       runs += 1;
     } });
-    const worker = await scheduler.start({ concurrency: 4 });
+    const worker = await scheduler.process({ concurrency: 4 });
     await scheduler.runNow({ id: "slow", requestId: "a" });
     await scheduler.runNow({ id: "slow", requestId: "b" });
     await scheduler.runNow({ id: "slow", requestId: "c" });
@@ -199,7 +199,7 @@ describe("scheduler execution", () => {
     }
     expect(tickSeen).toBe(true);
     // A worker starting later processes the offline tick.
-    const worker = await scheduler.start();
+    const worker = await scheduler.process();
     await waitFor(() => executed.length >= 1, 15_000);
     expect(executed[0]!.trigger).toBe("schedule");
     expect(executed[0]!.slot.getTime()).toBeGreaterThan(Date.now() - 120_000);
@@ -254,7 +254,7 @@ describe("hardening regressions", () => {
     await scheduler.create({ id: "phoenix", cron: "0 0 1 1 *", process: async (context) => {
       runs.push(context.runId);
     } });
-    const worker = await scheduler.start();
+    const worker = await scheduler.process();
     await scheduler.runNow({ id: "phoenix", requestId: "r1" });
     await waitFor(() => runs.length >= 1, 15_000);
 

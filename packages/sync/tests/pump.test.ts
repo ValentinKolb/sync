@@ -246,7 +246,7 @@ describe("hardening regressions", () => {
     const pump = sync.pump<Input, number, Item>({
       id: "oversized",
       retry: { maxAttempts: 2, backoffMs: [200] },
-      retention: { maxPageBytes: 8 * 1024 },
+      maxPageBytes: 8 * 1024,
       pull: async () => ({
         items: [{ key: bigKey }, { key: `${bigKey}2` }],
         nextCursor: null,

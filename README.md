@@ -189,7 +189,7 @@ await cron.create({
   },
 });
 
-await cron.start({ concurrency: 4 }); // runs of one schedule never overlap
+await cron.process({ concurrency: 4 }); // runs of one schedule never overlap
 await cron.runNow({ id: "cleanup", requestId: "manual-1" }); // durably accepted
 ```
 
@@ -202,7 +202,7 @@ KV compare-and-set leases with monotonic fencing.
 ```ts
 const locks = sync.mutex({ id: "provider-refresh", ttlMs: 10_000 });
 
-const result = await locks.withLock("tenant:42", async (lock) => {
+const result = await locks.withLock({ resource: "tenant:42" }, async (lock) => {
   // lock.fence is a monotonic bigint — persist and compare it if stale
   // writes to external systems after lease expiry must be excluded.
   return refresh(lock.fence);

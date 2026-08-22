@@ -1,10 +1,9 @@
-import { headers as natsHeaders } from "@nats-io/nats-core";
-import { StorageType } from "@nats-io/jetstream";
-import type { KV, KvWatchEntry } from "@nats-io/kv";
+import type { KV } from "@nats-io/kv";
 import { decodeJson, encodeJson } from "./codec.ts";
-import { SnapshotOverflowError, asError } from "./errors.ts";
+import { kvCasPut, kvPut } from "./kv.ts";
+import { CursorMismatchError, SnapshotOverflowError, asError } from "./errors.ts";
 import { assertName, assertSubjectLength, decodeSubjectToken, kvBucketName, resourceIdentity, subjectToken } from "./naming.ts";
-import { ensureKv } from "./resources.ts";
+import { ensureKv, toStorageType } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
 import { DEFAULT_EPHEMERAL_PAYLOAD_BYTES, DEFAULT_TENANT } from "./types.ts";
@@ -52,7 +51,7 @@ export type Ephemeral<T> = {
   upsert(input: { tenantId?: string; key: string; value: T; ttlMs?: number }): Promise<EphemeralEntry<T>>;
   /** Refresh a key's TTL by republishing its last value. False if the key is absent. */
   touch(input: { tenantId?: string; key: string; ttlMs?: number }): Promise<boolean>;
-  remove(input: { tenantId?: string; key: string }): Promise<boolean>;
+  delete(input: { tenantId?: string; key: string }): Promise<boolean>;
   snapshot(input?: { tenantId?: string; prefix?: string }): Promise<EphemeralSnapshot<T>>;
   watch(input?: {
     tenantId?: string;
@@ -76,7 +75,7 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
   const maxEntries = config.maxEntries ?? 10_000;
   const maxValueBytes = config.maxValueBytes ?? DEFAULT_EPHEMERAL_PAYLOAD_BYTES;
   const replicas = config.replicas ?? runtime.defaults.replicas;
-  const storage = runtime.defaults.storage === "memory" ? StorageType.Memory : StorageType.File;
+  const storage = toStorageType(runtime.defaults.storage);
   const bucket = kvBucketName(identity);
   const label = `ephemeral ${config.id}`;
 
@@ -134,33 +133,7 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
 
   const ttlSeconds = (ttlMs: number | undefined): number => Math.max(1, Math.ceil((ttlMs ?? config.ttlMs) / 1_000));
 
-  /**
-   * KV put with a per-message TTL header (and optional CAS). The KV client's
-   * put() does not expose per-message TTL, so this publishes to the bucket's
-   * documented `$KV.<bucket>.<key>` subject directly. With `previousSeq` set,
-   * a CAS conflict returns null instead of writing.
-   */
-  const putWithTtl = async (
-    rawKey: string,
-    value: T,
-    ttlMs: number | undefined,
-    previousSeq?: number,
-  ): Promise<number | null> => {
-    const ctx = await runtime.context();
-    const bytes = encodeJson(label, value ?? null, maxValueBytes);
-    const hdrs = natsHeaders();
-    hdrs.set("Nats-TTL", `${ttlSeconds(ttlMs)}s`);
-    if (previousSeq !== undefined) {
-      hdrs.set("Nats-Expected-Last-Subject-Sequence", String(previousSeq));
-    }
-    try {
-      const ack = await ctx.js.publish(`$KV.${bucket}.${rawKey}`, bytes, { headers: hdrs });
-      return ack.seq;
-    } catch (error) {
-      if (previousSeq !== undefined && /wrong last sequence/i.test(asError(error).message)) return null;
-      throw error;
-    }
-  };
+  const encodeValue = (value: T): Uint8Array => encodeJson(label, value ?? null, maxValueBytes);
 
   const toEntry = (
     rawKey: string,
@@ -185,7 +158,8 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
     await declaration.ready();
     const rawKey = kvKey(tenantId, input.key);
     const now = new Date();
-    const seq = (await putWithTtl(rawKey, input.value, input.ttlMs))!;
+    const ctx = await runtime.context();
+    const seq = await kvPut(ctx, bucket, rawKey, encodeValue(input.value), { ttl: `${ttlSeconds(input.ttlMs)}s` });
     return toEntry(rawKey, input.value, seq, now, input.ttlMs);
   };
 
@@ -200,7 +174,10 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
     for (let attempt = 0; attempt < 5; attempt++) {
       const entry = await store.get(rawKey);
       if (entry === null || entry.operation !== "PUT") return false;
-      const seq = await putWithTtl(rawKey, decodeJson<T>(entry.value), input.ttlMs, entry.revision);
+      const ctx = await runtime.context();
+      const seq = await kvCasPut(ctx, bucket, rawKey, encodeValue(decodeJson<T>(entry.value)), entry.revision, {
+        ttl: `${ttlSeconds(input.ttlMs)}s`,
+      });
       if (seq !== null) return true;
       // Lost the race — whoever won also refreshed the key's TTL just now,
       // so the touch goal is already achieved.
@@ -210,7 +187,7 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
     return false;
   };
 
-  const remove: Ephemeral<T>["remove"] = async (input) => {
+  const deleteEntry: Ephemeral<T>["delete"] = async (input) => {
     runtime.assertActive();
     assertName(input.key, "key");
     const tenantId = input.tenantId ?? DEFAULT_TENANT;
@@ -270,7 +247,7 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
     if (input.after !== undefined) {
       const after = Number(input.after);
       if (!Number.isSafeInteger(after) || after < 0) {
-        throw new RangeError(`after is not a valid ephemeral revision: ${input.after}`);
+        throw new CursorMismatchError(`after is not a valid ephemeral revision: ${input.after}`);
       }
       const status = await store.status();
       const firstSeq = status.streamInfo.state.first_seq;
@@ -289,14 +266,16 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
       resumeFrom = after + 1;
     }
 
+    if (input.signal?.aborted) return;
     const iterator = await store.watch({
       key: tenantFilter(input.tenantId),
       ...(resumeFrom !== null ? { resumeFromRevision: resumeFrom } : {}),
     });
     const onAbort = (): void => iterator.stop();
     input.signal?.addEventListener("abort", onAbort, { once: true });
+    if (input.signal?.aborted) onAbort();
     try {
-      for await (const entry of iterator as AsyncIterable<KvWatchEntry>) {
+      for await (const entry of iterator) {
         const key = decodeKvKey(entry.key);
         if (key === null) continue;
         if (input.prefix !== undefined && !key.startsWith(input.prefix)) continue;
@@ -334,7 +313,7 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
     ready: () => declaration.ready(),
     upsert,
     touch,
-    remove,
+    delete: deleteEntry,
     snapshot,
     watch,
   };

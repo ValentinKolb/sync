@@ -42,8 +42,8 @@ describe("ephemeral state", () => {
     const acme = await registry.snapshot({ tenantId: "acme" });
     expect(acme.entries.map((e) => e.key)).toEqual(["svc/other"]);
 
-    expect(await registry.remove({ key: "svc/api-2" })).toBe(true);
-    expect(await registry.remove({ key: "svc/api-2" })).toBe(false);
+    expect(await registry.delete({ key: "svc/api-2" })).toBe(true);
+    expect(await registry.delete({ key: "svc/api-2" })).toBe(false);
     expect((await registry.snapshot({ prefix: "svc/" })).entries).toHaveLength(1);
   });
 
@@ -70,7 +70,7 @@ describe("ephemeral state", () => {
     await Bun.sleep(250);
     await live.upsert({ key: "a", value: { user: "a", status: "up" }, ttlMs: 60_000 });
     await live.upsert({ key: "b", value: { user: "b", status: "up" }, ttlMs: 1_000 });
-    await live.remove({ key: "a" });
+    await live.delete({ key: "a" });
     await waitFor(() => events.length >= 4, 15_000); // upsert a, upsert b, delete a, expire b
     controller.abort();
     expect(events[0]).toMatchObject({ type: "upsert" });
@@ -160,4 +160,14 @@ describe("hardening regressions", () => {
     const key = "k".repeat(96);
     await expect(state.upsert({ tenantId: tenant, key, value: 1 })).rejects.toThrow("characters");
   });
+});
+
+describe("watch signal handling", () => {
+  test("a pre-aborted signal ends the watch immediately instead of hanging", async () => {
+    const state = sync.ephemeral<number>({ id: "pre-abort", ttlMs: 60_000 });
+    await state.upsert({ key: "x", value: 1 });
+    const events = [];
+    for await (const event of state.watch({ signal: AbortSignal.abort() })) events.push(event);
+    expect(events).toEqual([]);
+  }, 10_000);
 });
