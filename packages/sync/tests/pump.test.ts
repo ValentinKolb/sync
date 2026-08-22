@@ -1,783 +1,183 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
-import { redis } from "bun";
-import { pump, type PumpHandle } from "../index";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import type { NatsConnection } from "@nats-io/nats-core";
+import { createSync } from "../src/sync.ts";
+import type { Sync } from "../src/sync.ts";
+import { connectToCluster } from "./cluster.ts";
+import { cleanupNamespaces, testNamespace, waitFor } from "./helpers.ts";
 
-type Input = { source: string };
-type Cursor = number;
-type Item = { key: string; value: number };
+type Input = { total: number };
+type Item = { key: string };
 
-const handles: PumpHandle<unknown, unknown>[] = [];
-const PUMP_PREFIX = "test:pump:unit";
-const COLLISION_LEFT_PREFIX = `${PUMP_PREFIX}:root`;
-const COLLISION_RIGHT_PREFIX = `${PUMP_PREFIX}:root:mail`;
-const uid = (name: string): string => `${name}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
-const pumpBaseKey = (prefix: string, id: string): string =>
-  `sync:pump:namespace:v2:${encodeURIComponent(JSON.stringify([prefix, id]))}`;
-const pumpDueKey = (prefix: string, id: string): string =>
-  `${pumpBaseKey(prefix, id)}:due`;
-const pumpStateKey = (prefix: string, id: string, key: string): string =>
-  `${pumpBaseKey(prefix, id)}:run:${encodeURIComponent(key)}`;
-const pumpNamespacePattern = (prefix: string): string =>
-  `sync:pump:namespace:v2:${encodeURIComponent(`${JSON.stringify([prefix]).slice(0, -1)},`)}*`;
+let nc: NatsConnection;
+let sync: Sync;
+const namespace = testNamespace();
 
-const track = <I, C>(handle: PumpHandle<I, C>): PumpHandle<I, C> => {
-  handles.push(handle as PumpHandle<unknown, unknown>);
-  return handle;
-};
-
-const waitFor = async (
-  predicate: () => boolean | Promise<boolean>,
-  timeoutMs = 5_000,
-  pollMs = 20,
-): Promise<void> => {
-  const startedAt = Date.now();
-  while (!(await predicate())) {
-    if (Date.now() - startedAt > timeoutMs) {
-      throw new Error(`waitFor timed out after ${timeoutMs}ms`);
-    }
-    await Bun.sleep(pollMs);
-  }
-};
-
-const cleanup = async (): Promise<void> => {
-  const matches = await Promise.all([
-    redis.send("KEYS", [`${PUMP_PREFIX}:*`]),
-    ...[PUMP_PREFIX, COLLISION_LEFT_PREFIX, COLLISION_RIGHT_PREFIX]
-      .map((prefix) => redis.send("KEYS", [pumpNamespacePattern(prefix)])),
-  ]);
-  const keys = matches.flatMap((value) => Array.isArray(value) ? value.map(String) : []);
-  if (keys.length > 0) await redis.send("DEL", keys);
-};
-
-beforeEach(cleanup);
-
-afterEach(async () => {
-  for (const handle of handles.splice(0)) handle.stop();
-  await Bun.sleep(20);
-  await cleanup();
-});
-
-test("rejects non-finite numeric configuration", () => {
-  const base = {
-    id: uid("finite-config"),
-    pull: () => ({ items: [], nextCursor: null }),
-    dispatch: () => {},
+/** Source of `total` numbered items, paged by cursor. */
+const pagedPull =
+  (batch: number) =>
+  async ({ input, cursor, limit }: { input: Input; cursor: number | null; limit: number }) => {
+    const start = cursor ?? 0;
+    const end = Math.min(start + Math.min(limit, batch), input.total);
+    const items: Item[] = [];
+    for (let i = start; i < end; i++) items.push({ key: `item-${i}` });
+    return { items, nextCursor: end >= input.total ? null : end };
   };
 
-  expect(() => pump({ ...base, batchSize: Number.NaN })).toThrow(/batchSize must be finite/);
-  expect(() => pump({ ...base, defaults: { leaseMs: Number.POSITIVE_INFINITY } })).toThrow(
-    /defaults\.leaseMs must be finite/,
-  );
-  expect(() => pump({ ...base, limits: { pageBytes: Number.NaN } })).toThrow(/limits\.pageBytes must be finite/);
-  expect(() => pump({ ...base, retry: { maxAttempts: Number.POSITIVE_INFINITY } })).toThrow(
-    /retry\.maxAttempts must be finite/,
-  );
-  expect(() => pump({ ...base, defaults: { terminalRetentionMs: 1.5 } })).toThrow(
-    /defaults\.terminalRetentionMs must be a positive safe integer/,
-  );
-  expect(() =>
-    pump({ ...base, defaults: { terminalRetentionMs: Number.MAX_SAFE_INTEGER + 1 } }),
-  ).toThrow(/defaults\.terminalRetentionMs must be a positive safe integer/);
+beforeAll(async () => {
+  nc = await connectToCluster({ name: "pump-test" });
+  sync = createSync({ connection: nc, namespace, application: "tests" });
+  await sync.ready();
 });
 
-test("processes pages sequentially and exposes durable progress", async () => {
-  const values = [1, 2, 3, 4, 5];
-  const pulledFrom: Array<number | null> = [];
-  const dispatched: number[] = [];
-
-  const worker = track(pump<Input, Cursor, Item>({
-    id: uid("pages"),
-    prefix: PUMP_PREFIX,
-    batchSize: 2,
-    pull: ({ cursor, limit }) => {
-      pulledFrom.push(cursor);
-      const start = cursor ?? 0;
-      const rows = values.slice(start, start + limit);
-      const end = start + rows.length;
-      return {
-        items: rows.map((value) => ({ key: String(value), value })),
-        nextCursor: end < values.length ? end : null,
-      };
-    },
-    dispatch: ({ item }) => {
-      dispatched.push(item.value);
-    },
-  }));
-
-  const started = await worker.start({
-    key: "backfill:1",
-    input: { source: "messages" },
-    meta: { requestedBy: "test" },
-  });
-  expect(started.state).toBe("queued");
-
-  await waitFor(async () => (await worker.get({ key: "backfill:1" }))?.state === "completed");
-
-  expect(pulledFrom).toEqual([null, 2, 4]);
-  expect(dispatched).toEqual(values);
-  expect(await worker.get({ key: "backfill:1" })).toMatchObject({
-    state: "completed",
-    dispatched: 5,
-    failureCount: 0,
-    input: { source: "messages" },
-    meta: { requestedBy: "test" },
-  });
+afterAll(async () => {
+  await sync.drain({ timeoutMs: 2_000 });
+  await cleanupNamespaces(nc, [namespace]);
+  await nc.close();
 });
 
-test("start is idempotent for the same key", async () => {
-  let pulls = 0;
-  const worker = track(pump<Input, Cursor, Item>({
-    id: uid("idempotent"),
-    prefix: PUMP_PREFIX,
-    pull: async () => {
-      pulls += 1;
-      await Bun.sleep(50);
-      return { items: [], nextCursor: null };
-    },
-    dispatch: () => {},
-  }));
-
-  const first = await worker.start({ key: "same", input: { source: "first" } });
-  const second = await worker.start({ key: "same", input: { source: "ignored" } });
-
-  expect(second.createdAt).toBe(first.createdAt);
-  expect(second.input).toEqual({ source: "first" });
-  await waitFor(async () => (await worker.get({ key: "same" }))?.state === "completed");
-  expect(pulls).toBe(1);
-});
-
-test("colon-rich pump identities keep same-key runs isolated", async () => {
-  const sharedRunKey = "tenant:shared:run";
-  const leftPrefix = COLLISION_LEFT_PREFIX;
-  const leftId = "mail:backfill";
-  const rightPrefix = COLLISION_RIGHT_PREFIX;
-  const rightId = "backfill";
-  const leftCalls: string[] = [];
-  const rightCalls: string[] = [];
-
-  expect(`${leftPrefix}:${leftId}`).toBe(`${rightPrefix}:${rightId}`);
-  expect(pumpBaseKey(leftPrefix, leftId)).not.toBe(pumpBaseKey(rightPrefix, rightId));
-
-  const left = track(pump<Input, Cursor, Item>({
-    id: leftId,
-    prefix: leftPrefix,
-    pull: () => ({ items: [{ key: "left", value: 1 }], nextCursor: null }),
-    dispatch: ({ item }) => {
-      leftCalls.push(item.key);
-    },
-  }));
-  const right = track(pump<Input, Cursor, Item>({
-    id: rightId,
-    prefix: rightPrefix,
-    pull: () => ({ items: [{ key: "right", value: 2 }], nextCursor: null }),
-    dispatch: ({ item }) => {
-      rightCalls.push(item.key);
-    },
-  }));
-
-  await Promise.all([
-    left.start({ key: sharedRunKey, input: { source: "left" } }),
-    right.start({ key: sharedRunKey, input: { source: "right" } }),
-  ]);
-  await waitFor(async () =>
-    (await left.get({ key: sharedRunKey }))?.state === "completed" &&
-    (await right.get({ key: sharedRunKey }))?.state === "completed"
-  );
-
-  expect(leftCalls).toEqual(["left"]);
-  expect(rightCalls).toEqual(["right"]);
-  expect((await left.get({ key: sharedRunKey }))?.input).toEqual({ source: "left" });
-  expect((await right.get({ key: sharedRunKey }))?.input).toEqual({ source: "right" });
-});
-
-test("legacy run state blocks public access without being changed", async () => {
-  const id = uid("legacy-state");
-  const key = "tenant:legacy";
-  const legacyStateKey = `${PUMP_PREFIX}:${id}:run:${encodeURIComponent(key)}`;
-  await redis.send("RPUSH", [legacyStateKey, "opaque", "state"]);
-
-  let pulls = 0;
-  const worker = track(pump<Input, Cursor, Item>({
-    id,
-    prefix: PUMP_PREFIX,
-    pull: () => {
-      pulls += 1;
-      return { items: [], nextCursor: null };
-    },
-    dispatch: () => {},
-  }));
-
-  await expect(worker.start({ key, input: { source: "new" } })).rejects.toThrow(
-    "pump namespace migration required",
-  );
-  await expect(worker.get({ key })).rejects.toThrow("pump namespace migration required");
-  await expect(worker.cancel({ key })).rejects.toThrow("pump namespace migration required");
-
-  expect(pulls).toBe(0);
-  expect(await redis.send("TYPE", [legacyStateKey])).toBe("list");
-  expect(await redis.send("LRANGE", [legacyStateKey, "0", "-1"])).toEqual(["opaque", "state"]);
-  expect(Number(await redis.send("EXISTS", [pumpStateKey(PUMP_PREFIX, id, key)]))).toBe(0);
-  expect(Number(await redis.send("EXISTS", [pumpDueKey(PUMP_PREFIX, id)]))).toBe(0);
-});
-
-test("empty pages without cursor progress fail after maxAttempts", async () => {
-  let pulls = 0;
-  const worker = track(pump<Input, Cursor, Item>({
-    id: uid("stalled"),
-    prefix: PUMP_PREFIX,
-    retry: { maxAttempts: 2, baseMs: 10, maxMs: 10, jitter: 0 },
-    pull: ({ cursor }) => {
-      pulls += 1;
-      return { items: [], nextCursor: cursor ?? 1 };
-    },
-    dispatch: () => {},
-  }));
-
-  await worker.start({ key: "stalled", input: { source: "messages" } });
-  await waitFor(async () => (await worker.get({ key: "stalled" }))?.state === "failed");
-
-  expect(pulls).toBe(3);
-  expect(await worker.get({ key: "stalled" })).toMatchObject({
-    state: "failed",
-    cursor: 1,
-    failureCount: 2,
-    lastError: "pull returned a page without advancing the cursor",
-  });
-});
-
-test("object cursors with different property order still count as stalled", async () => {
-  let pulls = 0;
-  const worker = track(pump<Input, { page: number; shard: number }, Item>({
-    id: uid("canonical-cursor"),
-    prefix: PUMP_PREFIX,
-    retry: { maxAttempts: 1, baseMs: 10, maxMs: 10, jitter: 0 },
-    pull: ({ cursor }) => {
-      pulls += 1;
-      return cursor === null
-        ? { items: [], nextCursor: { page: 1, shard: 2 } }
-        : { items: [], nextCursor: { shard: 2, page: 1 } };
-    },
-    dispatch: () => {},
-  }));
-
-  await worker.start({ key: "canonical", input: { source: "messages" } });
-  await waitFor(async () => (await worker.get({ key: "canonical" }))?.state === "failed");
-
-  expect(pulls).toBe(2);
-  expect(await worker.get({ key: "canonical" })).toMatchObject({
-    state: "failed",
-    failureCount: 1,
-    lastError: "pull returned a page without advancing the cursor",
-  });
-});
-
-test("composed and decomposed Unicode cursor keys stall despite reversed insertion order", async () => {
-  let pulls = 0;
-  const worker = track(pump<Input, Record<string, number>, Item>({
-    id: uid("canonical-unicode-cursor"),
-    prefix: PUMP_PREFIX,
-    retry: { maxAttempts: 1, baseMs: 10, maxMs: 10, jitter: 0 },
-    pull: ({ cursor }) => {
-      pulls += 1;
-      return cursor === null
-        ? { items: [], nextCursor: { ["\u00e9"]: 1, ["e\u0301"]: 2 } }
-        : { items: [], nextCursor: { ["e\u0301"]: 2, ["\u00e9"]: 1 } };
-    },
-    dispatch: () => {},
-  }));
-
-  await worker.start({ key: "canonical", input: { source: "messages" } });
-  await waitFor(async () => (await worker.get({ key: "canonical" }))?.state === "failed");
-
-  expect(pulls).toBe(2);
-  expect(await worker.get({ key: "canonical" })).toMatchObject({
-    state: "failed",
-    failureCount: 1,
-    lastError: "pull returned a page without advancing the cursor",
-  });
-});
-
-test("failed dispatch retries the persisted page without pulling again", async () => {
-  let pulls = 0;
-  let failedOnce = false;
-  const calls: string[] = [];
-
-  const worker = track(pump<Input, Cursor, Item>({
-    id: uid("retry-page"),
-    prefix: PUMP_PREFIX,
-    retry: { maxAttempts: 3, baseMs: 10, maxMs: 10, jitter: 0 },
-    pull: () => {
-      pulls += 1;
-      return {
-        items: [
-          { key: "a", value: 1 },
-          { key: "b", value: 2 },
-          { key: "c", value: 3 },
-        ],
-        nextCursor: null,
-      };
-    },
-    dispatch: ({ item }) => {
-      calls.push(item.key);
-      if (item.key === "b" && !failedOnce) {
-        failedOnce = true;
-        throw new Error("temporary");
-      }
-    },
-  }));
-
-  await worker.start({ key: "retry", input: { source: "messages" } });
-  await waitFor(async () => (await worker.get({ key: "retry" }))?.state === "completed");
-
-  expect(pulls).toBe(1);
-  expect(calls).toEqual(["a", "b", "b", "c"]);
-  expect((await worker.get({ key: "retry" }))?.dispatched).toBe(3);
-});
-
-test("preserves empty JSON containers across Redis state transitions", async () => {
-  type ShapeInput = { filters: string[] };
-  type ShapeCursor = { page: number; tokens: string[] };
-  type ShapeItem = { key: string; tags: string[]; attributes: Record<string, never> };
-
-  const seenInputs: ShapeInput[] = [];
-  const seenItems: ShapeItem[] = [];
-  const seenCursors: Array<ShapeCursor | null> = [];
-
-  const worker = track(pump<ShapeInput, ShapeCursor, ShapeItem>({
-    id: uid("json-shapes"),
-    prefix: PUMP_PREFIX,
-    pull: ({ input, cursor }) => {
-      seenInputs.push(input);
-      seenCursors.push(cursor);
-      if (cursor === null) {
-        return {
-          items: [{ key: "a", tags: [], attributes: {} }],
-          nextCursor: { page: 1, tokens: [] },
-        };
-      }
-      return { items: [], nextCursor: null };
-    },
-    dispatch: ({ input, item }) => {
-      seenInputs.push(input);
-      seenItems.push(item);
-    },
-  }));
-
-  await worker.start({ key: "shapes", input: { filters: [] } });
-  await waitFor(async () => (await worker.get({ key: "shapes" }))?.state === "completed");
-
-  expect(seenInputs).toEqual([
-    { filters: [] },
-    { filters: [] },
-    { filters: [] },
-  ]);
-  expect(seenItems).toEqual([{ key: "a", tags: [], attributes: {} }]);
-  expect(seenCursors).toEqual([null, { page: 1, tokens: [] }]);
-});
-
-test("another worker resumes the persisted page after local stop", async () => {
-  const id = uid("handover");
-  let secondItemStarted = false;
-  const firstWorkerCalls: string[] = [];
-  const secondWorkerCalls: string[] = [];
-
-  const first = track(pump<Input, Cursor, Item>({
-    id,
-    prefix: PUMP_PREFIX,
-    defaults: { leaseMs: 100, heartbeatMs: 20 },
-    pull: () => ({
-      items: [
-        { key: "a", value: 1 },
-        { key: "b", value: 2 },
-        { key: "c", value: 3 },
-      ],
-      nextCursor: null,
-    }),
-    dispatch: async ({ item, signal }) => {
-      firstWorkerCalls.push(item.key);
-      if (item.key !== "b") return;
-      secondItemStarted = true;
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(resolve, 5_000);
-        signal.addEventListener("abort", () => {
-          clearTimeout(timer);
-          reject(new Error("stopped"));
-        }, { once: true });
-      });
-    },
-  }));
-
-  await first.start({ key: "handover", input: { source: "messages" } });
-  await waitFor(() => secondItemStarted);
-  first.stop();
-
-  const second = track(pump<Input, Cursor, Item>({
-    id,
-    prefix: PUMP_PREFIX,
-    defaults: { leaseMs: 100, heartbeatMs: 20 },
-    pull: () => {
-      throw new Error("persisted page must be reused");
-    },
-    dispatch: ({ item }) => {
-      secondWorkerCalls.push(item.key);
-    },
-  }));
-
-  await waitFor(async () => (await second.get({ key: "handover" }))?.state === "completed");
-
-  expect(firstWorkerCalls).toEqual(["a", "b"]);
-  expect(secondWorkerCalls).toEqual(["b", "c"]);
-  expect((await second.get({ key: "handover" }))?.dispatched).toBe(3);
-});
-
-test("cancel aborts the active callback and prevents further items", async () => {
-  let firstStarted = false;
-  const calls: string[] = [];
-
-  const worker = track(pump<Input, Cursor, Item>({
-    id: uid("cancel"),
-    prefix: PUMP_PREFIX,
-    defaults: { heartbeatMs: 20 },
-    pull: () => ({
-      items: [
-        { key: "a", value: 1 },
-        { key: "b", value: 2 },
-      ],
-      nextCursor: null,
-    }),
-    dispatch: async ({ item, signal }) => {
-      calls.push(item.key);
-      firstStarted = true;
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(resolve, 5_000);
-        signal.addEventListener("abort", () => {
-          clearTimeout(timer);
-          reject(new Error("canceled"));
-        }, { once: true });
-      });
-    },
-  }));
-
-  await worker.start({ key: "cancel", input: { source: "messages" } });
-  await waitFor(() => firstStarted);
-  expect(await worker.cancel({ key: "cancel" })).toBe(true);
-  await Bun.sleep(100);
-
-  expect(calls).toEqual(["a"]);
-  expect((await worker.get({ key: "cancel" }))?.state).toBe("canceled");
-  expect(await worker.cancel({ key: "cancel" })).toBe(false);
-});
-
-test("automatically heartbeats the lease during a long pull", async () => {
-  const id = uid("heartbeat");
-  let releasePull!: () => void;
-  let pullStarted = false;
-
-  const worker = track(pump<Input, Cursor, Item>({
-    id,
-    prefix: PUMP_PREFIX,
-    defaults: { leaseMs: 90, heartbeatMs: 20 },
-    pull: async () => {
-      pullStarted = true;
-      await new Promise<void>((resolve) => {
-        releasePull = resolve;
-      });
-      return { items: [], nextCursor: null };
-    },
-    dispatch: () => {},
-  }));
-
-  await worker.start({ key: "heartbeat", input: { source: "messages" } });
-  await waitFor(() => pullStarted);
-
-  const stateKey = pumpStateKey(PUMP_PREFIX, id, "heartbeat");
-  const first = JSON.parse((await redis.get(stateKey))!) as { leaseUntil: number };
-  await Bun.sleep(70);
-  const second = JSON.parse((await redis.get(stateKey))!) as { leaseUntil: number };
-  expect(second.leaseUntil).toBeGreaterThan(first.leaseUntil);
-
-  releasePull();
-  await waitFor(async () => (await worker.get({ key: "heartbeat" }))?.state === "completed");
-});
-
-test("rejects non-serializable input and terminally fails oversized pages", async () => {
-  const invalid = track(pump<{ createdAt: Date }, Cursor, Item>({
-    id: uid("invalid-input"),
-    prefix: PUMP_PREFIX,
-    pull: () => ({ items: [], nextCursor: null }),
-    dispatch: () => {},
-  }));
-
-  await expect(invalid.start({
-    key: "invalid",
-    input: { createdAt: new Date() },
-  })).rejects.toThrow("plain objects and arrays");
-
-  const oversized = track(pump<Input, Cursor, Item>({
-    id: uid("oversized"),
-    prefix: PUMP_PREFIX,
-    limits: { pageBytes: 20 },
-    retry: { maxAttempts: 1 },
-    pull: () => ({
-      items: [{ key: "large", value: 123456789 }],
-      nextCursor: null,
-    }),
-    dispatch: () => {},
-  }));
-
-  await oversized.start({ key: "oversized", input: { source: "messages" } });
-  await waitFor(async () => (await oversized.get({ key: "oversized" }))?.state === "failed");
-  expect((await oversized.get({ key: "oversized" }))?.lastError).toContain("page exceeds limit");
-});
-
-test("rejects every unsupported JSON input shape before persisting a run", async () => {
-  const circular: Record<string, unknown> = {};
-  circular.self = circular;
-  const invalidInputs: Array<[string, unknown]> = [
-    ["undefined", { value: undefined }],
-    ["function", { value: () => undefined }],
-    ["symbol", { value: Symbol("value") }],
-    ["bigint", { value: 1n }],
-    ["non-finite", { value: Number.NaN }],
-    ["circular", circular],
-    ["non-plain", { value: new Date() }],
-  ];
-
-  for (const [name, input] of invalidInputs) {
-    const worker = track(pump<unknown, Cursor, Item>({
-      id: uid(`invalid-${name}`),
-      prefix: PUMP_PREFIX,
-      pull: () => ({ items: [], nextCursor: null }),
-      dispatch: () => {},
-    }));
-
-    await expect(worker.start({ key: name, input })).rejects.toThrow();
-    expect(await worker.get({ key: name })).toBeNull();
-  }
-});
-
-test("terminally fails after the configured number of callback failures", async () => {
-  let pulls = 0;
-  const worker = track(pump<Input, Cursor, Item>({
-    id: uid("terminal-failure"),
-    prefix: PUMP_PREFIX,
-    retry: { maxAttempts: 2, baseMs: 10, maxMs: 10, jitter: 0 },
-    pull: () => {
-      pulls += 1;
-      throw new Error("provider unavailable");
-    },
-    dispatch: () => {},
-  }));
-
-  await worker.start({ key: "terminal", input: { source: "messages" } });
-  await waitFor(async () => (await worker.get({ key: "terminal" }))?.state === "failed");
-
-  expect(pulls).toBe(2);
-  expect(await worker.get({ key: "terminal" })).toMatchObject({
-    state: "failed",
-    failureCount: 2,
-    lastError: "provider unavailable",
-  });
-});
-
-test("progress resets the stalled-page failure counter", async () => {
-  let pulls = 0;
-  const worker = track(pump<Input, Cursor, Item>({
-    id: uid("stall-reset"),
-    prefix: PUMP_PREFIX,
-    retry: { maxAttempts: 2, baseMs: 10, maxMs: 10, jitter: 0 },
-    pull: () => {
-      pulls += 1;
-      if (pulls === 1) return { items: [], nextCursor: 1 };
-      if (pulls === 2) return { items: [], nextCursor: 1 };
-      if (pulls === 3) return { items: [{ key: "progress", value: 1 }], nextCursor: 2 };
-      if (pulls === 4) return { items: [], nextCursor: 2 };
-      return { items: [], nextCursor: null };
-    },
-    dispatch: () => {},
-  }));
-
-  await worker.start({ key: "reset", input: { source: "messages" } });
-  await waitFor(async () => (await worker.get({ key: "reset" }))?.state === "completed");
-
-  expect(pulls).toBe(5);
-  expect(await worker.get({ key: "reset" })).toMatchObject({
-    state: "completed",
-    dispatched: 1,
-    failureCount: 0,
-  });
-});
-
-test("a progressing page resets a prior stall before dispatch retry accounting", async () => {
-  let pulls = 0;
-  let failedOnce = false;
-  const dispatches: string[] = [];
-  const worker = track(pump<Input, Cursor, Item>({
-    id: uid("stall-dispatch-reset"),
-    prefix: PUMP_PREFIX,
-    retry: { maxAttempts: 2, baseMs: 10, maxMs: 10, jitter: 0 },
-    pull: () => {
-      pulls += 1;
-      if (pulls === 1) return { items: [], nextCursor: 1 };
-      if (pulls === 2) return { items: [], nextCursor: 1 };
-      if (pulls === 3) return { items: [{ key: "a", value: 1 }], nextCursor: 2 };
-      return { items: [], nextCursor: null };
-    },
-    dispatch: ({ item }) => {
-      dispatches.push(item.key);
-      if (!failedOnce) {
-        failedOnce = true;
-        throw new Error("temporary dispatch failure");
-      }
-    },
-  }));
-
-  await worker.start({ key: "reset", input: { source: "messages" } });
-  await waitFor(async () => (await worker.get({ key: "reset" }))?.state === "completed");
-
-  expect(pulls).toBe(4);
-  expect(dispatches).toEqual(["a", "a"]);
-  expect(await worker.get({ key: "reset" })).toMatchObject({
-    state: "completed",
-    dispatched: 1,
-    failureCount: 0,
-  });
-});
-
-test("a non-empty page with an unchanged cursor dispatches at least once and fails boundedly", async () => {
-  let pulls = 0;
-  const dispatches: string[] = [];
-  const worker = track(pump<Input, Cursor, Item>({
-    id: uid("non-empty-stall"),
-    prefix: PUMP_PREFIX,
-    retry: { maxAttempts: 2, baseMs: 10, maxMs: 10, jitter: 0 },
-    pull: () => {
-      pulls += 1;
-      if (pulls === 1) return { items: [], nextCursor: 1 };
-      return { items: [{ key: "same", value: pulls }], nextCursor: 1 };
-    },
-    dispatch: ({ item }) => {
-      dispatches.push(item.key);
-    },
-  }));
-
-  await worker.start({ key: "bounded", input: { source: "messages" } });
-  await waitFor(async () => (await worker.get({ key: "bounded" }))?.state === "failed");
-
-  expect(pulls).toBe(3);
-  expect(dispatches).toEqual(["same", "same"]);
-  expect(await worker.get({ key: "bounded" })).toMatchObject({
-    state: "failed",
-    dispatched: 2,
-    failureCount: 2,
-    lastError: "pull returned a page without advancing the cursor",
-  });
-});
-
-test("malformed persisted states are removed and their keys are reusable", async () => {
-  const id = uid("malformed");
-  const dueKey = pumpDueKey(PUMP_PREFIX, id);
-  const malformed = [
-    { key: "invalid-json", raw: "{not-json" },
-    { key: "invalid-shape", raw: "{}" },
-    { key: "primitive-string", raw: JSON.stringify("broken") },
-    { key: "primitive-number", raw: JSON.stringify(42) },
-    { key: "primitive-boolean", raw: JSON.stringify(true) },
-    { key: "primitive-null", raw: "null" },
-  ];
-  const now = Date.now();
-  for (const [index, entry] of malformed.entries()) {
-    const member = encodeURIComponent(entry.key);
-    await redis.set(pumpStateKey(PUMP_PREFIX, id, entry.key), entry.raw);
-    await redis.send("ZADD", [dueKey, String(now - malformed.length + index), member]);
-  }
-
-  let pulls = 0;
-  const worker = track(pump<Input, Cursor, Item>({
-    id,
-    prefix: PUMP_PREFIX,
-    pull: () => {
-      pulls += 1;
-      return { items: [], nextCursor: null };
-    },
-    dispatch: () => {},
-  }));
-
-  await worker.start({ key: "healthy", input: { source: "messages" } });
-  await waitFor(async () => (await worker.get({ key: "healthy" }))?.state === "completed");
-
-  await waitFor(async () => {
-    for (const entry of malformed) {
-      const member = encodeURIComponent(entry.key);
-      if (await redis.get(pumpStateKey(PUMP_PREFIX, id, entry.key))) return false;
-      if (await redis.send("ZSCORE", [dueKey, member])) return false;
-    }
-    return true;
-  });
-
-  expect(pulls).toBe(1);
-  for (const entry of malformed) {
-    expect(await worker.get({ key: entry.key })).toBeNull();
-    await worker.start({ key: entry.key, input: { source: "messages" } });
-    await waitFor(async () => (await worker.get({ key: entry.key }))?.state === "completed");
-  }
-  expect(pulls).toBe(malformed.length + 1);
-});
-
-test("a stale worker cannot checkpoint after its lease token is replaced", async () => {
-  const id = uid("stale-commit");
-  const key = "run";
-  const stateKey = pumpStateKey(PUMP_PREFIX, id, key);
-  let dispatchStarted = false;
-  let releaseDispatch!: () => void;
-  let dispatchFinished = false;
-
-  const worker = track(pump<Input, Cursor, Item>({
-    id,
-    prefix: PUMP_PREFIX,
-    defaults: { leaseMs: 1_000, heartbeatMs: 100 },
-    pull: () => ({
-      items: [{ key: "a", value: 1 }],
-      nextCursor: null,
-    }),
-    dispatch: async () => {
-      dispatchStarted = true;
-      await new Promise<void>((resolve) => {
-        releaseDispatch = resolve;
-      });
-      dispatchFinished = true;
-    },
-  }));
-
-  await worker.start({ key, input: { source: "messages" } });
-  await waitFor(() => dispatchStarted);
-
-  const stolen = JSON.parse((await redis.get(stateKey))!) as Record<string, unknown>;
-  stolen.leaseToken = "replacement";
-  stolen.leaseUntil = Date.now() + 5_000;
-  await redis.set(stateKey, JSON.stringify(stolen));
-  releaseDispatch();
-  await waitFor(() => dispatchFinished);
-  await Bun.sleep(50);
-
-  const persisted = JSON.parse((await redis.get(stateKey))!) as Record<string, unknown>;
-  expect(persisted.leaseToken).toBe("replacement");
-  expect(persisted.pageNextIndex).toBe(0);
-  expect(persisted.dispatched).toBe(0);
-  expect((await worker.get({ key }))?.state).toBe("running");
-});
-
-test("terminal state expires after retention", async () => {
-  const worker = track(pump<Input, Cursor, Item>({
-    id: uid("retention"),
-    prefix: PUMP_PREFIX,
-    defaults: { terminalRetentionMs: 60 },
-    pull: () => ({ items: [], nextCursor: null }),
-    dispatch: () => {},
-  }));
-
-  await worker.start({ key: "expires", input: { source: "messages" } });
-  await waitFor(async () => (await worker.get({ key: "expires" }))?.state === "completed");
-  await Bun.sleep(90);
-  expect(await worker.get({ key: "expires" })).toBeNull();
+describe("pump", () => {
+  test("drains a finite source across pages and completes", async () => {
+    const dispatched: string[] = [];
+    const pump = sync.pump<Input, number, Item>({
+      id: "drain",
+      batchSize: 4,
+      dispatchConcurrency: 2,
+      pull: pagedPull(4),
+      dispatch: async ({ item }) => {
+        dispatched.push(item.key);
+      },
+    });
+    await pump.start({ key: "run-1", input: { total: 10 } });
+    const worker = await pump.process({ concurrency: 2 });
+    await waitFor(async () => (await pump.get({ key: "run-1" }))?.status === "completed", 20_000);
+    const state = await pump.get({ key: "run-1" });
+    expect(state!.dispatched).toBe(10);
+    expect(state!.cursor).toBeNull();
+    expect(dispatched.toSorted()).toEqual(Array.from({ length: 10 }, (_, i) => `item-${i}`).toSorted());
+    // start() on a completed run restarts it; on a running run it is a no-op.
+    await worker.drain();
+  }, 30_000);
+
+  test("transient dispatch failure retries without repeating checkpointed items", async () => {
+    const calls = new Map<string, number>();
+    let failOnce = true;
+    const pump = sync.pump<Input, number, Item>({
+      id: "retry",
+      batchSize: 5,
+      retry: { maxAttempts: 3, backoffMs: [500] },
+      pull: pagedPull(5),
+      dispatch: async ({ item }) => {
+        calls.set(item.key, (calls.get(item.key) ?? 0) + 1);
+        if (failOnce && item.key === "item-3") {
+          failOnce = false;
+          throw new Error("transient sink failure");
+        }
+      },
+    });
+    await pump.start({ key: "run-r", input: { total: 5 } });
+    const worker = await pump.process();
+    await waitFor(async () => (await pump.get({ key: "run-r" }))?.status === "completed", 20_000);
+    const state = await pump.get({ key: "run-r" });
+    expect(state!.dispatched).toBe(5);
+    expect(state!.failureCount).toBe(0); // reset after a successful page
+    // Items 0-2 were checkpointed before the failure and never repeated.
+    expect(calls.get("item-0")).toBe(1);
+    expect(calls.get("item-1")).toBe(1);
+    expect(calls.get("item-2")).toBe(1);
+    // Item 3 failed once and was retried.
+    expect(calls.get("item-3")).toBe(2);
+    await worker.drain();
+  }, 30_000);
+
+  test("permanent failure lands in failed state with the last error", async () => {
+    const pump = sync.pump<Input, number, Item>({
+      id: "fail",
+      retry: { maxAttempts: 2, backoffMs: [200] },
+      pull: pagedPull(3),
+      dispatch: async () => {
+        throw new Error("sink is down");
+      },
+    });
+    await pump.start({ key: "run-f", input: { total: 3 } });
+    const worker = await pump.process();
+    await waitFor(async () => (await pump.get({ key: "run-f" }))?.status === "failed", 20_000);
+    const state = await pump.get({ key: "run-f" });
+    expect(state!.failureCount).toBe(2);
+    expect(state!.lastError).toContain("sink is down");
+    await worker.drain();
+  }, 30_000);
+
+  test("cancel stops an active run and keeps its state", async () => {
+    let dispatchedCount = 0;
+    const pump = sync.pump<Input, number, Item>({
+      id: "cancel",
+      batchSize: 2,
+      pull: pagedPull(2),
+      dispatch: async () => {
+        dispatchedCount += 1;
+        await Bun.sleep(150);
+      },
+    });
+    await pump.start({ key: "run-c", input: { total: 100 } });
+    const worker = await pump.process();
+    await waitFor(() => dispatchedCount >= 2, 15_000);
+    expect(await pump.cancel({ key: "run-c" })).toBe(true);
+    await waitFor(async () => (await pump.get({ key: "run-c" }))?.status === "canceled", 15_000);
+    const count = dispatchedCount;
+    await Bun.sleep(600);
+    expect(dispatchedCount).toBeLessThanOrEqual(count + 2); // stops promptly
+    expect(await pump.cancel({ key: "run-c" })).toBe(false); // already terminal
+    await worker.drain();
+  }, 30_000);
+
+  test("reconcile repairs lost wake-ups: accepted work survives a dead worker", async () => {
+    // A worker "dies" mid-run: its handler hangs, drain force-aborts it. The
+    // KV state stays queued/running; a later process() reconciles and finishes.
+    let firstWorkerHangs = true;
+    const done: string[] = [];
+    const pump = sync.pump<Input, number, Item>({
+      id: "recover",
+      batchSize: 3,
+      leaseMs: 2_000,
+      pull: pagedPull(3),
+      dispatch: async ({ item }) => {
+        if (firstWorkerHangs) {
+          await new Promise(() => {}); // never settles — simulates a crash
+        }
+        done.push(item.key);
+      },
+    });
+    await pump.start({ key: "run-x", input: { total: 3 } });
+    const dying = await pump.process();
+    await waitFor(async () => (await pump.get({ key: "run-x" }))?.status === "running", 15_000);
+    await dying.drain({ timeoutMs: 200 }); // force-abort the hung handler
+
+    firstWorkerHangs = false;
+    const rescuer = await pump.process();
+    await waitFor(async () => (await pump.get({ key: "run-x" }))?.status === "completed", 45_000);
+    expect(done.toSorted()).toEqual(["item-0", "item-1", "item-2"]);
+    await rescuer.drain();
+  }, 60_000);
+
+  test("start is idempotent for active runs and restarts terminal runs", async () => {
+    const pump = sync.pump<Input, number, Item>({
+      id: "restart",
+      pull: pagedPull(5),
+      dispatch: async () => {},
+    });
+    await pump.start({ key: "run-s", input: { total: 2 } });
+    await pump.start({ key: "run-s", input: { total: 999 } }); // ignored: active
+    expect((await pump.get({ key: "run-s" }))!.input.total).toBe(2);
+
+    const worker = await pump.process();
+    await waitFor(async () => (await pump.get({ key: "run-s" }))?.status === "completed", 20_000);
+
+    await pump.start({ key: "run-s", input: { total: 4 } }); // restart after terminal
+    await waitFor(async () => {
+      const state = await pump.get({ key: "run-s" });
+      return state?.status === "completed" && state.input.total === 4;
+    }, 20_000);
+    expect((await pump.get({ key: "run-s" }))!.dispatched).toBe(4);
+    await worker.drain();
+  }, 45_000);
 });

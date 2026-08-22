@@ -1,110 +1,105 @@
+// @k2b/sync v6 — NATS-native distributed sync primitives for TypeScript and Bun.
+
+export { createSync } from "./src/sync.ts";
+export type { Sync } from "./src/sync.ts";
+
+export type {
+  DrainResult,
+  SyncConfig,
+  SyncDefaults,
+  SyncHealth,
+  SyncResourceSummary,
+} from "./src/runtime.ts";
+
+export type { SyncEvent, SyncObserver } from "./src/events.ts";
+export type { JsonValue } from "./src/codec.ts";
+export type {
+  DeliveryConfig,
+  MessageMeta,
+  OrderingConfig,
+  PublishReceipt,
+  RetentionConfig,
+} from "./src/types.ts";
+export type { ProcessOptions, Worker } from "./src/worker.ts";
+
+export type {
+  Queue,
+  QueueConfig,
+  QueueDelivery,
+  QueueMessage,
+  QueueReader,
+  QueueSend,
+  DeadLetter,
+  DeadLetterStore,
+} from "./src/queue.ts";
+
+export type {
+  Topic,
+  TopicConfig,
+  TopicCursor,
+  TopicEvent,
+  TopicLiveEvent,
+  TopicProcessOptions,
+  TopicPublish,
+} from "./src/topic.ts";
+
+export type {
+  Job,
+  JobConfig,
+  JobContext,
+  JobFailureDecision,
+  JobProcessOptions,
+  JobSubmit,
+  JobSubmitManyOptions,
+} from "./src/job.ts";
+
+export type { Pump, PumpConfig, PumpItem, PumpState, PumpStatus } from "./src/pump.ts";
+
+export type {
+  ScheduleContext,
+  ScheduleDefinition,
+  ScheduleInfo,
+  Scheduler,
+  SchedulerConfig,
+} from "./src/scheduler.ts";
+
+export type { Lock, Mutex, MutexConfig } from "./src/mutex.ts";
+
+export type {
+  Ephemeral,
+  EphemeralConfig,
+  EphemeralEntry,
+  EphemeralEvent,
+  EphemeralSnapshot,
+} from "./src/ephemeral.ts";
+
+export type {
+  ObjectMetadata,
+  ObjectRef,
+  ObjectStore,
+  ObjectStoreConfig,
+  ObjectStoreEvent,
+  StoredObject,
+  SyncObjectInfo,
+} from "./src/object-store.ts";
+
 export {
-  ratelimit,
-  RateLimitError,
-  type RateLimiter,
-  type RateLimitResult,
-  type RateLimitConfig,
-} from "./src/ratelimit";
-export { mutex, LockError, type Mutex, type Lock, type MutexConfig } from "./src/mutex";
-export {
-  queue,
-  type Queue,
-  type QueueConfig,
-  type QueueReader,
-  type QueueRecvConfig,
-  type QueueSendConfig,
-  type QueueReceived,
-  type QueueDeadLetter,
-} from "./src/queue";
-export {
-  topic,
-  TopicPayloadError,
-  type Topic,
-  type RecoverableTopic,
-  type TopicConfig,
-  type TopicCursorConfig,
-  type TopicReader,
-  type TopicReaderConfig,
-  type RecoverableTopicReader,
-  type TopicReclaimConfig,
-  type TopicReclaimResult,
-  type TopicReclaimedDelivery,
-  type TopicInvalidDelivery,
-  type TopicRecvConfig,
-  type TopicPubConfig,
-  type TopicDelivery,
-  type TopicLiveConfig,
-  type TopicLiveEvent,
-} from "./src/topic";
-export {
-  job,
-  type JobId,
-  type JobCtx,
-  type JobAfterCtx,
-  type JobConfig,
-  type JobHandle,
-  type JobMetrics,
-  type JobTraceEvent,
-  type SubmitConfig,
-} from "./src/job";
-export {
-  pump,
-  type PumpItem,
-  type PumpStatus,
-  type PumpState,
-  type PumpPullContext,
-  type PumpDispatchContext,
-  type PumpPullResult,
-  type PumpRetryConfig,
-  type PumpTraceEvent,
-  type PumpConfig,
-  type PumpStartConfig,
-  type PumpHandle,
-} from "./src/pump";
-export {
-  scheduler,
-  type Scheduler,
-  type SchedulerConfig,
-  type SchedulerInfo,
-  type SchedulerMetrics,
-  type SchedulerTraceEvent,
-  type ScheduleConfig,
-  type ScheduleCtx,
-  type ScheduleAfterCtx,
-} from "./src/scheduler";
-export {
-  schedulerControl,
-  SchedulerControlNotFoundError,
-  SchedulerControlTimeoutError,
-  SchedulerControlUnavailableError,
-  type SchedulerControl,
-  type SchedulerControlConfig,
-  type SchedulerControlInfo,
-  type SchedulerControlRunNowConfig,
-  type SchedulerControlState,
-} from "./src/scheduler-control";
-export { type TraceHandler } from "./src/trace";
-export {
-  ephemeral,
-  EphemeralCapacityError,
-  EphemeralPayloadTooLargeError,
-  type EphemeralConfig,
-  type EphemeralUpsertConfig,
-  type EphemeralTouchConfig,
-  type EphemeralRemoveConfig,
-  type EphemeralEntry,
-  type EphemeralSnapshot,
-  type EphemeralRecvConfig,
-  type EphemeralEvent,
-  type EphemeralReader,
-  type EphemeralStore,
-} from "./src/ephemeral";
-export {
-  retry,
-  isRetryableTransportError,
-  expBackoff,
-  type BackoffOptions,
-  type RetryCtx,
-  type RetryAfterCtx,
-  type RetryConfig,
-} from "./src/retry";
+  BatchSubmitError,
+  ConflictingResourceDeclarationError,
+  CursorMismatchError,
+  InvalidNameError,
+  ObjectTooLargeError,
+  PayloadTooLargeError,
+  ResourceDriftError,
+  ResourceIdentityCollisionError,
+  RetentionGapError,
+  SnapshotOverflowError,
+  StaleDeliveryError,
+  SyncError,
+  SyncLifecycleError,
+  UnsupportedServerError,
+} from "./src/errors.ts";
+export type { ResourceDifference } from "./src/errors.ts";
+
+export { expBackoff, isRetryableTransportError, retry } from "./src/retry.ts";
+export type { BackoffOptions, RetryAfterCtx, RetryConfig, RetryCtx } from "./src/retry.ts";

@@ -6,8 +6,8 @@
   ],
   "scripts": {
     "test": "bun run --filter '*' test",
-    "typecheck": "bun run --filter '*' typecheck && bun run typecheck:parity",
-    "typecheck:parity": "cd parity && bunx tsc --noEmit"
+    "test:all": "bun run --filter '*' test:all",
+    "typecheck": "bun run --filter '*' typecheck"
   },
   "devDependencies": {
     "@types/bun": "latest",

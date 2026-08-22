@@ -1,914 +1,203 @@
-import { beforeEach, expect, test } from "bun:test";
-import { redis } from "bun";
-import { queue } from "../index";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import type { NatsConnection } from "@nats-io/nats-core";
+import { createSync } from "../src/sync.ts";
+import type { Sync } from "../src/sync.ts";
+import { PayloadTooLargeError } from "../src/errors.ts";
+import { connectToCluster, uniqueName } from "./cluster.ts";
+import { cleanupNamespaces, testNamespace, waitFor } from "./helpers.ts";
 
-const queueBase = (id: string, tenantId = "default", prefix = "test:q"): string =>
-  `sync:queue:namespace:v2:${encodeURIComponent(JSON.stringify([prefix, tenantId, id]))}`;
+type Task = { n: number };
 
-beforeEach(async () => {
-  const versionedTestPrefix =
-    `sync:queue:namespace:v2:${encodeURIComponent('["test:q')}*`;
-  const [legacyKeys, versionedKeys] = await Promise.all([
-    redis.send("KEYS", ["test:q:*"]),
-    redis.send("KEYS", [versionedTestPrefix]),
-  ]);
-  const keys = [
-    ...(Array.isArray(legacyKeys) ? legacyKeys : []),
-    ...(Array.isArray(versionedKeys) ? versionedKeys : []),
-  ];
-  if (Array.isArray(keys) && keys.length > 0) {
-    await redis.send("DEL", keys as string[]);
-  }
+let nc: NatsConnection;
+let sync: Sync;
+const namespace = testNamespace();
+
+beforeAll(async () => {
+  nc = await connectToCluster({ name: "queue-test" });
+  sync = createSync({ connection: nc, namespace, application: "tests" });
+  await sync.ready();
 });
 
-test("send + recv + ack", async () => {
-  const q = queue({
-    id: "basic",
-    prefix: "test:q",
+afterAll(async () => {
+  await sync.drain({ timeoutMs: 5_000 });
+  await cleanupNamespaces(nc, [namespace]);
+  await nc.close();
+});
+
+describe("queue delivery", () => {
+  test("competing workers split the work; every message is handled once", async () => {
+    const queue = sync.queue<Task>({ id: "split" });
+    const seen: number[] = [];
+    const byWorker = [0, 0];
+    const w1 = await queue.process({ concurrency: 4 }, async (message) => {
+      seen.push(message.data.n);
+      byWorker[0] += 1;
+    });
+    const w2 = await queue.process({ concurrency: 4 }, async (message) => {
+      seen.push(message.data.n);
+      byWorker[1] += 1;
+    });
+    for (let n = 1; n <= 20; n++) await queue.send({ data: { n } });
+    await waitFor(() => seen.length >= 20);
+    await Bun.sleep(300);
+    expect(seen.toSorted((a, b) => a - b)).toEqual(Array.from({ length: 20 }, (_, i) => i + 1));
+    expect(byWorker[0]! + byWorker[1]!).toBe(20);
+    await Promise.all([w1.drain(), w2.drain()]);
   });
 
-  await q.send({ data: { msg: "hello" } });
-
-  const message = await q.recv({ wait: false });
-  expect(message).not.toBeNull();
-  expect(message?.data.msg).toBe("hello");
-  expect(await message?.ack()).toBe(true);
-
-  const empty = await q.recv({ wait: false });
-  expect(empty).toBeNull();
-});
-
-test("nack requeues message and increments attempt", async () => {
-  const q = queue({
-    id: "nack",
-    prefix: "test:q",
+  test("idempotencyKey dedupes within the window, scoped per tenant", async () => {
+    const queue = sync.queue<Task>({ id: "dedupe" });
+    const first = await queue.send({ data: { n: 1 }, idempotencyKey: "once" });
+    const dup = await queue.send({ data: { n: 1 }, idempotencyKey: "once" });
+    const other = await queue.send({ data: { n: 1 }, tenantId: "acme", idempotencyKey: "once" });
+    expect(first.duplicate).toBe(false);
+    expect(dup.duplicate).toBe(true);
+    expect(other.duplicate).toBe(false);
   });
 
-  await q.send({ data: { n: 1 } });
-
-  const first = await q.recv({ wait: false });
-  expect(first?.attempt).toBe(1);
-  expect(await first?.nack()).toBe(true);
-
-  const second = await q.recv({ wait: false });
-  expect(second).not.toBeNull();
-  expect(second?.attempt).toBe(2);
-  expect(await second?.ack()).toBe(true);
-});
-
-test("delay sends message to delayed queue", async () => {
-  const q = queue({
-    id: "delay",
-    prefix: "test:q",
+  test("delayMs delivers later without occupying a handler slot", async () => {
+    const queue = sync.queue<Task>({ id: "delay" });
+    const deliveredAt: number[] = [];
+    const start = Date.now();
+    const w = await queue.process({}, async () => {
+      deliveredAt.push(Date.now() - start);
+    });
+    await queue.send({ data: { n: 1 }, delayMs: 1_500 });
+    await queue.send({ data: { n: 2 } });
+    await waitFor(() => deliveredAt.length === 2, 15_000);
+    const [immediate, delayed] = deliveredAt.toSorted((a, b) => a - b);
+    expect(immediate!).toBeLessThan(1_000);
+    expect(delayed!).toBeGreaterThanOrEqual(1_200);
+    await w.drain();
   });
 
-  await q.send({ data: { ok: true }, delayMs: 80 });
-  expect(await q.recv({ wait: false })).toBeNull();
+  test("failed handler retries with backoff, then dead-letters; requeue works", async () => {
+    const queue = sync.queue<Task>({
+      id: "retry",
+      delivery: { maxAttempts: 2, backoffMs: [100], ackWaitMs: 5_000 },
+    });
+    const attempts: number[] = [];
+    let failing = true;
+    const w = await queue.process({}, async (message) => {
+      attempts.push(message.attempt);
+      if (failing) throw new Error("boom");
+    });
+    await queue.send({ data: { n: 7 }, idempotencyKey: "fail-1" });
+    await waitFor(() => attempts.length >= 2, 15_000);
+    await Bun.sleep(400);
+    expect(attempts).toEqual([1, 2]);
 
-  await Bun.sleep(100);
+    const dead = await queue.deadLetters.list();
+    expect(dead).toHaveLength(1);
+    expect(dead[0]!.data.n).toBe(7);
+    expect(dead[0]!.attempts).toBe(2);
+    expect(dead[0]!.reason).toBe("max attempts exhausted");
+    expect(dead[0]!.error).toContain("boom");
 
-  const message = await q.recv({ wait: false });
-  expect(message).not.toBeNull();
-  expect(message?.data.ok).toBe(true);
-  expect(await message?.ack()).toBe(true);
-});
-
-test("touch extends lease", async () => {
-  const q = queue({
-    id: "touch",
-    prefix: "test:q",
+    failing = false;
+    await queue.deadLetters.requeue({ messageId: dead[0]!.messageId, idempotencyKey: "requeue-1" });
+    await waitFor(() => attempts.length >= 3, 15_000);
+    expect(await queue.deadLetters.list()).toHaveLength(0);
+    await w.drain();
   });
 
-  await q.send({ data: { id: "a" } });
-
-  const message = await q.recv({ wait: false, leaseMs: 50 });
-  expect(message).not.toBeNull();
-
-  expect(await message?.touch({ leaseMs: 250 })).toBe(true);
-  await Bun.sleep(100);
-
-  const duplicate = await q.recv({ wait: false });
-  expect(duplicate).toBeNull();
-
-  expect(await message?.ack()).toBe(true);
-});
-
-test("touch cannot revive a lease after its deadline", async () => {
-  const q = queue({ id: "touch-expired", prefix: "test:q" });
-
-  await q.send({ data: { v: 1 } });
-  const message = await q.recv({ wait: false, leaseMs: 30 });
-  await Bun.sleep(50);
-
-  expect(await message?.touch({ leaseMs: 1_000 })).toBe(false);
-  const redelivered = await q.recv({ wait: false });
-  expect(redelivered?.messageId).toBe(message?.messageId);
-  expect(await redelivered?.ack()).toBe(true);
-});
-
-test("expired lease requeues message", async () => {
-  const q = queue({
-    id: "expire",
-    prefix: "test:q",
+  test("oversized payloads are rejected locally before publish", async () => {
+    const queue = sync.queue<string>({ id: "toobig", maxPayloadBytes: 1_024 });
+    await expect(queue.send({ data: "x".repeat(2_000) })).rejects.toBeInstanceOf(PayloadTooLargeError);
   });
 
-  await q.send({ data: { id: "b" } });
-
-  const first = await q.recv({ wait: false, leaseMs: 40 });
-  expect(first).not.toBeNull();
-
-  await Bun.sleep(70);
-
-  const second = await q.recv({ wait: false });
-  expect(second).not.toBeNull();
-  expect(second?.messageId).toBe(first?.messageId);
-  expect(second?.attempt).toBeGreaterThan(1);
-  expect(await second?.ack()).toBe(true);
+  test("crashed handler slot is redelivered after ackWait to another worker", async () => {
+    const queue = sync.queue<Task>({
+      id: "crash",
+      delivery: { ackWaitMs: 2_000, maxAttempts: 3, backoffMs: [100] },
+    });
+    // Worker 1 "crashes": takes the message and never settles it.
+    let hung = 0;
+    const w1 = await queue.process({}, async () => {
+      hung += 1;
+      await new Promise(() => {}); // never resolves — simulates a dead process
+    });
+    await queue.send({ data: { n: 1 } });
+    await waitFor(() => hung === 1);
+    // Worker 2 picks it up after ackWait expiry.
+    const rescued: number[] = [];
+    const w2 = await queue.process({}, async (message) => {
+      rescued.push(message.attempt);
+    });
+    await waitFor(() => rescued.length === 1, 15_000);
+    expect(rescued[0]).toBeGreaterThanOrEqual(2);
+    w1.stop();
+    await w2.drain();
+    await w1.drain({ timeoutMs: 100 }); // force-aborts the hung handler
+  }, 30_000);
 });
 
-test("idempotency key deduplicates send", async () => {
-  const q = queue({
-    id: "idempotency",
-    prefix: "test:q",
+describe("queue reader", () => {
+  test("manual ack, retry, and deadLetter settlement", async () => {
+    const queue = sync.queue<Task>({
+      id: "manual",
+      delivery: { maxAttempts: 3, backoffMs: [100], ackWaitMs: 5_000 },
+    });
+    await queue.send({ data: { n: 1 } });
+    const reader = await queue.reader();
+
+    const first = await reader.receive({ waitMs: 5_000 });
+    expect(first).not.toBeNull();
+    expect(first!.data.n).toBe(1);
+    await first!.retry({ delayMs: 100 });
+
+    const second = await reader.receive({ waitMs: 5_000 });
+    expect(second!.attempt).toBe(2);
+    await second!.ack();
+
+    await queue.send({ data: { n: 2 } });
+    const third = await reader.receive({ waitMs: 5_000 });
+    await third!.deadLetter({ reason: "manually rejected" });
+    const dead = await queue.deadLetters.list();
+    expect(dead.map((d) => d.reason)).toContain("manually rejected");
+
+    expect(await reader.receive({ waitMs: 300 })).toBeNull();
+    await reader.close();
+  }, 30_000);
+});
+
+describe("partitioned ordering", () => {
+  test("same orderingKey is serial and in order; different keys run in parallel", async () => {
+    const queue = sync.queue<Task>({
+      id: "partitioned",
+      ordering: { mode: "partitioned", partitions: 8 },
+      delivery: { ackWaitMs: 10_000 },
+    });
+    const perKey = new Map<string, number[]>();
+    let maxConcurrentA = 0;
+    let currentA = 0;
+    const w = await queue.process({ concurrency: 8 }, async (message) => {
+      const key = message.orderingKey!;
+      if (key === "a") {
+        currentA += 1;
+        maxConcurrentA = Math.max(maxConcurrentA, currentA);
+      }
+      await Bun.sleep(30);
+      perKey.get(key)?.push(message.data.n) ?? perKey.set(key, [message.data.n]);
+      if (key === "a") currentA -= 1;
+    });
+    const sends = [];
+    for (let n = 1; n <= 8; n++) sends.push(queue.send({ data: { n }, orderingKey: "a" }));
+    for (let n = 1; n <= 8; n++) sends.push(queue.send({ data: { n }, orderingKey: "b" }));
+    await Promise.all(sends);
+    await waitFor(() => (perKey.get("a")?.length ?? 0) + (perKey.get("b")?.length ?? 0) >= 16, 30_000);
+    expect(perKey.get("a")).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(perKey.get("b")).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(maxConcurrentA).toBe(1);
+    await w.drain();
+  }, 45_000);
+
+  test("send without orderingKey fails; reader is refused", async () => {
+    const queue = sync.queue<Task>({
+      id: uniqueName("part2"),
+      ordering: { mode: "partitioned", partitions: 2 },
+    });
+    await expect(queue.send({ data: { n: 1 } })).rejects.toThrow("requires an orderingKey");
+    await expect(queue.reader()).rejects.toThrow("partitioned");
   });
-
-  const a = await q.send({ data: { k: "x" }, idempotencyKey: "same" });
-  const b = await q.send({ data: { k: "x" }, idempotencyKey: "same" });
-
-  expect(a.messageId).toBe(b.messageId);
-
-  const message = await q.recv({ wait: false });
-  expect(message?.messageId).toBe(a.messageId);
-  expect(await message?.ack()).toBe(true);
-  expect(await q.recv({ wait: false })).toBeNull();
-});
-
-test("idempotency keys use the full queue identity", async () => {
-  const q = queue({
-    id: "idempotency-legacy",
-    prefix: "test:q",
-  });
-
-  const sent = await q.send({ data: { k: "x" }, idempotencyKey: "scope:key" });
-
-  expect(await redis.get(`${queueBase("idempotency-legacy")}:idempotency:scope:key`)).toBe(sent.messageId);
-});
-
-test("reader exposes recv/stream as read-only handle", async () => {
-  const q = queue({
-    id: "reader",
-    prefix: "test:q",
-  });
-
-  await q.send({ data: { v: 1 } });
-  await q.send({ data: { v: 2 } });
-
-  const reader = q.reader();
-  const values: number[] = [];
-
-  for await (const message of reader.stream({ wait: false })) {
-    values.push(message.data.v);
-    await message.ack();
-  }
-
-  expect(values).toEqual([1, 2]);
-});
-
-test("nack delay validation rejects values above maxNackDelayMs", async () => {
-  const q = queue({
-    id: "nack-limit",
-    prefix: "test:q",
-    limits: { maxNackDelayMs: 20 },
-  });
-
-  await q.send({ data: { id: "x" } });
-  const message = await q.recv({ wait: false });
-  expect(message).not.toBeNull();
-
-  let thrown: unknown = null;
-  try {
-    await message?.nack({ delayMs: 25 });
-  } catch (error) {
-    thrown = error;
-  }
-
-  expect(thrown).not.toBeNull();
-  expect(await message?.ack()).toBe(true);
-});
-
-test("queue timings reject unsafe values before mutating Redis", async () => {
-  expect(() =>
-    queue({
-      id: "invalid-defaults",
-      prefix: "test:q",
-      delivery: { defaultLeaseMs: Number.NaN },
-    }),
-  ).toThrow("delivery.defaultLeaseMs must be a safe integer");
-
-  const q = queue({ id: "invalid-timings", prefix: "test:q" });
-  await expect(q.send({ data: { v: 1 }, delayMs: Number.NaN })).rejects.toThrow(
-    "send.delayMs must be a safe integer",
-  );
-  await expect(q.send({ data: { v: 1 }, idempotencyTtlMs: 0 })).rejects.toThrow(
-    "send.idempotencyTtlMs must be a safe integer",
-  );
-  expect(await redis.send("GET", [`${queueBase("invalid-timings")}:seq`])).toBeNull();
-
-  await q.send({ data: { v: 1 } });
-  await expect(q.recv({ wait: false, timeoutMs: Number.NaN })).rejects.toThrow(
-    "recv.timeoutMs must be a safe integer",
-  );
-  await expect(q.recv({ wait: false, leaseMs: Number.POSITIVE_INFINITY })).rejects.toThrow(
-    "recv.leaseMs must be a safe integer",
-  );
-  const message = await q.recv({ wait: false });
-  await expect(message?.nack({ delayMs: Number.NaN })).rejects.toThrow(
-    "nack.delayMs must be a safe integer",
-  );
-  await expect(message?.touch({ leaseMs: 0 })).rejects.toThrow("touch.leaseMs must be a safe integer");
-  expect(await message?.ack()).toBe(true);
-  await expect(q.dlq({ limit: Number.NaN })).rejects.toThrow("dlq.limit must be a safe integer");
-});
-
-test("tenant isolation keeps queues separated", async () => {
-  const q = queue({
-    id: "tenant",
-    prefix: "test:q",
-  });
-
-  await q.send({ tenantId: "t1", data: { value: "a" } });
-  await q.send({ tenantId: "t2", data: { value: "b" } });
-
-  const m1 = await q.recv({ tenantId: "t1", wait: false });
-  const m2 = await q.recv({ tenantId: "t2", wait: false });
-
-  expect(m1?.data.value).toBe("a");
-  expect(m2?.data.value).toBe("b");
-  expect(await m1?.ack()).toBe(true);
-  expect(await m2?.ack()).toBe(true);
-});
-
-test("idempotency key expires after ttl", async () => {
-  const q = queue({
-    id: "idempotency-ttl",
-    prefix: "test:q",
-  });
-
-  const a = await q.send({ data: { v: 1 }, idempotencyKey: "k", idempotencyTtlMs: 40 });
-  await Bun.sleep(60);
-  const b = await q.send({ data: { v: 1 }, idempotencyKey: "k", idempotencyTtlMs: 40 });
-
-  expect(a.messageId).not.toBe(b.messageId);
-
-  const first = await q.recv({ wait: false });
-  const second = await q.recv({ wait: false });
-  expect(first).not.toBeNull();
-  expect(second).not.toBeNull();
-  expect(await first?.ack()).toBe(true);
-  expect(await second?.ack()).toBe(true);
-});
-
-test("parallel recv claims each message exactly once", async () => {
-  const q = queue({
-    id: "parallel-recv",
-    prefix: "test:q",
-  });
-
-  const count = 20;
-  for (let i = 0; i < count; i++) {
-    await q.send({ data: { idx: i } });
-  }
-
-  const r1 = q.reader();
-  const r2 = q.reader();
-  const collected: number[] = [];
-
-  const drain = async (reader: typeof r1): Promise<void> => {
-    while (true) {
-      const msg = await reader.recv({ wait: false });
-      if (!msg) break;
-      collected.push(msg.data.idx);
-      await msg.ack();
-    }
-  };
-
-  await Promise.all([drain(r1), drain(r2)]);
-
-  expect(collected.length).toBe(count);
-  expect(new Set(collected).size).toBe(count);
-});
-
-test("parallel send with same idempotency key deduplicates", async () => {
-  const q = queue({
-    id: "parallel-idem",
-    prefix: "test:q",
-  });
-
-  const results = await Promise.all(
-    Array.from({ length: 10 }, () =>
-      q.send({ data: { v: 1 }, idempotencyKey: "same-key" }),
-    ),
-  );
-
-  const ids = new Set(results.map((r) => r.messageId));
-  expect(ids.size).toBe(1);
-
-  const msg = await q.recv({ wait: false });
-  expect(msg).not.toBeNull();
-  expect(await msg?.ack()).toBe(true);
-  expect(await q.recv({ wait: false })).toBeNull();
-});
-
-test("double ack returns false on second call", async () => {
-  const q = queue({
-    id: "double-ack",
-    prefix: "test:q",
-  });
-
-  await q.send({ data: { v: 1 } });
-  const msg = await q.recv({ wait: false });
-  expect(msg).not.toBeNull();
-
-  expect(await msg?.ack()).toBe(true);
-  expect(await msg?.ack()).toBe(false);
-});
-
-test("double nack returns false on second call", async () => {
-  const q = queue({
-    id: "double-nack",
-    prefix: "test:q",
-  });
-
-  await q.send({ data: { v: 1 } });
-  const msg = await q.recv({ wait: false });
-  expect(msg).not.toBeNull();
-
-  expect(await msg?.nack()).toBe(true);
-  expect(await msg?.nack()).toBe(false);
-
-  // Message was requeued by first nack, consume it
-  const requeued = await q.recv({ wait: false });
-  expect(requeued).not.toBeNull();
-  expect(await requeued?.ack()).toBe(true);
-});
-
-test("ack after lease expiry and maintenance returns false", async () => {
-  const q = queue({
-    id: "ack-expired",
-    prefix: "test:q",
-  });
-
-  await q.send({ data: { v: 1 } });
-  const msg = await q.recv({ wait: false, leaseMs: 30 });
-  expect(msg).not.toBeNull();
-
-  // Wait for lease to expire
-  await Bun.sleep(60);
-
-  // Trigger maintenance by calling recv (non-blocking forces maintenance)
-  // This cleans up the expired delivery and requeues the message
-  const requeued = await q.recv({ wait: false });
-  expect(requeued).not.toBeNull();
-  expect(requeued?.messageId).toBe(msg?.messageId);
-
-  // Now the original delivery was cleaned up by maintenance — ack fails
-  expect(await msg?.ack()).toBe(false);
-
-  expect(await requeued?.ack()).toBe(true);
-});
-
-test("nack with delay requeues after delay elapses", async () => {
-  const q = queue({
-    id: "nack-delay",
-    prefix: "test:q",
-  });
-
-  await q.send({ data: { v: 1 } });
-  const msg = await q.recv({ wait: false });
-  expect(msg).not.toBeNull();
-
-  expect(await msg?.nack({ delayMs: 80 })).toBe(true);
-
-  // Not available immediately
-  expect(await q.recv({ wait: false })).toBeNull();
-
-  await Bun.sleep(100);
-
-  // Available after delay
-  const delayed = await q.recv({ wait: false });
-  expect(delayed).not.toBeNull();
-  expect(delayed?.messageId).toBe(msg?.messageId);
-  expect(await delayed?.ack()).toBe(true);
-});
-
-test("payload exceeding size limit is rejected", async () => {
-  const q = queue({
-    id: "payload-limit",
-    prefix: "test:q",
-    limits: { payloadBytes: 64 },
-  });
-
-  let thrown: unknown = null;
-  try {
-    await q.send({ data: { data: "x".repeat(200) } });
-  } catch (error) {
-    thrown = error;
-  }
-
-  expect(thrown).toBeInstanceOf(Error);
-  expect((thrown as Error).message).toContain("payload exceeds limit");
-});
-
-test("FIFO ordering is preserved", async () => {
-  const q = queue({
-    id: "fifo",
-    prefix: "test:q",
-  });
-
-  for (let i = 0; i < 10; i++) {
-    await q.send({ data: { seq: i } });
-  }
-
-  const received: number[] = [];
-  for await (const msg of q.stream({ wait: false })) {
-    received.push(msg.data.seq);
-    await msg.ack();
-  }
-
-  expect(received).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
-});
-
-test("meta is preserved through send/recv", async () => {
-  const q = queue({
-    id: "meta",
-    prefix: "test:q",
-  });
-
-  await q.send({
-    data: { v: 1 },
-    meta: { source: "test", traceId: "abc-123" },
-  });
-
-  const msg = await q.recv({ wait: false });
-  expect(msg).not.toBeNull();
-  expect(msg?.meta?.source).toBe("test");
-  expect(msg?.meta?.traceId).toBe("abc-123");
-  expect(await msg?.ack()).toBe(true);
-});
-
-test("message moves to dlq after max deliveries", async () => {
-  const q = queue({
-    id: "dlq",
-    prefix: "test:q",
-    delivery: { maxDeliveries: 2 },
-  });
-
-  await q.send({ data: { value: "x" } });
-
-  const first = await q.recv({ wait: false });
-  expect(first).not.toBeNull();
-  expect(await first?.nack()).toBe(true);
-
-  const second = await q.recv({ wait: false });
-  expect(second).not.toBeNull();
-  expect(await second?.nack()).toBe(true);
-
-  expect(await q.recv({ wait: false })).toBeNull();
-
-  const dlqKey = `${queueBase("dlq")}:dlq`;
-  const dlqRaw = await redis.hget(dlqKey, first!.messageId);
-  expect(typeof dlqRaw).toBe("string");
-});
-
-// ==========================
-// Race condition tests
-// ==========================
-
-test("concurrent ack and nack on same delivery — only one succeeds", async () => {
-  const q = queue({
-    id: "race-ack-nack",
-    prefix: "test:q",
-  });
-
-  await q.send({ data: { v: 1 } });
-  const msg = await q.recv({ wait: false });
-  expect(msg).not.toBeNull();
-
-  const [ackResult, nackResult] = await Promise.all([msg!.ack(), msg!.nack()]);
-
-  // Exactly one should succeed
-  expect(ackResult !== nackResult).toBe(true);
-
-  if (nackResult) {
-    // Nack won — message should be requeued
-    const requeued = await q.recv({ wait: false });
-    expect(requeued).not.toBeNull();
-    expect(await requeued?.ack()).toBe(true);
-  } else {
-    // Ack won — queue should be empty
-    expect(await q.recv({ wait: false })).toBeNull();
-  }
-});
-
-test("nack delay exceeding maxMessageAgeMs sends message to DLQ", async () => {
-  const q = queue({
-    id: "nack-age-dlq",
-    prefix: "test:q",
-    limits: { maxMessageAgeMs: 80 },
-  });
-
-  await q.send({ data: { v: 1 } });
-  const msg = await q.recv({ wait: false });
-  expect(msg).not.toBeNull();
-
-  // Nack with delay longer than maxMessageAgeMs
-  expect(await msg?.nack({ delayMs: 200 })).toBe(true);
-
-  // Wait for message to age past maxMessageAgeMs while in delayed set
-  await Bun.sleep(250);
-
-  // Trigger maintenance — message is now older than maxMessageAgeMs
-  const result = await q.recv({ wait: false });
-  expect(result).toBeNull();
-
-  // Verify message landed in DLQ
-  const dlqKey = `${queueBase("nack-age-dlq")}:dlq`;
-  const dlqRaw = await redis.hget(dlqKey, msg!.messageId);
-  expect(dlqRaw).not.toBeNull();
-  const dlqEntry = JSON.parse(dlqRaw!);
-  expect(dlqEntry.reason).toBe("expired");
-});
-
-test("an expired ready message moves to the DLQ instead of being claimed", async () => {
-  const q = queue<{ v: number }>({
-    id: "ready-age-dlq",
-    prefix: "test:q",
-    limits: { maxMessageAgeMs: 50 },
-  });
-
-  await q.send({ data: { v: 1 } });
-  await Bun.sleep(80);
-
-  expect(await q.recv({ wait: false })).toBeNull();
-  const entries = await q.dlq();
-  expect(entries.map((entry) => entry.reason)).toEqual(["expired"]);
-  expect(await redis.send("LLEN", [`${queueBase("ready-age-dlq")}:active`])).toBe(0);
-  expect(await redis.send("HLEN", [`${queueBase("ready-age-dlq")}:messages`])).toBe(0);
-});
-
-test("recv drains more than one expired claim batch before returning a valid message", async () => {
-  const q = queue<{ v: number }>({
-    id: "ready-age-batch",
-    prefix: "test:q",
-    limits: { maxMessageAgeMs: 50 },
-  });
-
-  for (let i = 0; i < 33; i++) {
-    await q.send({ data: { v: i } });
-  }
-  await Bun.sleep(80);
-  await q.send({ data: { v: 99 } });
-
-  const valid = await q.recv({ wait: false });
-  expect(valid?.data).toEqual({ v: 99 });
-  expect((await q.dlq()).length).toBe(33);
-  expect(await valid?.ack()).toBe(true);
-});
-
-test("blocking recv unblocks when message is sent", async () => {
-  const q = queue({
-    id: "blocking-recv",
-    prefix: "test:q",
-  });
-
-  const reader = q.reader();
-  const recvPromise = reader.recv({ wait: true, timeoutMs: 5_000 });
-
-  // Give the blocking client time to connect and start waiting
-  await Bun.sleep(50);
-
-  await q.send({ data: { v: 42 } });
-
-  const msg = await recvPromise;
-  expect(msg).not.toBeNull();
-  expect(msg?.data.v).toBe(42);
-  expect(await msg?.ack()).toBe(true);
-});
-
-test("maintenance requeue + second consumer recv vs original ack", async () => {
-  const q = queue({
-    id: "race-maintenance-ack",
-    prefix: "test:q",
-  });
-
-  await q.send({ data: { v: 1 } });
-  const original = await q.recv({ wait: false, leaseMs: 30 });
-  expect(original).not.toBeNull();
-
-  // Wait for lease to expire
-  await Bun.sleep(60);
-
-  // Second consumer triggers maintenance and picks up the requeued message
-  const reader2 = q.reader();
-  const requeued = await reader2.recv({ wait: false });
-  expect(requeued).not.toBeNull();
-  expect(requeued?.messageId).toBe(original?.messageId);
-
-  // Now both consumers race: original tries late ack, requeued tries ack
-  const [originalAck, requeuedAck] = await Promise.all([
-    original!.ack(),
-    requeued!.ack(),
-  ]);
-
-  // Original delivery was cleaned up by maintenance — should fail
-  expect(originalAck).toBe(false);
-  // Requeued delivery is valid — should succeed
-  expect(requeuedAck).toBe(true);
-
-  // Queue should now be empty
-  expect(await q.recv({ wait: false })).toBeNull();
-});
-
-// ==========================
-// Payload fidelity (opaque JSON)
-// ==========================
-
-const AWKWARD = {
-  empty: [] as number[],
-  emptyObj: {},
-  unicode: "日本😀",
-  big: 9007199254740991,
-  nested: [[], {}] as unknown[],
-  nul: null,
-  deep: { list: [1, [], { inner: [] }] },
-};
-
-test("payload round-trips byte-equivalent JSON across claim and redelivery", async () => {
-  const q = queue<typeof AWKWARD>({
-    id: "opaque-roundtrip",
-    prefix: "test:q",
-  });
-
-  await q.send({ data: AWKWARD, meta: { tags: [], n: 9007199254740991 } });
-
-  // First claim runs the message through the Lua re-encode path once.
-  const first = await q.recv({ wait: false });
-  expect(first?.data).toEqual(AWKWARD);
-  expect(first?.meta).toEqual({ tags: [], n: 9007199254740991 });
-  expect(await first?.nack()).toBe(true);
-
-  // Redelivery runs it through a second time; a lossy encode compounds here.
-  const second = await q.recv({ wait: false });
-  expect(second?.attempt).toBe(2);
-  expect(second?.data).toEqual(AWKWARD);
-  expect(second?.meta).toEqual({ tags: [], n: 9007199254740991 });
-  expect(Array.isArray(second?.data.empty)).toBe(true);
-  expect(await second?.ack()).toBe(true);
-});
-
-test("dead-lettered payload keeps the original JSON shape", async () => {
-  const q = queue<typeof AWKWARD>({
-    id: "opaque-dlq",
-    prefix: "test:q",
-    delivery: { maxDeliveries: 1 },
-  });
-
-  await q.send({ data: AWKWARD });
-  const message = await q.recv({ wait: false });
-  expect(await message?.nack()).toBe(true); // settled by moving it to the DLQ
-  expect(await q.recv({ wait: false })).toBeNull(); // not requeued
-
-  const raw = await redis.send("HGETALL", [`${queueBase("opaque-dlq")}:dlq`]);
-  const entries = Object.values(raw as Record<string, string>);
-  expect(entries.length).toBe(1);
-  const dlq = JSON.parse(entries[0]!) as { dataJson: string; reason: string };
-  expect(dlq.reason).toBe("max_deliveries_exceeded");
-  expect(JSON.parse(dlq.dataJson)).toEqual(AWKWARD);
-});
-
-test("messages written in the 5.8.0 record format are still delivered", async () => {
-  const q = queue<{ tag: string }>({
-    id: "legacy-record",
-    prefix: "test:q",
-  });
-
-  // Exactly what <= 5.8.0 wrote: decoded `data`/`meta`, no `v`, no `dataJson`.
-  const legacy = JSON.stringify({
-    data: { tag: "from-5.8.0" },
-    attempt: 0,
-    meta: { source: "legacy" },
-    enqueuedAt: Date.now(),
-  });
-  await redis.send("HSET", [`${queueBase("legacy-record")}:messages`, "9001", legacy]);
-  await redis.send("LPUSH", [`${queueBase("legacy-record")}:ready`, "9001"]);
-
-  const message = await q.recv({ wait: false });
-  expect(message?.messageId).toBe("9001");
-  expect(message?.data).toEqual({ tag: "from-5.8.0" });
-  expect(message?.meta).toEqual({ source: "legacy" });
-  expect(message?.attempt).toBe(1);
-
-  // The record is upgraded in place, so redelivery reads the new format.
-  expect(await message?.nack()).toBe(true);
-  const again = await q.recv({ wait: false });
-  expect(again?.data).toEqual({ tag: "from-5.8.0" });
-  expect(again?.attempt).toBe(2);
-  expect(await again?.ack()).toBe(true);
-});
-
-test("the unimplemented ordering mode is rejected instead of silently ignored", () => {
-  expect(() =>
-    queue({ id: "ordering-reject", prefix: "test:q", ordering: { mode: "ordering_key_partitioned" } }),
-  ).toThrow(/ordering_key_partitioned/);
-
-  // The implemented mode and a bare orderingKey stay accepted.
-  expect(() => queue({ id: "ordering-ok", prefix: "test:q", ordering: { mode: "best_effort" } })).not.toThrow();
-});
-
-test("recv records the consumerId on the delivery record", async () => {
-  const q = queue<{ v: number }>({ id: "consumer-id", prefix: "test:q" });
-
-  await q.send({ data: { v: 1 } });
-  const message = await q.recv({ wait: false, consumerId: "worker-7" });
-  expect(message).not.toBeNull();
-
-  const raw = await redis.send("HGET", [`${queueBase("consumer-id")}:deliveries`, message!.deliveryId]);
-  expect(JSON.parse(raw as string).consumerId).toBe("worker-7");
-
-  expect(await message?.ack()).toBe(true);
-});
-
-test("dlq entries are readable, drainable and bounded per entry", async () => {
-  const q = queue<{ v: number }>({
-    id: "dlq-api",
-    prefix: "test:q",
-    delivery: { maxDeliveries: 1 },
-    limits: { dlqRetentionMs: 60_000 },
-  });
-
-  await q.send({ data: { v: 1 } });
-  const first = await q.recv({ wait: false });
-  await first?.nack({ error: "boom" });
-
-  await q.send({ data: { v: 2 } });
-  const second = await q.recv({ wait: false });
-  await second?.nack();
-
-  const entries = await q.dlq();
-  expect(entries.length).toBe(2);
-  expect(entries.map((e) => e.data.v)).toEqual([1, 2]); // oldest first
-  expect(entries[0]?.reason).toBe("max_deliveries_exceeded");
-  expect(entries[0]?.lastError).toBe("boom");
-  expect(entries[0]?.attempts).toBe(1);
-
-  expect(await q.dlqRemove({ messageId: entries[0]!.messageId })).toBe(true);
-  expect(await redis.send("ZSCORE", [`${queueBase("dlq-api")}:dlq:index`, entries[0]!.messageId])).toBeNull();
-  expect(await q.dlqRemove({ messageId: entries[0]!.messageId })).toBe(false);
-  expect((await q.dlq()).length).toBe(1);
-});
-
-test("dlq reads purge expired hash and index entries without a later failure", async () => {
-  const q = queue<{ v: number }>({
-    id: "dlq-read-retention",
-    prefix: "test:q",
-    delivery: { maxDeliveries: 1 },
-    limits: { dlqRetentionMs: 80 },
-  });
-
-  await q.send({ data: { v: 1 } });
-  await (await q.recv({ wait: false }))?.nack();
-  expect((await q.dlq()).length).toBe(1);
-
-  await Bun.sleep(120);
-
-  expect(await q.dlq()).toEqual([]);
-  expect(await redis.send("HLEN", [`${queueBase("dlq-read-retention")}:dlq`])).toBe(0);
-  expect(await redis.send("ZCARD", [`${queueBase("dlq-read-retention")}:dlq:index`])).toBe(0);
-});
-
-test("dlq retention drops entries older than the window without dropping fresh ones", async () => {
-  const q = queue<{ v: number }>({
-    id: "dlq-retention",
-    prefix: "test:q",
-    delivery: { maxDeliveries: 1 },
-    limits: { dlqRetentionMs: 120 },
-  });
-
-  await q.send({ data: { v: 1 } });
-  await (await q.recv({ wait: false }))?.nack();
-  expect((await q.dlq()).length).toBe(1);
-
-  await Bun.sleep(200);
-
-  // A later failure must not keep the stale entry alive, and must survive itself.
-  await q.send({ data: { v: 2 } });
-  await (await q.recv({ wait: false }))?.nack();
-
-  const entries = await q.dlq();
-  expect(entries.length).toBe(1);
-  expect(entries[0]?.data).toEqual({ v: 2 });
-});
-
-test("dead letters written in the 5.8.0 format are still listed", async () => {
-  const q = queue<{ tag: string }>({ id: "dlq-legacy", prefix: "test:q" });
-
-  await redis.send("HSET", [
-    `${queueBase("dlq-legacy")}:dlq`,
-    "4242",
-    JSON.stringify({
-      messageId: "4242",
-      data: { tag: "old" },
-      meta: { source: "legacy" },
-      attempts: 3,
-      movedAt: Date.now(),
-      reason: "expired",
-    }),
-  ]);
-
-  const entries = await q.dlq();
-  expect(entries.length).toBe(1);
-  expect(entries[0]?.data).toEqual({ tag: "old" });
-  expect(entries[0]?.meta).toEqual({ source: "legacy" });
-  expect(entries[0]?.reason).toBe("expired");
-});
-
-test("dlq reads reconcile a stale index without hiding an unindexed legacy entry", async () => {
-  const q = queue<{ tag: string }>({ id: "dlq-stale-index", prefix: "test:q" });
-  const dlqKey = `${queueBase("dlq-stale-index")}:dlq`;
-  const indexKey = `${dlqKey}:index`;
-
-  await redis.send("HSET", [
-    dlqKey,
-    "valid",
-    JSON.stringify({
-      messageId: "valid",
-      data: { tag: "kept" },
-      attempts: 1,
-      movedAt: Date.now(),
-      reason: "failed",
-    }),
-  ]);
-  await redis.send("ZADD", [indexKey, String(Date.now() - 1), "missing"]);
-
-  const entries = await q.dlq({ limit: 1 });
-  expect(entries.map((entry) => entry.messageId)).toEqual(["valid"]);
-  expect(await redis.send("ZSCORE", [indexKey, "missing"])).toBeNull();
-  expect(await redis.send("ZSCORE", [indexKey, "valid"])).not.toBeNull();
-});
-
-test("tenant and queue id delimiter combinations cannot share state", async () => {
-  const first = queue<{ source: string }>({ id: "c", prefix: "test:q" });
-  const second = queue<{ source: string }>({ id: "b:c", prefix: "test:q" });
-
-  await first.send({ tenantId: "a:b", data: { source: "first" } });
-  expect(await second.recv({ tenantId: "a", wait: false })).toBeNull();
-
-  await second.send({ tenantId: "a", data: { source: "second" } });
-  const firstMessage = await first.recv({ tenantId: "a:b", wait: false });
-  const secondMessage = await second.recv({ tenantId: "a", wait: false });
-
-  expect(firstMessage?.data.source).toBe("first");
-  expect(secondMessage?.data.source).toBe("second");
-  expect(await firstMessage?.ack()).toBe(true);
-  expect(await secondMessage?.ack()).toBe(true);
-});
-
-test("delimiter-rich queues fail closed when legacy state already exists", async () => {
-  await redis.send("LPUSH", ["test:q:a:b:c:ready", "legacy-message"]);
-  const q = queue({ id: "c", prefix: "test:q" });
-
-  await expect(q.send({ tenantId: "a:b", data: { value: 1 } })).rejects.toThrow(
-    /queue namespace migration required/,
-  );
-});
-
-test("delimiter-safe queues cannot claim an ambiguous legacy namespace", async () => {
-  await redis.send("LPUSH", ["test:q:scope:a:b:ready", "foreign-message"]);
-  const q = queue({ id: "b", prefix: "test:q:scope" });
-
-  await expect(q.send({ tenantId: "a", data: { value: 1 } })).rejects.toThrow(
-    /queue namespace migration required/,
-  );
-});
-
-test("legacy namespace checks escape Redis glob characters", async () => {
-  await redis.send("LPUSH", ["test:q:a:bee:ready", "unrelated"]);
-  const q = queue({ id: "b*", prefix: "test:q" });
-
-  await expect(q.send({ tenantId: "a", data: { value: 1 } })).resolves.toHaveProperty("messageId");
-});
-
-test("prefix and tenant delimiter combinations cannot share state", async () => {
-  const first = queue<{ source: string }>({ id: "b", prefix: "test:q:scope" });
-  const second = queue<{ source: string }>({ id: "b", prefix: "test:q" });
-
-  await first.send({ tenantId: "a", data: { source: "first" } });
-  await second.send({ tenantId: "scope:a", data: { source: "second" } });
-
-  const firstMessage = await first.recv({ tenantId: "a", wait: false });
-  const secondMessage = await second.recv({ tenantId: "scope:a", wait: false });
-  expect(firstMessage?.data.source).toBe("first");
-  expect(secondMessage?.data.source).toBe("second");
-  expect(await firstMessage?.ack()).toBe(true);
-  expect(await secondMessage?.ack()).toBe(true);
 });

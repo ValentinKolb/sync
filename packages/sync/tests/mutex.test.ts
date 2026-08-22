@@ -1,332 +1,119 @@
-import { test, expect, beforeEach } from "bun:test";
-import { redis } from "bun";
-import { mutex, LockError } from "../index";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import type { NatsConnection } from "@nats-io/nats-core";
+import { createSync } from "../src/sync.ts";
+import type { Sync } from "../src/sync.ts";
+import type { Lock } from "../src/mutex.ts";
+import { connectToCluster } from "./cluster.ts";
+import { cleanupNamespaces, testNamespace } from "./helpers.ts";
 
-beforeEach(async () => {
-  const keys = await redis.send("KEYS", ["test:mx:*"]);
-  if (Array.isArray(keys) && keys.length > 0) {
-    await redis.send("DEL", keys as string[]);
-  }
+let nc: NatsConnection;
+let sync: Sync;
+const namespace = testNamespace();
+
+beforeAll(async () => {
+  nc = await connectToCluster({ name: "mutex-test" });
+  sync = createSync({ connection: nc, namespace, application: "tests" });
+  await sync.ready();
 });
 
-test("acquires lock successfully", async () => {
-  const m = mutex({ id: "basic", prefix: "test:mx" });
-
-  expect(m.id).toBe("basic");
-
-  const lock = await m.acquire("resource:1");
-  expect(lock).not.toBeNull();
-  expect(lock!.resource).toBe("test:mx:basic:resource:1");
-  expect(lock!.value).toHaveLength(32);
-
-  await m.release(lock!);
+afterAll(async () => {
+  await sync.drain({ timeoutMs: 2_000 });
+  await cleanupNamespaces(nc, [namespace]);
+  await nc.close();
 });
 
-test("only one lock can be held at a time", async () => {
-  const m = mutex({ id: "exclusive", prefix: "test:mx", retryCount: 0 });
-
-  const lock1 = await m.acquire("resource:2");
-  expect(lock1).not.toBeNull();
-
-  const lock2 = await m.acquire("resource:2");
-  expect(lock2).toBeNull();
-
-  await m.release(lock1!);
-});
-
-test("lock is released and can be acquired again", async () => {
-  const m = mutex({ id: "reacquire", prefix: "test:mx", retryCount: 0 });
-
-  const lock1 = await m.acquire("resource:3");
-  expect(lock1).not.toBeNull();
-
-  await m.release(lock1!);
-
-  const lock2 = await m.acquire("resource:3");
-  expect(lock2).not.toBeNull();
-
-  await m.release(lock2!);
-});
-
-test("lock expires after TTL", async () => {
-  const m = mutex({
-    id: "expire",
-    prefix: "test:mx",
-    retryCount: 0,
-    defaultTtl: 100,
+describe("mutex", () => {
+  test("exclusive acquire; second holder waits for release", async () => {
+    const mutex = sync.mutex({ id: "excl", retry: { attempts: 0 } });
+    const lock = await mutex.acquire("resource-a");
+    expect(lock).not.toBeNull();
+    expect(await mutex.acquire("resource-a")).toBeNull();
+    // Independent resources do not contend.
+    const other = await mutex.acquire("resource-b");
+    expect(other).not.toBeNull();
+    expect(await mutex.release(lock!)).toBe(true);
+    const next = await mutex.acquire("resource-a");
+    expect(next).not.toBeNull();
+    await mutex.release(next!);
+    await mutex.release(other!);
   });
 
-  const lock1 = await m.acquire("resource:4");
-  expect(lock1).not.toBeNull();
+  test("expired lease frees the resource; fencing token grows monotonically", async () => {
+    const mutex = sync.mutex({ id: "expiry", ttlMs: 1_000, retry: { attempts: 0 } });
+    const first = await mutex.acquire("job-runner");
+    expect(first).not.toBeNull();
+    await Bun.sleep(2_500);
+    const second = await mutex.acquire("job-runner");
+    expect(second).not.toBeNull();
+    expect(second!.fence).toBeGreaterThan(first!.fence);
+    await mutex.release(second!);
+  }, 15_000);
 
-  await Bun.sleep(150);
+  test("stale owner cannot extend or release after expiry and reacquisition", async () => {
+    const mutex = sync.mutex({ id: "stale", ttlMs: 1_000, retry: { attempts: 0 } });
+    const stale = await mutex.acquire("shared");
+    expect(stale).not.toBeNull();
+    await Bun.sleep(2_500);
+    const fresh = await mutex.acquire("shared");
+    expect(fresh).not.toBeNull();
+    expect(await mutex.extend(stale!)).toBe(false);
+    expect(await mutex.release(stale!)).toBe(false);
+    // The fresh lock is untouched by the stale calls.
+    expect(await mutex.extend(fresh!)).toBe(true);
+    await mutex.release(fresh!);
+  }, 15_000);
 
-  const lock2 = await m.acquire("resource:4");
-  expect(lock2).not.toBeNull();
+  test("extend keeps the lease alive beyond the original TTL and preserves the fence", async () => {
+    const mutex = sync.mutex({ id: "extend", ttlMs: 1_000, retry: { attempts: 0 } });
+    const lock = await mutex.acquire("renewing");
+    expect(lock).not.toBeNull();
+    const fence = lock!.fence;
+    for (let i = 0; i < 3; i++) {
+      await Bun.sleep(600);
+      expect(await mutex.extend(lock!)).toBe(true);
+    }
+    expect(lock!.fence).toBe(fence);
+    expect(await mutex.acquire("renewing")).toBeNull();
+    await mutex.release(lock!);
+  }, 15_000);
 
-  await m.release(lock2!);
-});
-
-test("withLock executes function and releases lock", async () => {
-  const m = mutex({ id: "withlock", prefix: "test:mx" });
-
-  let executed = false;
-  const result = await m.withLock("resource:5", async () => {
-    executed = true;
-    return 42;
-  });
-
-  expect(executed).toBe(true);
-  expect(result).toBe(42);
-
-  const lock = await m.acquire("resource:5");
-  expect(lock).not.toBeNull();
-  await m.release(lock!);
-});
-
-test("withLock releases lock on error", async () => {
-  const m = mutex({ id: "withlock-err", prefix: "test:mx", retryCount: 0 });
-
-  let thrown: unknown = null;
-  try {
-    await m.withLock("resource:6", async () => {
-      throw new Error("test error");
+  test("withLock runs the function under the lock and always releases", async () => {
+    const mutex = sync.mutex({ id: "with", retry: { attempts: 0 } });
+    const result = await mutex.withLock("crit", async (lock: Lock) => {
+      expect(await mutex.acquire("crit")).toBeNull();
+      return "done";
     });
-  } catch (e) {
-    thrown = e;
-  }
+    expect(result).toBe("done");
+    const after = await mutex.acquire("crit");
+    expect(after).not.toBeNull();
+    await mutex.release(after!);
 
-  expect((thrown as Error).message).toBe("test error");
-
-  const lock = await m.acquire("resource:6");
-  expect(lock).not.toBeNull();
-  await m.release(lock!);
-});
-
-test("withLock returns null when lock cannot be acquired", async () => {
-  const m = mutex({ id: "withlock-null", prefix: "test:mx", retryCount: 0 });
-
-  const lock1 = await m.acquire("resource:7");
-
-  const result = await m.withLock("resource:7", async () => {
-    return 42;
+    // Function failure still releases.
+    await expect(
+      mutex.withLock("crit", async () => {
+        throw new Error("inner");
+      }),
+    ).rejects.toThrow("inner");
+    const again = await mutex.acquire("crit");
+    expect(again).not.toBeNull();
+    await mutex.release(again!);
   });
 
-  expect(result).toBeNull();
-
-  await m.release(lock1!);
-});
-
-test("withLockOrThrow throws LockError when lock cannot be acquired", async () => {
-  const m = mutex({ id: "throw", prefix: "test:mx", retryCount: 0 });
-
-  const lock1 = await m.acquire("resource:8");
-
-  let thrown: unknown = null;
-  try {
-    await m.withLockOrThrow("resource:8", async () => {
-      return 42;
-    });
-  } catch (e) {
-    thrown = e;
-  }
-
-  expect(thrown).toBeInstanceOf(LockError);
-  expect((thrown as LockError).resource).toBe("resource:8");
-
-  await m.release(lock1!);
-});
-
-test("extend prolongs lock TTL", async () => {
-  const m = mutex({
-    id: "extend",
-    prefix: "test:mx",
-    retryCount: 0,
-    defaultTtl: 100,
-  });
-
-  const lock = await m.acquire("resource:9");
-  expect(lock).not.toBeNull();
-
-  const extended = await m.extend(lock!, 1000);
-  expect(extended).toBe(true);
-  expect(lock!.ttl).toBe(1000);
-
-  await Bun.sleep(150);
-
-  const lock2 = await m.acquire("resource:9");
-  expect(lock2).toBeNull();
-
-  await m.release(lock!);
-});
-
-test("extend fails if lock was lost", async () => {
-  const m = mutex({
-    id: "extend-lost",
-    prefix: "test:mx",
-    retryCount: 0,
-    defaultTtl: 100,
-  });
-
-  const lock = await m.acquire("resource:10");
-  expect(lock).not.toBeNull();
-
-  await Bun.sleep(150);
-
-  const extended = await m.extend(lock!, 1000);
-  expect(extended).toBe(false);
-});
-
-test("different resources can be locked independently", async () => {
-  const m = mutex({ id: "independent", prefix: "test:mx", retryCount: 0 });
-
-  const lockA = await m.acquire("resource:a");
-  const lockB = await m.acquire("resource:b");
-
-  expect(lockA).not.toBeNull();
-  expect(lockB).not.toBeNull();
-
-  await m.release(lockA!);
-  await m.release(lockB!);
-});
-
-test("retries with delay when lock is held", async () => {
-  const m = mutex({
-    id: "retry",
-    prefix: "test:mx",
-    retryCount: 5,
-    retryDelay: 50,
-    defaultTtl: 100,
-  });
-
-  const lock1 = await m.acquire("resource:11");
-  expect(lock1).not.toBeNull();
-
-  const start = Date.now();
-  const lock2 = await m.acquire("resource:11");
-  const elapsed = Date.now() - start;
-
-  expect(lock2).not.toBeNull();
-  expect(elapsed).toBeGreaterThanOrEqual(50);
-
-  await m.release(lock2!);
-});
-
-test("long resources are hashed", async () => {
-  const m = mutex({ id: "long", prefix: "test:mx", retryCount: 0 });
-
-  const longResource = "resource:" + "b".repeat(200);
-  const lock = await m.acquire(longResource);
-
-  expect(lock).not.toBeNull();
-  expect(lock!.resource).toStartWith("test:mx:long:hash:");
-  expect(lock!.resource.length).toBe("test:mx:long:hash:".length + 64);
-
-  await m.release(lock!);
-});
-
-// ==========================
-// Additional consistency tests
-// ==========================
-
-test("release by non-owner does not release the lock", async () => {
-  const m = mutex({ id: "non-owner", prefix: "test:mx", retryCount: 0 });
-
-  const real = await m.acquire("resource:owned");
-  expect(real).not.toBeNull();
-
-  const fake: typeof real = {
-    resource: real!.resource,
-    value: "not-the-real-value",
-    ttl: real!.ttl,
-    expiration: real!.expiration,
-  };
-
-  await m.release(fake);
-
-  // Real lock should still be held
-  const attempt = await m.acquire("resource:owned");
-  expect(attempt).toBeNull();
-
-  await m.release(real!);
-});
-
-test("concurrent acquire on same resource — exactly one wins", async () => {
-  const m = mutex({ id: "race", prefix: "test:mx", retryCount: 0 });
-
-  const results = await Promise.all(
-    Array.from({ length: 10 }, () => m.acquire("resource:contested")),
-  );
-
-  const acquired = results.filter((r) => r !== null);
-  expect(acquired.length).toBe(1);
-
-  await m.release(acquired[0]!);
-});
-
-test("different mutex ids are isolated", async () => {
-  const m1 = mutex({ id: "scope-a", prefix: "test:mx", retryCount: 0 });
-  const m2 = mutex({ id: "scope-b", prefix: "test:mx", retryCount: 0 });
-
-  const lock1 = await m1.acquire("shared-name");
-  expect(lock1).not.toBeNull();
-
-  const lock2 = await m2.acquire("shared-name");
-  expect(lock2).not.toBeNull();
-
-  await m1.release(lock1!);
-  await m2.release(lock2!);
-});
-
-test("withLock provides mutual exclusion for concurrent operations", async () => {
-  const m = mutex({ id: "mutual", prefix: "test:mx", retryCount: 10, retryDelay: 20, defaultTtl: 2000 });
-
-  let counter = 0;
-  const iterations = 5;
-
-  const increment = async (): Promise<void> => {
-    await m.withLock("counter", async () => {
-      const current = counter;
-      await Bun.sleep(10);
-      counter = current + 1;
-    });
-  };
-
-  await Promise.all(Array.from({ length: iterations }, () => increment()));
-
-  expect(counter).toBe(iterations);
-});
-
-test("rejects invalid lock TTLs before changing Redis state", async () => {
-  const invalidTtls = [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1];
-  for (const ttl of invalidTtls) {
-    expect(() => mutex({ id: "invalid-default", prefix: "test:mx", defaultTtl: ttl })).toThrow(
-      /positive safe integer/,
-    );
-  }
-
-  const m = mutex({ id: "invalid-operation", prefix: "test:mx", retryCount: 0 });
-  for (const ttl of invalidTtls) {
-    await expect(m.acquire("resource", ttl)).rejects.toThrow(/positive safe integer/);
-  }
-
-  const lock = await m.acquire("resource");
-  expect(lock).not.toBeNull();
-  for (const ttl of invalidTtls) {
-    await expect(m.extend(lock!, ttl)).rejects.toThrow(/positive safe integer/);
-  }
-  expect(await m.acquire("resource")).toBeNull();
-  await m.release(lock!);
-});
-
-test("rejects invalid retry configuration before acquiring", () => {
-  const invalidCounts = [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1];
-  for (const retryCount of invalidCounts) {
-    expect(() => mutex({ id: "invalid-retry-count", retryCount })).toThrow(/retryCount/);
-  }
-
-  const invalidDelays = [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1];
-  for (const retryDelay of invalidDelays) {
-    expect(() => mutex({ id: "invalid-retry-delay", retryDelay })).toThrow(/retryDelay/);
-  }
+  test("contending acquirers serialize on one resource", async () => {
+    const mutex = sync.mutex({ id: "contend", ttlMs: 5_000, retry: { attempts: 50, delayMs: 50 } });
+    let holders = 0;
+    let maxHolders = 0;
+    const critical = async (): Promise<void> => {
+      const value = await mutex.withLock("hot", async () => {
+        holders += 1;
+        maxHolders = Math.max(maxHolders, holders);
+        await Bun.sleep(50);
+        holders -= 1;
+        return true;
+      });
+      expect(value).toBe(true);
+    };
+    await Promise.all(Array.from({ length: 8 }, critical));
+    expect(maxHolders).toBe(1);
+  }, 30_000);
 });

@@ -1,1138 +1,526 @@
-import { redis, sleep } from "bun";
-import { randomUUID } from "crypto";
-import { expBackoff, type BackoffOptions } from "./retry";
-import { emitTrace, type TraceHandler } from "./trace";
+import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType } from "@nats-io/jetstream";
+import type { JsMsg } from "@nats-io/jetstream";
+import type { KV } from "@nats-io/kv";
+import { decodeJson, encodeJson } from "./codec.ts";
+import type { JsonValue } from "./codec.ts";
+import { runPullLoop } from "./consume.ts";
+import { asError } from "./errors.ts";
+import { assertName, resourceIdentity, subjectRoot, subjectToken, decodeSubjectToken } from "./naming.ts";
+import { ensureConsumer, ensureKv, ensureStream } from "./resources.ts";
+import type { ProvisionContext } from "./resources.ts";
+import type { SyncRuntime } from "./runtime.ts";
+import { DEFAULT_MESSAGE_PAYLOAD_BYTES, nanos } from "./types.ts";
+import type { MessageMeta } from "./types.ts";
+import { createWorkerRuntime } from "./worker.ts";
+import type { ProcessOptions, Worker } from "./worker.ts";
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_PREFIX = "sync:pump";
-const DEFAULT_BATCH_SIZE = 100;
-const DEFAULT_DELAY_MS = 0;
-const DEFAULT_LEASE_MS = 30_000;
-const DEFAULT_TERMINAL_RETENTION_MS = 7 * DAY_MS;
-const DEFAULT_PAGE_BYTES = 128 * 1024;
-const DEFAULT_MAX_ATTEMPTS = 10;
-const DEFAULT_RETRY_BASE_MS = 1_000;
-const DEFAULT_RETRY_MAX_MS = 60_000;
-const DEFAULT_RETRY_JITTER = 0.2;
-const WORKER_POLL_MS = 250;
-const MAX_KEY_BYTES = 512;
-const STALLED_PAGE_ERROR = "pull returned a page without advancing the cursor";
-const NAMESPACE_MIGRATION_ERROR =
-  "pump namespace migration required; drain old workers and migrate or remove legacy keys";
+// ==========================
+// Types
+// ==========================
 
-const textEncoder = new TextEncoder();
+export type PumpItem = { key: string };
 
-const canonicalJson = (value: unknown): string => {
-  const normalize = (current: unknown): unknown => {
-    if (Array.isArray(current)) return current.map(normalize);
-    if (current && typeof current === "object") {
-      return Object.fromEntries(
-        Object.entries(current as Record<string, unknown>)
-          .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
-          .map(([key, entry]) => [key, normalize(entry)]),
-      );
-    }
-    return current;
+export type PumpConfig<Input, Cursor, Item extends PumpItem> = {
+  id: string;
+  owner?: string;
+  /** Items requested per pull(). Default 100. */
+  batchSize?: number;
+  /** Simultaneously dispatched items inside each active run. Default 1. */
+  dispatchConcurrency?: number;
+  /** Global ceiling of concurrently leased runs across all pods. Default 100. */
+  maxActiveRuns?: number;
+  retention?: {
+    /** How long terminal run state stays readable. Default 7 days. */
+    terminalMs?: number;
+    /** Maximum encoded bytes of one persisted run record incl. its page. Default 128 KiB. */
+    maxPageBytes?: number;
   };
-  const encoded = JSON.stringify(normalize(value));
-  if (encoded === undefined) throw new Error("value is not JSON-serializable");
-  return encoded;
-};
-
-const START_SCRIPT = `
-  local existing = redis.call("GET", KEYS[1])
-  if existing then
-    return { existing, 0 }
-  end
-
-  redis.call("SET", KEYS[1], ARGV[2])
-  redis.call("ZADD", KEYS[2], ARGV[3], ARGV[1])
-  return { ARGV[2], 1 }
-`;
-
-const CLAIM_SCRIPT = `
-  local raw = redis.call("GET", KEYS[1])
-  if not raw then
-    redis.call("ZREM", KEYS[2], ARGV[1])
-    return nil
-  end
-
-  local ok, state = pcall(cjson.decode, raw)
-  if not ok or type(state) ~= "table" then
-    redis.call("DEL", KEYS[1])
-    redis.call("ZREM", KEYS[2], ARGV[1])
-    return nil
-  end
-
-  if state.state == "completed" or state.state == "failed" or state.state == "canceled" then
-    redis.call("ZREM", KEYS[2], ARGV[1])
-    return nil
-  end
-
-  local now = tonumber(ARGV[3])
-  local nextRunAt = tonumber(state.nextRunAt) or 0
-  local leaseUntil = tonumber(state.leaseUntil) or 0
-  if nextRunAt > now then
-    redis.call("ZADD", KEYS[2], tostring(nextRunAt), ARGV[1])
-    return nil
-  end
-  if leaseUntil > now then
-    redis.call("ZADD", KEYS[2], tostring(leaseUntil), ARGV[1])
-    return nil
-  end
-
-  state.state = "running"
-  state.nextRunAt = nil
-  state.leaseToken = ARGV[2]
-  state.leaseUntil = tonumber(ARGV[4])
-  state.updatedAt = now
-  local encoded = cjson.encode(state)
-  redis.call("SET", KEYS[1], encoded)
-  redis.call("ZADD", KEYS[2], ARGV[4], ARGV[1])
-  return encoded
-`;
-
-const DELETE_INVALID_SCRIPT = `
-  local raw = redis.call("GET", KEYS[1])
-  if raw ~= ARGV[2] then return 0 end
-
-  redis.call("DEL", KEYS[1])
-  redis.call("ZREM", KEYS[2], ARGV[1])
-  return 1
-`;
-
-const HEARTBEAT_SCRIPT = `
-  local raw = redis.call("GET", KEYS[1])
-  if not raw then return 0 end
-
-  local ok, state = pcall(cjson.decode, raw)
-  if not ok or state.state ~= "running" or state.leaseToken ~= ARGV[2] then
-    return 0
-  end
-
-  state.leaseUntil = tonumber(ARGV[3])
-  state.updatedAt = tonumber(ARGV[4])
-  redis.call("SET", KEYS[1], cjson.encode(state))
-  redis.call("ZADD", KEYS[2], ARGV[3], ARGV[1])
-  return 1
-`;
-
-const STORE_PAGE_SCRIPT = `
-  local raw = redis.call("GET", KEYS[1])
-  if not raw then return nil end
-
-  local ok, state = pcall(cjson.decode, raw)
-  if not ok or state.state ~= "running" or state.leaseToken ~= ARGV[2] then
-    return nil
-  end
-
-  state.pageItemsJson = ARGV[3]
-  state.pageNextCursorJson = ARGV[4]
-  state.pageNextIndex = 0
-  state.pageItemCount = tonumber(ARGV[5])
-  local stalled = ARGV[7] == "1"
-  if not stalled then
-    state.failureCount = 0
-    state.lastError = nil
-  end
-  state.updatedAt = tonumber(ARGV[6])
-  local encoded = cjson.encode(state)
-  redis.call("SET", KEYS[1], encoded)
-  return encoded
-`;
-
-const CHECKPOINT_SCRIPT = `
-  local raw = redis.call("GET", KEYS[1])
-  if not raw then return nil end
-
-  local ok, state = pcall(cjson.decode, raw)
-  if not ok or state.state ~= "running" or state.leaseToken ~= ARGV[1] or not state.pageItemsJson then
-    return nil
-  end
-
-  if tonumber(state.pageNextIndex) ~= tonumber(ARGV[2]) then
-    return nil
-  end
-
-  state.pageNextIndex = tonumber(ARGV[2]) + 1
-  state.dispatched = (tonumber(state.dispatched) or 0) + 1
-  local stalled = ARGV[4] == "1"
-  if not stalled then
-    state.failureCount = 0
-    state.lastError = nil
-  end
-  state.updatedAt = tonumber(ARGV[3])
-  local encoded = cjson.encode(state)
-  redis.call("SET", KEYS[1], encoded)
-  return encoded
-`;
-
-const COMMIT_PAGE_SCRIPT = `
-  local raw = redis.call("GET", KEYS[1])
-  if not raw then return nil end
-
-  local ok, state = pcall(cjson.decode, raw)
-  if not ok or state.state ~= "running" or state.leaseToken ~= ARGV[2] or not state.pageItemsJson then
-    return nil
-  end
-
-  if tonumber(state.pageNextIndex) < tonumber(state.pageItemCount) then
-    return nil
-  end
-
-  local nextCursorJson = state.pageNextCursorJson
-  -- A page that did not move the cursor made no durable progress, even when
-  -- dispatch accepted items from it.
-  -- Resetting failureCount on it, and scheduling the next run immediately when
-  -- delayMs is 0, let a fully-filtered source or an external API returning an
-  -- empty page with a nextPageToken hammer Redis and the upstream forever, with
-  -- no terminal state and no trace signal. Such a round now counts as a failure
-  -- so the configured backoff and maxAttempts apply.
-  local stalled = ARGV[8] == "1"
-  state.cursorJson = nextCursorJson
-  state.pageItemsJson = nil
-  state.pageNextCursorJson = nil
-  state.pageNextIndex = nil
-  state.pageItemCount = nil
-  state.leaseToken = nil
-  state.leaseUntil = nil
-  state.updatedAt = tonumber(ARGV[3])
-
-  if nextCursorJson == "null" then
-    state.failureCount = 0
-    state.lastError = nil
-    state.state = "completed"
-    state.nextRunAt = nil
-    local encoded = cjson.encode(state)
-    redis.call("SET", KEYS[1], encoded, "PX", ARGV[5])
-    redis.call("ZREM", KEYS[2], ARGV[1])
-    return encoded
-  end
-
-  if stalled then
-    state.failureCount = (tonumber(state.failureCount) or 0) + 1
-    state.lastError = "${STALLED_PAGE_ERROR}"
-    if state.failureCount >= tonumber(ARGV[7]) then
-      state.state = "failed"
-      state.nextRunAt = nil
-      local encoded = cjson.encode(state)
-      redis.call("SET", KEYS[1], encoded, "PX", ARGV[5])
-      redis.call("ZREM", KEYS[2], ARGV[1])
-      return encoded
-    end
-  else
-    state.failureCount = 0
-    state.lastError = nil
-  end
-
-  state.state = "waiting"
-  state.nextRunAt = stalled and tonumber(ARGV[6]) or tonumber(ARGV[4])
-  local encoded = cjson.encode(state)
-  redis.call("SET", KEYS[1], encoded)
-  redis.call("ZADD", KEYS[2], tostring(state.nextRunAt), ARGV[1])
-  return encoded
-`;
-
-const FAIL_SCRIPT = `
-  local raw = redis.call("GET", KEYS[1])
-  if not raw then return nil end
-
-  local ok, state = pcall(cjson.decode, raw)
-  if not ok or state.state ~= "running" or state.leaseToken ~= ARGV[2] then
-    return nil
-  end
-
-  state.failureCount = (tonumber(state.failureCount) or 0) + 1
-  state.lastError = ARGV[3]
-  state.leaseToken = nil
-  state.leaseUntil = nil
-  state.updatedAt = tonumber(ARGV[4])
-
-  if state.failureCount >= tonumber(ARGV[6]) then
-    state.state = "failed"
-    state.nextRunAt = nil
-    state.pageItemsJson = nil
-    state.pageNextCursorJson = nil
-    state.pageNextIndex = nil
-    state.pageItemCount = nil
-    local encoded = cjson.encode(state)
-    redis.call("SET", KEYS[1], encoded, "PX", ARGV[7])
-    redis.call("ZREM", KEYS[2], ARGV[1])
-    return encoded
-  end
-
-  state.state = "waiting"
-  state.nextRunAt = tonumber(ARGV[5])
-  local encoded = cjson.encode(state)
-  redis.call("SET", KEYS[1], encoded)
-  redis.call("ZADD", KEYS[2], ARGV[5], ARGV[1])
-  return encoded
-`;
-
-const RELEASE_SCRIPT = `
-  local raw = redis.call("GET", KEYS[1])
-  if not raw then return 0 end
-
-  local ok, state = pcall(cjson.decode, raw)
-  if not ok or state.state ~= "running" or state.leaseToken ~= ARGV[2] then
-    return 0
-  end
-
-  state.state = "waiting"
-  state.nextRunAt = tonumber(ARGV[3])
-  state.leaseToken = nil
-  state.leaseUntil = nil
-  state.updatedAt = tonumber(ARGV[3])
-  redis.call("SET", KEYS[1], cjson.encode(state))
-  redis.call("ZADD", KEYS[2], ARGV[3], ARGV[1])
-  return 1
-`;
-
-const CANCEL_SCRIPT = `
-  local raw = redis.call("GET", KEYS[1])
-  if not raw then return nil end
-
-  local ok, state = pcall(cjson.decode, raw)
-  if not ok then return nil end
-  if state.state == "completed" or state.state == "failed" or state.state == "canceled" then
-    return { cjson.encode(state), 0 }
-  end
-
-  state.state = "canceled"
-  state.nextRunAt = nil
-  state.leaseToken = nil
-  state.leaseUntil = nil
-  state.pageItemsJson = nil
-  state.pageNextCursorJson = nil
-  state.pageNextIndex = nil
-  state.pageItemCount = nil
-  state.updatedAt = tonumber(ARGV[2])
-  local encoded = cjson.encode(state)
-  redis.call("SET", KEYS[1], encoded, "PX", ARGV[3])
-  redis.call("ZREM", KEYS[2], ARGV[1])
-  return { encoded, 1 }
-`;
-
-export type PumpItem = {
-  key: string;
+  retry?: { maxAttempts?: number; backoffMs?: number[] };
+  /** Run lease duration: crash takeover latency vs. duplicate-claim safety. Default 60_000, min 2_000. */
+  leaseMs?: number;
+  pull(context: {
+    input: Input;
+    cursor: Cursor | null;
+    limit: number;
+    signal: AbortSignal;
+  }): Promise<{ items: Item[]; nextCursor: Cursor | null }>;
+  dispatch(context: { input: Input; item: Item; signal: AbortSignal }): Promise<void>;
 };
 
 export type PumpStatus = "queued" | "running" | "waiting" | "completed" | "failed" | "canceled";
 
-export type PumpState<Input = void, Cursor = unknown> = {
+export type PumpState<Input, Cursor> = {
   key: string;
   input: Input;
   cursor: Cursor | null;
-  state: PumpStatus;
+  status: PumpStatus;
   dispatched: number;
   failureCount: number;
   lastError?: string;
-  nextRunAt?: number;
-  meta?: Record<string, unknown>;
-  createdAt: number;
-  updatedAt: number;
+  createdAt: Date;
+  updatedAt: Date;
 };
 
-export type PumpPullContext<Input, Cursor> = {
+export type Pump<Input, Cursor> = {
+  ready(): Promise<void>;
+  start(input: { key: string; input: Input; meta?: MessageMeta }): Promise<void>;
+  process(options?: ProcessOptions): Promise<Worker>;
+  get(input: { key: string }): Promise<PumpState<Input, Cursor> | null>;
+  cancel(input: { key: string }): Promise<boolean>;
+  /** Re-enqueue wake-ups for every non-terminal run. Runs automatically on process(). */
+  reconcile(): Promise<{ requeued: number }>;
+};
+
+/** The KV record is the truth for a run; wake-up messages are repairable hints. */
+type PumpRecord<Input, Cursor, Item extends PumpItem> = {
+  key: string;
   input: Input;
   cursor: Cursor | null;
-  limit: number;
-  signal: AbortSignal;
-};
-
-export type PumpDispatchContext<Input, Item extends PumpItem> = {
-  input: Input;
-  item: Item;
-  signal: AbortSignal;
-};
-
-export type PumpPullResult<Cursor, Item extends PumpItem> = {
-  items: Item[];
-  nextCursor: Cursor | null;
-};
-
-export type PumpRetryConfig = BackoffOptions & {
-  maxAttempts?: number;
-};
-
-export type PumpTraceEvent<Input = void, Cursor = unknown> =
-  | { type: "submitted"; key: string; input: Input; meta?: Record<string, unknown> }
-  | { type: "started"; key: string; cursor: Cursor | null; failureCount: number }
-  | { type: "pulled"; key: string; itemCount: number; durationMs: number }
-  | { type: "dispatched"; key: string; itemKey: string; dispatched: number; durationMs: number }
-  | { type: "rescheduled"; key: string; failureCount: number; delayMs: number; error: Error }
-  | {
-      type: "finished";
-      key: string;
-      status: "completed" | "failed" | "canceled";
-      dispatched: number;
-      durationMs: number;
-      error?: Error;
-    };
-
-export type PumpConfig<Input, Cursor, Item extends PumpItem> = {
-  id: string;
-  prefix?: string;
-  batchSize?: number;
-  delayMs?: number;
-  defaults?: {
-    leaseMs?: number;
-    heartbeatMs?: number;
-    terminalRetentionMs?: number;
-  };
-  retry?: PumpRetryConfig;
-  limits?: {
-    pageBytes?: number;
-  };
-  trace?: TraceHandler<PumpTraceEvent<Input, Cursor>>;
-  pull: (ctx: PumpPullContext<Input, Cursor>) => Promise<PumpPullResult<Cursor, Item>> | PumpPullResult<Cursor, Item>;
-  dispatch: (ctx: PumpDispatchContext<Input, Item>) => Promise<void> | void;
-};
-
-export type PumpStartConfig<Input = void> = {
-  key: string;
-  meta?: Record<string, unknown>;
-} & (Input extends void ? { input?: Input } : { input: Input });
-
-export type PumpHandle<Input = void, Cursor = unknown> = {
-  id: string;
-  start(cfg: PumpStartConfig<Input>): Promise<PumpState<Input, Cursor>>;
-  get(cfg: { key: string }): Promise<PumpState<Input, Cursor> | null>;
-  cancel(cfg: { key: string }): Promise<boolean>;
-  stop(): void;
-};
-
-type ActivePage<Cursor, Item extends PumpItem> = {
-  items: Item[];
-  nextCursor: Cursor | null;
-  nextIndex: number;
-};
-
-type StoredPumpState<Input, Cursor, Item extends PumpItem> = PumpState<Input, Cursor> & {
-  version: 1;
-  activePage?: ActivePage<Cursor, Item>;
-  leaseToken?: string;
-  leaseUntil?: number;
-};
-
-type StoredPumpRecord = {
-  version: 1;
-  key: string;
-  inputJson?: string;
-  cursorJson: string;
-  state: PumpStatus;
+  status: PumpStatus;
   dispatched: number;
   failureCount: number;
   lastError?: string;
-  nextRunAt?: number;
-  metaJson?: string;
-  createdAt: number;
-  updatedAt: number;
-  pageItemsJson?: string;
-  pageNextCursorJson?: string;
-  pageNextIndex?: number;
-  pageItemCount?: number;
-  leaseToken?: string;
-  leaseUntil?: number;
+  meta?: MessageMeta;
+  createdAt: string;
+  updatedAt: string;
+  lease?: { token: string; until: string };
+  page?: { items: Item[]; done: string[]; nextCursor: Cursor | null };
 };
 
-type ActiveAttempt = {
-  member: string;
-  token: string;
-  abort: AbortController;
-};
+const TERMINAL: readonly PumpStatus[] = ["completed", "failed", "canceled"];
 
-type ActiveWorker = {
-  abort: AbortController;
-  current?: ActiveAttempt;
-};
+// ==========================
+// Pump factory
+// ==========================
 
-// Deliberately not a module-level registry keyed by `${prefix}:${id}`. That
-// made a second handle with the same id a silent no-op — its pull, dispatch and
-// trace callbacks were never invoked, so after a hot reload stale code kept
-// serving live traffic — and either handle's stop() aborted the shared worker.
-// Concurrent workers on one id are already resolved by the leaseToken fence.
-
-class LeaseLostError extends Error {
-  constructor() {
-    super("pump lease lost");
-    this.name = "LeaseLostError";
-  }
-}
-
-const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
-
-const evalScript = async (script: string, keys: string[], args: Array<string | number>): Promise<unknown> =>
-  await redis.send("EVAL", [script, String(keys.length), ...keys, ...args.map(String)]);
-
-const assertIdentifier = (value: string, label: string): void => {
-  if (!value) throw new Error(`${label} must be non-empty`);
-  if (value.length > 256) throw new Error(`${label} too long (max 256 chars)`);
-};
-
-const finiteConfig = (value: number | undefined, fallback: number, label: string): number => {
-  const resolved = value ?? fallback;
-  if (!Number.isFinite(resolved)) throw new Error(`${label} must be finite`);
-  return resolved;
-};
-
-const positiveSafeIntegerConfig = (value: number | undefined, fallback: number, label: string): number => {
-  const resolved = finiteConfig(value, fallback, label);
-  if (!Number.isSafeInteger(resolved) || resolved <= 0) {
-    throw new RangeError(`${label} must be a positive safe integer`);
-  }
-  return resolved;
-};
-
-const assertKey = (key: string): void => {
-  if (!key) throw new Error("key must be non-empty");
-  if (textEncoder.encode(key).byteLength > MAX_KEY_BYTES) {
-    throw new Error(`key exceeds max length (${MAX_KEY_BYTES} bytes)`);
-  }
-};
-
-const assertJsonValue = (value: unknown, label: string, seen = new WeakSet<object>()): void => {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return;
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) throw new Error(`${label} must contain only finite numbers`);
-    return;
-  }
-  if (typeof value !== "object") throw new Error(`${label} must be JSON-serializable`);
-  if (seen.has(value)) throw new Error(`${label} must not contain circular references`);
-  seen.add(value);
-
-  if (Array.isArray(value)) {
-    value.forEach((entry, index) => assertJsonValue(entry, `${label}[${index}]`, seen));
-    seen.delete(value);
-    return;
-  }
-  const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
-    throw new Error(`${label} must contain only plain objects and arrays`);
-  }
-  for (const [key, entry] of Object.entries(value)) {
-    assertJsonValue(entry, `${label}.${key}`, seen);
-  }
-  seen.delete(value);
-};
-
-const isRecord = (value: unknown): value is Record<string, unknown> =>
-  value !== null && typeof value === "object" && !Array.isArray(value);
-
-const isPumpStatus = (value: unknown): value is PumpStatus =>
-  value === "queued" ||
-  value === "running" ||
-  value === "waiting" ||
-  value === "completed" ||
-  value === "failed" ||
-  value === "canceled";
-
-const isNonNegativeSafeInteger = (value: unknown): value is number =>
-  Number.isSafeInteger(value) && (value as number) >= 0;
-
-const isFiniteTimestamp = (value: unknown): value is number =>
-  typeof value === "number" && Number.isFinite(value) && value >= 0;
-
-const isJsonValue = (value: unknown): boolean => {
-  try {
-    assertJsonValue(value, "persisted pump state");
-    return true;
-  } catch {
-    return false;
-  }
-};
-
-const parseState = <Input, Cursor, Item extends PumpItem>(
-  raw: unknown,
-): StoredPumpState<Input, Cursor, Item> | null => {
-  if (typeof raw !== "string") return null;
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (!isRecord(parsed)) return null;
-    const record = parsed as StoredPumpRecord;
-    if (
-      record.version !== 1 ||
-      typeof record.key !== "string" ||
-      record.key.length === 0 ||
-      textEncoder.encode(record.key).byteLength > MAX_KEY_BYTES ||
-      typeof record.cursorJson !== "string" ||
-      !isPumpStatus(record.state) ||
-      !isNonNegativeSafeInteger(record.dispatched) ||
-      !isNonNegativeSafeInteger(record.failureCount) ||
-      !isFiniteTimestamp(record.createdAt) ||
-      !isFiniteTimestamp(record.updatedAt) ||
-      (record.inputJson !== undefined && typeof record.inputJson !== "string") ||
-      (record.metaJson !== undefined && typeof record.metaJson !== "string") ||
-      (record.lastError !== undefined && typeof record.lastError !== "string") ||
-      (record.nextRunAt !== undefined && !isFiniteTimestamp(record.nextRunAt)) ||
-      (record.leaseToken !== undefined && (typeof record.leaseToken !== "string" || record.leaseToken.length === 0)) ||
-      (record.leaseUntil !== undefined && !isFiniteTimestamp(record.leaseUntil))
-    ) {
-      return null;
-    }
-
-    const hasLeaseToken = record.leaseToken !== undefined;
-    const hasLeaseUntil = record.leaseUntil !== undefined;
-    if (hasLeaseToken !== hasLeaseUntil || (record.state === "running") !== hasLeaseToken) return null;
-    if ((record.state === "queued" || record.state === "waiting") && record.nextRunAt === undefined) return null;
-
-    const input = record.inputJson === undefined
-      ? undefined as Input
-      : JSON.parse(record.inputJson) as Input;
-    const cursor = JSON.parse(record.cursorJson) as Cursor | null;
-    const meta = record.metaJson === undefined
-      ? undefined
-      : JSON.parse(record.metaJson) as Record<string, unknown>;
-    if (
-      (input !== undefined && !isJsonValue(input)) ||
-      !isJsonValue(cursor) ||
-      (meta !== undefined && (!isRecord(meta) || !isJsonValue(meta)))
-    ) {
-      return null;
-    }
-
-    const pageFields = [
-      record.pageItemsJson,
-      record.pageNextCursorJson,
-      record.pageNextIndex,
-      record.pageItemCount,
-    ];
-    const hasActivePage = pageFields.every((value) => value !== undefined);
-    if (!hasActivePage && pageFields.some((value) => value !== undefined)) return null;
-
-    let activePage: ActivePage<Cursor, Item> | undefined;
-    if (hasActivePage) {
-      if (
-        typeof record.pageItemsJson !== "string" ||
-        typeof record.pageNextCursorJson !== "string" ||
-        !isNonNegativeSafeInteger(record.pageNextIndex) ||
-        !isNonNegativeSafeInteger(record.pageItemCount)
-      ) {
-        return null;
-      }
-      const items = JSON.parse(record.pageItemsJson) as unknown;
-      const nextCursor = JSON.parse(record.pageNextCursorJson) as Cursor | null;
-      if (
-        !Array.isArray(items) ||
-        items.length !== record.pageItemCount ||
-        record.pageNextIndex > items.length ||
-        !isJsonValue(items) ||
-        !isJsonValue(nextCursor) ||
-        !items.every((item) => isRecord(item) && typeof item.key === "string" && item.key.length > 0)
-      ) {
-        return null;
-      }
-      activePage = {
-        items: items as Item[],
-        nextCursor,
-        nextIndex: record.pageNextIndex,
-      };
-    }
-
-    return {
-      version: 1,
-      key: record.key,
-      input,
-      cursor,
-      state: record.state,
-      dispatched: record.dispatched,
-      failureCount: record.failureCount,
-      ...(record.lastError ? { lastError: record.lastError } : {}),
-      ...(record.nextRunAt !== undefined ? { nextRunAt: record.nextRunAt } : {}),
-      ...(meta ? { meta } : {}),
-      createdAt: record.createdAt,
-      updatedAt: record.updatedAt,
-      ...(activePage ? { activePage } : {}),
-      ...(record.leaseToken ? { leaseToken: record.leaseToken } : {}),
-      ...(record.leaseUntil !== undefined ? { leaseUntil: record.leaseUntil } : {}),
-    };
-  } catch {
-    return null;
-  }
-};
-
-const toPublicState = <Input, Cursor, Item extends PumpItem>(
-  state: StoredPumpState<Input, Cursor, Item>,
-): PumpState<Input, Cursor> => ({
-  key: state.key,
-  input: state.input,
-  cursor: state.cursor,
-  state: state.state,
-  dispatched: state.dispatched,
-  failureCount: state.failureCount,
-  ...(state.lastError ? { lastError: state.lastError } : {}),
-  ...(state.nextRunAt !== undefined ? { nextRunAt: state.nextRunAt } : {}),
-  ...(state.meta ? { meta: state.meta } : {}),
-  createdAt: state.createdAt,
-  updatedAt: state.updatedAt,
-});
-
-export const pump = <Input = void, Cursor = unknown, Item extends PumpItem = PumpItem>(
+export const createPump = <Input, Cursor, Item extends PumpItem>(
+  runtime: SyncRuntime,
   config: PumpConfig<Input, Cursor, Item>,
-): PumpHandle<Input, Cursor> => {
-  assertIdentifier(config.id, "config.id");
+): Pump<Input, Cursor> => {
+  const identity = resourceIdentity(runtime.namespace, "pump", config.id);
+  const owner = config.owner ?? runtime.application;
+  const batchSize = config.batchSize ?? 100;
+  const dispatchConcurrency = config.dispatchConcurrency ?? 1;
+  const maxActiveRuns = config.maxActiveRuns ?? 100;
+  const maxPageBytes = config.retention?.maxPageBytes ?? DEFAULT_MESSAGE_PAYLOAD_BYTES;
+  const terminalMs = config.retention?.terminalMs ?? 7 * 24 * 60 * 60 * 1_000;
+  const maxAttempts = config.retry?.maxAttempts ?? 5;
+  const backoffMs = config.retry?.backoffMs ?? [1_000, 5_000, 30_000];
+  const leaseMs = config.leaseMs ?? 60_000;
+  if (!Number.isSafeInteger(leaseMs) || leaseMs < 2_000) {
+    throw new RangeError("leaseMs must be an integer of at least 2000");
+  }
+  for (const [label, value] of [
+    ["batchSize", batchSize],
+    ["dispatchConcurrency", dispatchConcurrency],
+    ["maxActiveRuns", maxActiveRuns],
+    ["retry.maxAttempts", maxAttempts],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 1) throw new RangeError(`${label} must be a positive integer`);
+  }
 
-  const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const legacyBaseKey = `${prefix}:${config.id}`;
-  const baseKey =
-    `sync:pump:namespace:v2:${encodeURIComponent(JSON.stringify([prefix, config.id]))}`;
-  const dueKey = `${baseKey}:due`;
-  // The worker belongs to this handle, not to the id.
-  let activeWorker: ActiveWorker | null = null;
-  const batchSize = Math.max(1, Math.floor(finiteConfig(config.batchSize, DEFAULT_BATCH_SIZE, "batchSize")));
-  const delayMs = Math.max(0, finiteConfig(config.delayMs, DEFAULT_DELAY_MS, "delayMs"));
-  const leaseMs = Math.max(50, finiteConfig(config.defaults?.leaseMs, DEFAULT_LEASE_MS, "defaults.leaseMs"));
-  const heartbeatMs = Math.max(
-    10,
-    Math.min(
-      finiteConfig(config.defaults?.heartbeatMs, Math.floor(leaseMs / 3), "defaults.heartbeatMs"),
-      Math.max(10, Math.floor(leaseMs / 2)),
-    ),
-  );
-  const terminalRetentionMs = positiveSafeIntegerConfig(
-    config.defaults?.terminalRetentionMs,
-    DEFAULT_TERMINAL_RETENTION_MS,
-    "defaults.terminalRetentionMs",
-  );
-  const pageBytes = Math.max(1, finiteConfig(config.limits?.pageBytes, DEFAULT_PAGE_BYTES, "limits.pageBytes"));
-  const maxAttempts = Math.max(
-    1,
-    Math.floor(finiteConfig(config.retry?.maxAttempts, DEFAULT_MAX_ATTEMPTS, "retry.maxAttempts")),
-  );
-  const retryBackoff: BackoffOptions = {
-    baseMs: finiteConfig(config.retry?.baseMs, DEFAULT_RETRY_BASE_MS, "retry.baseMs"),
-    maxMs: finiteConfig(config.retry?.maxMs, DEFAULT_RETRY_MAX_MS, "retry.maxMs"),
-    jitter: finiteConfig(config.retry?.jitter, DEFAULT_RETRY_JITTER, "retry.jitter"),
+  const replicas = runtime.defaults.replicas;
+  const storage = runtime.defaults.storage === "memory" ? StorageType.Memory : StorageType.File;
+  const bucket = `S6_P_${identity.hash}`;
+  const wakeStream = `S6_PQ_${identity.hash}`;
+  const wakeDurable = `S6_PQC_${identity.hash}`;
+  const root = subjectRoot(identity);
+  const wakeSubject = `${root}.wake`;
+  const label = `pump ${config.id}`;
+
+  let kv: KV | null = null;
+
+  const declaration = runtime.declare({
+    identity,
+    owner,
+    configKey: JSON.stringify([
+      "pump",
+      config.id,
+      owner,
+      batchSize,
+      dispatchConcurrency,
+      maxActiveRuns,
+      maxPageBytes,
+      terminalMs,
+      maxAttempts,
+      backoffMs,
+      leaseMs,
+    ]),
+    natsNames: [`KV_${bucket}`, wakeStream],
+    provision: async (ctx: ProvisionContext) => {
+      kv = await ensureKv(ctx, identity, owner, bucket, {
+        history: 1,
+        replicas,
+        storage,
+        markerTTL: 1_000,
+      });
+      await ensureStream(ctx, identity, owner, {
+        name: wakeStream,
+        subjects: [wakeSubject],
+        retention: RetentionPolicy.Workqueue,
+        discard: DiscardPolicy.Old,
+        storage,
+        num_replicas: replicas,
+        max_age: nanos(terminalMs),
+        max_bytes: 64 * 1024 * 1024,
+        max_msgs: -1,
+        max_msg_size: -1,
+        duplicate_window: nanos(120_000),
+      });
+    },
+    summary: async (ctx: ProvisionContext) => {
+      const status = await (kv ?? (await ctx.kvm.open(bucket))).status();
+      const wake = await ctx.jsm.streams.info(wakeStream);
+      return {
+        runs: status.values,
+        pendingWakeups: wake.state.messages,
+      } satisfies Record<string, JsonValue>;
+    },
+  });
+
+  const getKv = async (): Promise<KV> => {
+    await declaration.ready();
+    if (kv === null) {
+      const ctx = await runtime.context();
+      kv = await ctx.kvm.open(bucket);
+    }
+    return kv;
   };
 
-  const memberFor = (key: string): string => encodeURIComponent(key);
-  const stateKeyForMember = (member: string): string => `${baseKey}:run:${member}`;
-  const stateKeyFor = (key: string): string => stateKeyForMember(memberFor(key));
-  const legacyStateKeyFor = (key: string): string =>
-    `${legacyBaseKey}:run:${memberFor(key)}`;
-
-  const assertNoLegacyState = async (key: string): Promise<void> => {
-    const exists = Number(await redis.send("EXISTS", [legacyStateKeyFor(key)]));
-    if (exists > 0) throw new Error(NAMESPACE_MIGRATION_ERROR);
+  const runKey = (key: string): string => {
+    assertName(key, "pump key");
+    return `run.${subjectToken(key, "pump key")}`;
   };
 
-  const removeInvalidState = async (member: string, raw: string): Promise<void> => {
-    await evalScript(
-      DELETE_INVALID_SCRIPT,
-      [stateKeyForMember(member), dueKey],
-      [member, raw],
-    );
-  };
+  type Loaded = { record: PumpRecord<Input, Cursor, Item>; revision: number } | null;
 
-  const readState = async (key: string): Promise<StoredPumpState<Input, Cursor, Item> | null> => {
-    const member = memberFor(key);
-    const raw = await redis.get(stateKeyForMember(member));
-    const state = parseState<Input, Cursor, Item>(raw);
-    if ((!state || state.key !== key) && typeof raw === "string") {
-      await removeInvalidState(member, raw);
+  const load = async (key: string): Promise<Loaded> => {
+    const store = await getKv();
+    const entry = await store.get(runKey(key));
+    if (entry === null || entry.operation !== "PUT") return null;
+    try {
+      return { record: decodeJson<PumpRecord<Input, Cursor, Item>>(entry.value), revision: entry.revision };
+    } catch {
       return null;
     }
-    return state;
   };
 
-  const heartbeat = async (member: string, token: string): Promise<boolean> => {
-    const now = Date.now();
-    const result = await evalScript(
-      HEARTBEAT_SCRIPT,
-      [stateKeyForMember(member), dueKey],
-      [member, token, now + leaseMs, now],
-    );
-    return Number(result) > 0;
-  };
-
-  const release = async (member: string, token: string): Promise<void> => {
-    const now = Date.now();
-    await evalScript(RELEASE_SCRIPT, [stateKeyForMember(member), dueKey], [member, token, now]);
-  };
-
-  const runAttempt = async (
-    worker: ActiveWorker,
-    member: string,
-    token: string,
-    initialState: StoredPumpState<Input, Cursor, Item>,
-  ): Promise<void> => {
-    const attemptAbort = new AbortController();
-    const current: ActiveAttempt = { member, token, abort: attemptAbort };
-    worker.current = current;
-
-    const onWorkerAbort = (): void => attemptAbort.abort();
-    worker.abort.signal.addEventListener("abort", onWorkerAbort, { once: true });
-
-    let heartbeatBusy = false;
-    const heartbeatTimer = setInterval(() => {
-      if (heartbeatBusy || attemptAbort.signal.aborted) return;
-      heartbeatBusy = true;
-      void heartbeat(member, token)
-        .then((ok) => {
-          if (!ok) attemptAbort.abort();
-        })
-        .catch(() => attemptAbort.abort())
-        .finally(() => {
-          heartbeatBusy = false;
-        });
-    }, heartbeatMs);
-    (heartbeatTimer as unknown as { unref?: () => void }).unref?.();
-
-    let state = initialState;
+  /** CAS write; returns the new revision or null when the record moved underneath us. */
+  const casWrite = async (
+    key: string,
+    record: PumpRecord<Input, Cursor, Item>,
+    previousRevision: number,
+  ): Promise<number | null> => {
+    const store = await getKv();
+    record.updatedAt = new Date().toISOString();
+    const bytes = encodeJson(label, record, maxPageBytes);
     try {
-      await emitTrace(config.trace, {
-        type: "started",
-        key: state.key,
-        cursor: state.cursor,
-        failureCount: state.failureCount,
-      });
-
-      if (!state.activePage) {
-        const pullStartedAt = Date.now();
-        const result = await Promise.resolve(
-          config.pull({
-            input: state.input,
-            cursor: state.cursor,
-            limit: batchSize,
-            signal: attemptAbort.signal,
-          }),
-        );
-        if (attemptAbort.signal.aborted) throw new LeaseLostError();
-        if (!result || !Array.isArray(result.items)) {
-          throw new Error("pump pull must return { items, nextCursor }");
-        }
-        assertJsonValue(result.items, "pull.items");
-        assertJsonValue(result.nextCursor, "pull.nextCursor");
-        for (const item of result.items) {
-          if (!item || typeof item.key !== "string" || !item.key) {
-            throw new Error("every pump item must have a non-empty string key");
-          }
-        }
-
-        const activePage: ActivePage<Cursor, Item> = {
-          items: result.items,
-          nextCursor: result.nextCursor,
-          nextIndex: 0,
-        };
-        const itemsJson = JSON.stringify(activePage.items);
-        const nextCursorJson = canonicalJson(activePage.nextCursor);
-        const stalled = activePage.nextCursor !== null
-          && canonicalJson(activePage.nextCursor) === canonicalJson(state.cursor);
-        const pageRaw = JSON.stringify({
-          items: activePage.items,
-          nextCursor: activePage.nextCursor,
-        });
-        const actualPageBytes = textEncoder.encode(pageRaw).byteLength;
-        if (actualPageBytes > pageBytes) {
-          throw new Error(`pump page exceeds limit (${pageBytes} bytes)`);
-        }
-
-        const stored = parseState<Input, Cursor, Item>(
-          await evalScript(
-            STORE_PAGE_SCRIPT,
-            [stateKeyForMember(member)],
-            [member, token, itemsJson, nextCursorJson, activePage.items.length, Date.now(), stalled ? "1" : "0"],
-          ),
-        );
-        if (!stored) throw new LeaseLostError();
-        state = stored;
-
-        await emitTrace(config.trace, {
-          type: "pulled",
-          key: state.key,
-          itemCount: activePage.items.length,
-          durationMs: Date.now() - pullStartedAt,
-        });
+      if (previousRevision === 0) {
+        return await store.create(runKey(key), bytes);
       }
-
-      while (state.activePage && state.activePage.nextIndex < state.activePage.items.length) {
-        if (attemptAbort.signal.aborted) throw new LeaseLostError();
-        if (!(await heartbeat(member, token))) throw new LeaseLostError();
-
-        const index = state.activePage.nextIndex;
-        const item = state.activePage.items[index]!;
-        const stalled = state.activePage.nextCursor !== null
-          && canonicalJson(state.activePage.nextCursor) === canonicalJson(state.cursor);
-        const dispatchStartedAt = Date.now();
-        await Promise.resolve(
-          config.dispatch({
-            input: state.input,
-            item,
-            signal: attemptAbort.signal,
-          }),
-        );
-        if (attemptAbort.signal.aborted) throw new LeaseLostError();
-
-        const checkpointed = parseState<Input, Cursor, Item>(
-          await evalScript(
-            CHECKPOINT_SCRIPT,
-            [stateKeyForMember(member)],
-            [token, index, Date.now(), stalled ? "1" : "0"],
-          ),
-        );
-        if (!checkpointed) throw new LeaseLostError();
-        state = checkpointed;
-
-        await emitTrace(config.trace, {
-          type: "dispatched",
-          key: state.key,
-          itemKey: item.key,
-          dispatched: state.dispatched,
-          durationMs: Date.now() - dispatchStartedAt,
-        });
-      }
-
-      const nextRunAt = Date.now() + delayMs;
-      const stalledRunAt =
-        Date.now() + Math.max(delayMs, expBackoff((state.failureCount ?? 0) + 1, retryBackoff));
-      const stalled = state.activePage !== undefined
-        && state.activePage.nextCursor !== null
-        && canonicalJson(state.activePage.nextCursor) === canonicalJson(state.cursor);
-      const committed = parseState<Input, Cursor, Item>(
-        await evalScript(
-          COMMIT_PAGE_SCRIPT,
-          [stateKeyForMember(member), dueKey],
-          [member, token, Date.now(), nextRunAt, terminalRetentionMs, stalledRunAt, maxAttempts, stalled ? "1" : "0"],
-        ),
-      );
-      if (!committed) throw new LeaseLostError();
-      state = committed;
-
-      if (state.state === "completed") {
-        await emitTrace(config.trace, {
-          type: "finished",
-          key: state.key,
-          status: "completed",
-          dispatched: state.dispatched,
-          durationMs: Date.now() - state.createdAt,
-        });
-      } else if (state.state === "failed") {
-        await emitTrace(config.trace, {
-          type: "finished",
-          key: state.key,
-          status: "failed",
-          dispatched: state.dispatched,
-          durationMs: Date.now() - state.createdAt,
-          error: new Error(STALLED_PAGE_ERROR),
-        });
-      } else if (state.lastError === STALLED_PAGE_ERROR && state.nextRunAt !== undefined) {
-        await emitTrace(config.trace, {
-          type: "rescheduled",
-          key: state.key,
-          failureCount: state.failureCount,
-          delayMs: Math.max(0, state.nextRunAt - Date.now()),
-          error: new Error(STALLED_PAGE_ERROR),
-        });
-      }
-    } catch (caught) {
-      const error = asError(caught);
-      if (attemptAbort.signal.aborted || error instanceof LeaseLostError) {
-        await release(member, token).catch(() => undefined);
-        return;
-      }
-
-      const nextFailureCount = state.failureCount + 1;
-      const retryDelayMs = expBackoff(nextFailureCount, retryBackoff);
-      const failed = parseState<Input, Cursor, Item>(
-        await evalScript(
-          FAIL_SCRIPT,
-          [stateKeyForMember(member), dueKey],
-          [
-            member,
-            token,
-            error.message,
-            Date.now(),
-            Date.now() + retryDelayMs,
-            maxAttempts,
-            terminalRetentionMs,
-          ],
-        ),
-      );
-      if (!failed) return;
-
-      if (failed.state === "failed") {
-        await emitTrace(config.trace, {
-          type: "finished",
-          key: failed.key,
-          status: "failed",
-          dispatched: failed.dispatched,
-          durationMs: Date.now() - failed.createdAt,
-          error,
-        });
-      } else {
-        await emitTrace(config.trace, {
-          type: "rescheduled",
-          key: failed.key,
-          failureCount: failed.failureCount,
-          delayMs: retryDelayMs,
-          error,
-        });
-      }
-    } finally {
-      clearInterval(heartbeatTimer);
-      worker.abort.signal.removeEventListener("abort", onWorkerAbort);
-      if (worker.current === current) worker.current = undefined;
+      return await store.update(runKey(key), bytes, previousRevision);
+    } catch (error) {
+      if (/wrong last sequence|already exists/i.test(asError(error).message)) return null;
+      throw error;
     }
   };
 
-  const startWorker = (): void => {
-    if (activeWorker) return;
-
-    const worker: ActiveWorker = { abort: new AbortController() };
-    activeWorker = worker;
-
-    void (async () => {
-      try {
-        while (!worker.abort.signal.aborted) {
-          try {
-            const candidates = await redis.send("ZRANGEBYSCORE", [
-              dueKey,
-              "-inf",
-              String(Date.now()),
-              "LIMIT",
-              "0",
-              "1",
-            ]);
-            const member = Array.isArray(candidates) && candidates[0] !== undefined
-              ? String(candidates[0])
-              : null;
-            if (!member) {
-              await sleep(WORKER_POLL_MS);
-              continue;
-            }
-
-            const token = randomUUID();
-            const now = Date.now();
-            const claimedRaw = await evalScript(
-              CLAIM_SCRIPT,
-              [stateKeyForMember(member), dueKey],
-              [member, token, now, now + leaseMs],
-            );
-            const claimed = parseState<Input, Cursor, Item>(claimedRaw);
-            if (!claimed || memberFor(claimed.key) !== member) {
-              if (typeof claimedRaw === "string") await removeInvalidState(member, claimedRaw);
-              await sleep(10);
-              continue;
-            }
-
-            await runAttempt(worker, member, token, claimed);
-          } catch {
-            if (!worker.abort.signal.aborted) await sleep(WORKER_POLL_MS);
-          }
-        }
-      } finally {
-        if (activeWorker === worker) activeWorker = null;
-      }
-    })();
+  const publishWake = async (key: string, revision: number): Promise<void> => {
+    const ctx = await runtime.context();
+    // The stable message ID makes wake-ups repairable: re-enqueueing the same
+    // run revision dedupes, a new revision wakes again.
+    await ctx.js.publish(wakeSubject, encodeJson(label, { key }, 4_096), {
+      msgID: `wake.${subjectToken(key, "pump key")}.${revision}`,
+    });
   };
 
-  const start = async (cfg: PumpStartConfig<Input>): Promise<PumpState<Input, Cursor>> => {
-    assertKey(cfg.key);
-    await assertNoLegacyState(cfg.key);
-    const input = (cfg as { input?: Input }).input as Input;
-    if (input !== undefined) assertJsonValue(input, "start.input");
-    if (cfg.meta !== undefined) assertJsonValue(cfg.meta, "start.meta");
+  const toState = (record: PumpRecord<Input, Cursor, Item>): PumpState<Input, Cursor> => ({
+    key: record.key,
+    input: record.input,
+    cursor: record.cursor,
+    status: record.status,
+    dispatched: record.dispatched,
+    failureCount: record.failureCount,
+    ...(record.lastError !== undefined ? { lastError: record.lastError } : {}),
+    createdAt: new Date(record.createdAt),
+    updatedAt: new Date(record.updatedAt),
+  });
 
-    const now = Date.now();
-    const state: StoredPumpRecord = {
-      version: 1,
-      key: cfg.key,
-      ...(input !== undefined ? { inputJson: JSON.stringify(input) } : {}),
-      cursorJson: "null",
-      state: "queued",
+  // ==========================
+  // Public operations
+  // ==========================
+
+  const start: Pump<Input, Cursor>["start"] = async (input) => {
+    runtime.assertActive();
+    await declaration.ready();
+    const existing = await load(input.key);
+    if (existing !== null && !TERMINAL.includes(existing.record.status)) return; // idempotent
+    const now = new Date().toISOString();
+    const record: PumpRecord<Input, Cursor, Item> = {
+      key: input.key,
+      input: input.input,
+      cursor: null,
+      status: "queued",
       dispatched: 0,
       failureCount: 0,
-      nextRunAt: now,
-      ...(cfg.meta ? { metaJson: JSON.stringify(cfg.meta) } : {}),
+      ...(input.meta !== undefined ? { meta: input.meta } : {}),
       createdAt: now,
       updatedAt: now,
     };
-    const stateRaw = JSON.stringify(state);
-    const member = memberFor(cfg.key);
-    let stored: StoredPumpState<Input, Cursor, Item> | null = null;
-    let created = false;
-    for (let attempt = 0; attempt < 3 && !stored; attempt += 1) {
-      const result = await evalScript(
-        START_SCRIPT,
-        [stateKeyForMember(member), dueKey],
-        [member, stateRaw, now],
-      );
-      if (!Array.isArray(result)) throw new Error("pump start failed");
+    const revision = await casWrite(input.key, record, existing?.revision ?? 0);
+    if (revision === null) return; // lost a concurrent start — that start enqueued the wake-up
+    await publishWake(input.key, revision);
+  };
 
-      const parsed = parseState<Input, Cursor, Item>(result[0]);
-      stored = parsed?.key === cfg.key ? parsed : null;
-      created = Number(result[1]) > 0;
-      if (!stored && typeof result[0] === "string") {
-        await removeInvalidState(member, result[0]);
+  const get: Pump<Input, Cursor>["get"] = async (input) => {
+    runtime.assertActive();
+    const loaded = await load(input.key);
+    return loaded === null ? null : toState(loaded.record);
+  };
+
+  const cancel: Pump<Input, Cursor>["cancel"] = async (input) => {
+    runtime.assertActive();
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const loaded = await load(input.key);
+      if (loaded === null || TERMINAL.includes(loaded.record.status)) return false;
+      const record = { ...loaded.record, status: "canceled" as const, lease: undefined };
+      if ((await casWrite(input.key, record, loaded.revision)) !== null) return true;
+    }
+    return false;
+  };
+
+  const reconcile: Pump<Input, Cursor>["reconcile"] = async () => {
+    runtime.assertActive();
+    const store = await getKv();
+    let requeued = 0;
+    const keys = await store.keys("run.>");
+    for await (const rawKey of keys) {
+      const key = decodeSubjectToken(rawKey.slice("run.".length));
+      const loaded = await load(key);
+      if (loaded === null || TERMINAL.includes(loaded.record.status)) continue;
+      await publishWake(key, loaded.revision);
+      requeued += 1;
+    }
+    if (requeued > 0) {
+      runtime.events.emit({ type: "pump_recovered", resource: config.id, kind: "pump", detail: { requeued } });
+    }
+    return { requeued };
+  };
+
+  // ==========================
+  // Run execution
+  // ==========================
+
+  /** Executes one run to a terminal, waiting, or lease-blocked outcome. */
+  const executeRun = async (key: string, msg: JsMsg, signal: AbortSignal): Promise<void> => {
+    const leaseToken = crypto.randomUUID();
+    let loaded = await load(key);
+
+    // Claim or bail out.
+    while (true) {
+      if (loaded === null || TERMINAL.includes(loaded.record.status)) {
+        msg.ack();
+        return;
+      }
+      const lease = loaded.record.lease;
+      if (lease !== undefined && new Date(lease.until).getTime() > Date.now() && lease.token !== leaseToken) {
+        // Another process owns this run; check again after the lease window.
+        msg.nak(Math.max(1_000, new Date(lease.until).getTime() - Date.now()));
+        return;
+      }
+      const claimed: PumpRecord<Input, Cursor, Item> = {
+        ...loaded.record,
+        status: "running",
+        lease: { token: leaseToken, until: new Date(Date.now() + leaseMs).toISOString() },
+      };
+      const revision = await casWrite(key, claimed, loaded.revision);
+      if (revision !== null) {
+        loaded = { record: claimed, revision };
+        break;
+      }
+      loaded = await load(key);
+    }
+
+    let { record, revision } = loaded;
+
+    /** CAS with lease refresh; on external change reloads and returns false. */
+    const checkpoint = async (mutate: (r: PumpRecord<Input, Cursor, Item>) => void): Promise<boolean> => {
+      const next = { ...record, lease: { token: leaseToken, until: new Date(Date.now() + leaseMs).toISOString() } };
+      mutate(next);
+      const newRevision = await casWrite(key, next, revision);
+      msg.working();
+      if (newRevision === null) {
+        const reloaded = await load(key);
+        if (reloaded !== null) ({ record, revision } = reloaded);
+        return false;
+      }
+      record = next;
+      revision = newRevision;
+      return true;
+    };
+
+    const fail = async (error: Error): Promise<void> => {
+      const failureCount = record.failureCount + 1;
+      if (failureCount >= maxAttempts) {
+        await checkpoint((r) => {
+          r.status = "failed";
+          r.failureCount = failureCount;
+          r.lastError = error.message;
+          r.lease = undefined;
+        });
+        runtime.events.emit({ type: "handler_error", resource: config.id, kind: "pump", error: error.message });
+        msg.ack();
+        return;
+      }
+      await checkpoint((r) => {
+        r.status = "waiting";
+        r.failureCount = failureCount;
+        r.lastError = error.message;
+        r.lease = undefined;
+      });
+      msg.nak(backoffMs[Math.min(failureCount - 1, backoffMs.length - 1)]!);
+    };
+
+    while (true) {
+      if (signal.aborted || TERMINAL.includes(record.status)) {
+        // Canceled externally or shutting down: release the lease, keep state.
+        if (TERMINAL.includes(record.status)) msg.ack();
+        else {
+          await checkpoint((r) => {
+            r.lease = undefined;
+          });
+          msg.nak();
+        }
+        return;
+      }
+
+      // 1. Ensure there is a current page.
+      if (record.page === undefined) {
+        let pulled: { items: Item[]; nextCursor: Cursor | null };
+        try {
+          pulled = await config.pull({ input: record.input, cursor: record.cursor, limit: batchSize, signal });
+        } catch (error) {
+          await fail(asError(error));
+          return;
+        }
+        const keys = new Set(pulled.items.map((item) => item.key));
+        if (keys.size !== pulled.items.length) {
+          await fail(new Error("pull() returned items with duplicate keys"));
+          return;
+        }
+        if (pulled.items.length === 0 && pulled.nextCursor === null) {
+          await checkpoint((r) => {
+            r.status = "completed";
+            r.lease = undefined;
+          });
+          msg.ack();
+          return;
+        }
+        if (!(await checkpoint((r) => {
+          r.page = { items: pulled.items, done: [], nextCursor: pulled.nextCursor };
+        }))) continue; // externally changed (e.g. canceled) — re-evaluate
+      }
+
+      // 2. Dispatch remaining page items with bounded concurrency, checkpointing
+      //    each completed item key individually. A crash repeats only items
+      //    whose sink succeeded after their last confirmed checkpoint.
+      const page = record.page!;
+      const remaining = page.items.filter((item) => !page.done.includes(item.key));
+      let dispatchError: Error | null = null;
+      let index = 0;
+      const workers = Array.from({ length: Math.min(dispatchConcurrency, remaining.length) }, async () => {
+        while (dispatchError === null && !signal.aborted) {
+          const item = remaining[index++];
+          if (item === undefined) return;
+          try {
+            await config.dispatch({ input: record.input, item, signal });
+          } catch (error) {
+            dispatchError = asError(error);
+            return;
+          }
+          await checkpoint((r) => {
+            r.page?.done.push(item.key);
+          });
+        }
+      });
+      await Promise.all(workers);
+      if (dispatchError !== null) {
+        await fail(dispatchError);
+        return;
+      }
+      if (signal.aborted || TERMINAL.includes(record.status)) continue; // handled at loop head
+
+      // 3. Page complete: advance the committed cursor, clear the page.
+      const finished = record.page!;
+      const advanced = await checkpoint((r) => {
+        r.cursor = finished.nextCursor;
+        r.dispatched += finished.items.length;
+        r.failureCount = 0;
+        delete r.lastError;
+        delete r.page;
+        if (finished.nextCursor === null) {
+          r.status = "completed";
+          r.lease = undefined;
+        }
+      });
+      if (!advanced) continue;
+      if (record.status === "completed") {
+        msg.ack();
+        return;
       }
     }
-    if (!stored) throw new Error("pump state is invalid");
-    startWorker();
-
-    if (created) {
-      await emitTrace(config.trace, {
-        type: "submitted",
-        key: stored.key,
-        input: stored.input,
-        ...(stored.meta ? { meta: stored.meta } : {}),
-      });
-    }
-    return toPublicState(stored);
   };
 
-  const get = async (cfg: { key: string }): Promise<PumpState<Input, Cursor> | null> => {
-    assertKey(cfg.key);
-    await assertNoLegacyState(cfg.key);
-    const state = await readState(cfg.key);
-    return state ? toPublicState(state) : null;
-  };
-
-  const cancel = async (cfg: { key: string }): Promise<boolean> => {
-    assertKey(cfg.key);
-    await assertNoLegacyState(cfg.key);
-    const member = memberFor(cfg.key);
-    const result = await evalScript(
-      CANCEL_SCRIPT,
-      [stateKeyForMember(member), dueKey],
-      [member, Date.now(), terminalRetentionMs],
-    );
-    if (!Array.isArray(result)) return false;
-
-    const state = parseState<Input, Cursor, Item>(result[0]);
-    const changed = Number(result[1]) > 0;
-    if (!state || !changed) return false;
-
-    const worker = activeWorker;
-    if (worker?.current?.member === member) worker.current.abort.abort();
-
-    await emitTrace(config.trace, {
-      type: "finished",
-      key: state.key,
-      status: "canceled",
-      dispatched: state.dispatched,
-      durationMs: Date.now() - state.createdAt,
+  const process: Pump<Input, Cursor>["process"] = async (options = {}) => {
+    runtime.assertActive();
+    await declaration.ready();
+    const ctx = await runtime.context();
+    await ensureConsumer(ctx, wakeStream, {
+      durable_name: wakeDurable,
+      ack_policy: AckPolicy.Explicit,
+      filter_subject: wakeSubject,
+      ack_wait: nanos(leaseMs),
+      max_ack_pending: maxActiveRuns,
+      deliver_policy: DeliverPolicy.All,
     });
-    return true;
-  };
+    await reconcile();
 
-  const stop = (): void => {
-    const worker = activeWorker;
-    if (!worker) return;
-    worker.abort.abort();
-    worker.current?.abort.abort();
-    if (worker.current) {
-      void release(worker.current.member, worker.current.token).catch(() => undefined);
-    }
-    activeWorker = null;
-  };
+    const wr = createWorkerRuntime(options, { onFinished: () => runtime.unregisterWorker(wr) });
+    runtime.registerWorker(wr);
+    runtime.events.emit({ type: "worker_started", resource: config.id, kind: "pump" });
 
-  startWorker();
+    const onMessage = async (msg: JsMsg, signal: AbortSignal): Promise<void> => {
+      let wake: { key: string };
+      try {
+        wake = decodeJson<{ key: string }>(msg.data);
+        if (typeof wake.key !== "string") throw new Error("invalid wake-up");
+      } catch {
+        msg.term();
+        return;
+      }
+      try {
+        await executeRun(wake.key, msg, signal);
+      } catch (error) {
+        runtime.events.emit({ type: "handler_error", resource: config.id, kind: "pump", error: asError(error).message });
+        msg.nak(5_000);
+      }
+    };
+
+    runPullLoop(wr, () => ctx.js.consumers.get(wakeStream, wakeDurable), onMessage, {
+      events: runtime.events,
+      resource: config.id,
+    }).finally(() => {
+      runtime.events.emit({ type: "worker_stopped", resource: config.id, kind: "pump" });
+    });
+    return wr.worker;
+  };
 
   return {
-    id: config.id,
+    ready: () => declaration.ready(),
     start,
+    process,
     get,
     cancel,
-    stop,
+    reconcile,
   };
 };

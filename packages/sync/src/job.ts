@@ -1,797 +1,205 @@
-import { redis, sleep } from "bun";
-import { queue } from "./queue";
-import { expBackoff, isRetryableTransportError, retry, type BackoffOptions } from "./retry";
-import { emitTrace, type TraceHandler } from "./trace";
-
-const DEFAULT_PREFIX = "sync:job";
-const DAY_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_LEASE_MS = 30_000;
-const DEFAULT_WORKER_RECV_TIMEOUT_MS = 1_000;
-const DEFAULT_KEY_TTL_MS = 24 * 60 * 60 * 1000;
-const MIN_KEY_TTL_MS = 1_000;
-const MAX_KEY_TTL_MS = 30 * DAY_MS;
-const MAX_JOB_DELAY_MS = MAX_KEY_TTL_MS - MIN_KEY_TTL_MS;
-const MAX_JOB_MESSAGE_AGE_MS = Number.MAX_SAFE_INTEGER;
-// How long a claim may stay unenqueued before a later submit re-enqueues it.
-// Generous relative to the single `queue.send` it covers, and far below any TTL.
-const ENQUEUE_GRACE_MS = 30_000;
-
-// Claim the idempotency key atomically. Returns { jobId, isNew }.
-//
-// The stored value records whether the work message actually reached the queue.
-// A pod that died between claiming the key and enqueuing used to strand the key
-// with no message behind it: every later submit returned that orphaned jobId and
-// enqueued nothing, for up to keyTtlMs. A claim that is still unenqueued past
-// the grace window is therefore handed back as new so the caller re-enqueues it,
-// keeping the original jobId valid.
-//
-// Values written by <= 5.8.0 are the bare jobId; those are treated as enqueued.
-const CLAIM_KEY_SCRIPT = `
-  local idemKey = KEYS[1]
-  local seqKey = KEYS[2]
-  local ttlMs = tonumber(ARGV[1])
-  local now = tonumber(ARGV[2])
-  local graceMs = tonumber(ARGV[3])
-  local incomingPayloadJson = ARGV[4]
-
-  local existing = redis.call("GET", idemKey)
-  if existing then
-    local ok, record = pcall(cjson.decode, existing)
-    if not ok or type(record) ~= "table" or not record.jobId then
-      return { existing, 0 }
-    end
-    if record.enqueued then
-      return { record.jobId, 0, "" }
-    end
-    if type(record.payloadJson) == "string" and record.payloadJson ~= "" then
-      -- Every contender retries the exact payload captured by the first claim.
-      -- The work queue's jobId idempotency key makes concurrent sends harmless.
-      return { record.jobId, 1, record.payloadJson }
-    end
-    if (now - (tonumber(record.claimedAt) or 0)) <= graceMs then
-      -- A concurrent submit is still mid-flight; do not enqueue a second time.
-      return { record.jobId, 0, "" }
-    end
-    record.claimedAt = now
-    record.payloadJson = incomingPayloadJson
-    redis.call("SET", idemKey, cjson.encode(record), "PX", tostring(ttlMs))
-    return { record.jobId, 1, incomingPayloadJson }
-  end
-
-  local nextId = tostring(redis.call("INCR", seqKey))
-  redis.call(
-    "SET",
-    idemKey,
-    cjson.encode({
-      jobId = nextId,
-      enqueued = false,
-      claimedAt = now,
-      payloadJson = incomingPayloadJson
-    }),
-    "PX",
-    tostring(ttlMs)
-  )
-  return { nextId, 1, incomingPayloadJson }
-`;
-
-// Mark the claim as backed by a real queue message, and refresh its TTL.
-// A remote worker may win this transition before submit() returns from send().
-// Its TTL-bounded receipt lets concurrent submitters distinguish that accepted
-// work from a stale delivery after the worker terminally released the claim.
-const MARK_ENQUEUED_SCRIPT = `
-  local existing = redis.call("GET", KEYS[1])
-  local receipt = redis.call("GET", KEYS[2])
-  local jobId = ARGV[1]
-  local claimTtlMs = tostring(ARGV[2])
-  local receiptTtlMs = tostring(ARGV[3])
-  local actor = ARGV[4]
-
-  if existing then
-    local ok, record = pcall(cjson.decode, existing)
-    local structured = ok and type(record) == "table" and record.jobId
-    local matches = (structured and record.jobId == jobId) or (not structured and existing == jobId)
-
-    if matches and actor == "worker" then
-      redis.call("SET", KEYS[2], jobId, "PX", receiptTtlMs)
-    end
-
-    if matches and structured and not record.enqueued then
-      record.enqueued = true
-      record.payloadJson = nil
-      redis.call("SET", KEYS[1], cjson.encode(record), "PX", claimTtlMs)
-      return 1
-    end
-
-    if matches then
-      redis.call("PEXPIRE", KEYS[1], claimTtlMs)
-      if actor == "submit" and receipt == jobId then
-        return 3
-      end
-      return 2
-    end
-  end
-
-  if actor == "submit" and receipt == jobId then
-    return 3
-  end
-
-  return 0
-`;
-
-// Release only our own claim. An unconditional DEL let a slow job's terminal
-// release delete the claim a later submit had already taken over.
-const RELEASE_KEY_SCRIPT = `
-  local existing = redis.call("GET", KEYS[1])
-  if not existing then return 0 end
-  local ok, record = pcall(cjson.decode, existing)
-  if ok and type(record) == "table" and record.jobId then
-    if record.jobId ~= ARGV[1] then return 0 end
-  elseif existing ~= ARGV[1] then
-    return 0
-  end
-  redis.call("DEL", KEYS[1])
-  return 1
-`;
-
-// Keep a claim alive while its job is still running or waiting to retry.
-const REFRESH_KEY_SCRIPT = `
-  local existing = redis.call("GET", KEYS[1])
-  if not existing then return 0 end
-  local ok, record = pcall(cjson.decode, existing)
-  if ok and type(record) == "table" and record.jobId then
-    if record.jobId ~= ARGV[1] then return 0 end
-  elseif existing ~= ARGV[1] then
-    return 0
-  end
-  redis.call("PEXPIRE", KEYS[1], tostring(ARGV[2]))
-  return 1
-`;
-
-// Settle the queue delivery and release its matching idempotency claim in one
-// Redis transition. A transport failure after this script commits may hide the
-// result, but it cannot leave an acknowledged job claimed without work.
-const TERMINAL_ACK_SCRIPT = `
-  local deliveryId = ARGV[1]
-  local jobId = ARGV[2]
-
-  local deliveryRaw = redis.call("HGET", KEYS[1], deliveryId)
-  if not deliveryRaw then
-    return 0
-  end
-
-  local ok, delivery = pcall(cjson.decode, deliveryRaw)
-  if not ok then
-    redis.call("HDEL", KEYS[1], deliveryId)
-    redis.call("ZREM", KEYS[2], deliveryId)
-    return 0
-  end
-
-  redis.call("HDEL", KEYS[1], deliveryId)
-  redis.call("ZREM", KEYS[2], deliveryId)
-  redis.call("LREM", KEYS[4], 1, delivery.messageId)
-  redis.call("HDEL", KEYS[3], delivery.messageId)
-  if redis.call("HGET", KEYS[5], delivery.messageId) == deliveryId then
-    redis.call("HDEL", KEYS[5], delivery.messageId)
-  end
-  redis.call("HDEL", KEYS[6], delivery.messageId)
-
-  local existing = redis.call("GET", KEYS[7])
-  if existing then
-    local claimOk, record = pcall(cjson.decode, existing)
-    if claimOk and type(record) == "table" and record.jobId then
-      if record.jobId == jobId then redis.call("DEL", KEYS[7]) end
-    elseif existing == jobId then
-      redis.call("DEL", KEYS[7])
-    end
-  end
-
-  return 1
-`;
+import type { JsonValue } from "./codec.ts";
+import { BatchSubmitError, asError } from "./errors.ts";
+import { assertName } from "./naming.ts";
+import { createQueueCore } from "./queue.ts";
+import type { DeadLetterStore, QueueConfig } from "./queue.ts";
+import type { SyncRuntime } from "./runtime.ts";
+import type { MessageMeta, OrderingConfig, PublishReceipt } from "./types.ts";
+import type { ProcessOptions, Worker } from "./worker.ts";
 
 // ==========================
 // Types
 // ==========================
 
-export type JobId = string;
-
-export type JobMetrics = {
-  dispatches: number;
-  failures: number;
-  reschedules: number;
+export type JobConfig = Omit<QueueConfig, "ordering"> & {
+  ordering?: OrderingConfig;
+  /** Retention for diagnostics and dead letters. Default 7 days. */
+  terminalRetentionMs?: number;
 };
 
-export type JobTraceEvent<Input = void, Result = unknown> =
-  | { type: "submitted"; jobId: string; key: string; input?: Input; meta?: Record<string, unknown> }
-  | { type: "started"; jobId: string; key: string; input?: Input; attempt: number }
-  | { type: "succeeded"; jobId: string; key: string; input?: Input; data: Result; durationMs: number }
-  | { type: "failed"; jobId: string; key: string; input?: Input; error: Error; durationMs: number }
-  | { type: "rescheduled"; jobId: string; key: string; attempt: number; delayMs: number }
-  | { type: "finished"; jobId: string; key: string; status: "succeeded" | "failed"; durationMs: number };
-
-export type JobCtx<Input = void> = {
-  jobId: JobId;
+export type JobSubmit<Input> = {
+  /** Required idempotent submission key (the NATS message ID within the dedupe window). */
   key: string;
   input: Input;
-  failureCount: number;
-  readonly duration: number;
-  signal: AbortSignal;
-  heartbeat(cfg?: { leaseMs?: number }): Promise<void>;
-};
-
-export type JobAfterCtx<Input = void, Result = unknown> = JobCtx<Input> & {
-  data?: Result;
-  error?: Error;
-  reschedule(cfg?: { delayMs?: number }): void;
-  expBackoff(cfg?: BackoffOptions): number;
-  metric: JobMetrics;
-};
-
-export type SubmitConfig<Input = void> = {
-  key: string;
-  keyTtlMs?: number;
+  tenantId?: string;
   delayMs?: number;
-  at?: number;
-  leaseMs?: number;
-  meta?: Record<string, unknown>;
-} & (Input extends void ? { input?: Input } : { input: Input });
-
-export type JobConfig<Input = void, Result = unknown> = {
-  id: string;
-  prefix?: string;
-  defaults?: {
-    leaseMs?: number;
-    keyTtlMs?: number;
-  };
-  trace?: TraceHandler<JobTraceEvent<Input, Result>>;
-  process: (cfg: { ctx: JobCtx<Input> }) => Promise<Result> | Result;
-  after?: (cfg: { ctx: JobAfterCtx<Input, Result> }) => Promise<void> | void;
+  at?: Date;
+  orderingKey?: string;
+  meta?: MessageMeta;
 };
 
-export type JobHandle<Input = void> = {
-  id: string;
-  submit(cfg: SubmitConfig<Input>): Promise<JobId>;
-  metric(): JobMetrics;
-  stop(): void;
-};
-
-// ==========================
-// Internal
-// ==========================
-
-type WorkPayload = {
-  jobId: JobId;
+export type JobContext<Input> = {
+  jobId: string;
   key: string;
-  input?: unknown;
-  keyTtlMs: number;
-  leaseMs: number;
-  meta?: Record<string, unknown>;
+  input: Input;
+  attempt: number;
+  failureCount: number;
+  signal: AbortSignal;
+  heartbeat(): Promise<void>;
 };
 
-type PendingEnqueue = {
-  payload: Omit<WorkPayload, "jobId">;
-  availableAt: number;
-  idempotencyTtlMs: number;
+export type JobFailureDecision = { action: "retry"; delayMs?: number } | { action: "dead_letter"; reason: string };
+
+export type JobProcessOptions<Input> = ProcessOptions & {
+  onError?: (input: { context: JobContext<Input>; error: Error }) => JobFailureDecision | Promise<JobFailureDecision>;
 };
 
-const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
-const requireSafeInteger = (name: string, value: number, min: number, max = Number.MAX_SAFE_INTEGER): number => {
-  if (!Number.isSafeInteger(value) || value < min || value > max) {
-    throw new RangeError(`${name} must be a safe integer between ${min} and ${max}`);
-  }
-  return value;
+export type JobSubmitManyOptions = {
+  /** Bounded number of in-flight publish promises. Default 16. */
+  publishConcurrency?: number;
+  /** Bounded bytes of in-flight publishes — local backpressure. Default 8 MiB. */
+  maxPendingBytes?: number;
+  signal?: AbortSignal;
 };
 
-const requireFutureDuration = (name: string, value: number, min: number): number =>
-  requireSafeInteger(name, value, min, Number.MAX_SAFE_INTEGER - Date.now());
-
-const resolveDelayMs = (name: string, value = 0): number =>
-  requireSafeInteger(name, value, 0, MAX_JOB_DELAY_MS);
+export type Job<Input> = {
+  ready(): Promise<void>;
+  submit(job: JobSubmit<Input>): Promise<PublishReceipt & { jobId: string }>;
+  submitMany(
+    jobs: Iterable<JobSubmit<Input>> | AsyncIterable<JobSubmit<Input>>,
+    options?: JobSubmitManyOptions,
+  ): Promise<{ accepted: number; duplicates: number }>;
+  process(options: JobProcessOptions<Input>, handler: (context: JobContext<Input>) => Promise<void>): Promise<Worker>;
+  deadLetters: DeadLetterStore<{ key: string; input: Input }>;
+};
 
 // ==========================
-// Factory
+// Job factory
 // ==========================
 
-export const job = <Input = void, Result = unknown>(
-  config: JobConfig<Input, Result>,
-): JobHandle<Input> => {
-  const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const defaultLeaseMs = requireFutureDuration(
-    "defaults.leaseMs",
-    config.defaults?.leaseMs ?? DEFAULT_LEASE_MS,
-    1,
-  );
-  const defaultKeyTtlMs = requireSafeInteger(
-    "defaults.keyTtlMs",
-    config.defaults?.keyTtlMs ?? DEFAULT_KEY_TTL_MS,
-    MIN_KEY_TTL_MS,
-    MAX_KEY_TTL_MS,
+export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<Input> => {
+  const terminalRetentionMs = config.terminalRetentionMs ?? 7 * 24 * 60 * 60 * 1_000;
+  const core = createQueueCore<Input, { key: string; input: Input }>(
+    runtime,
+    { ...config, dlqMaxAgeMs: terminalRetentionMs },
+    "job",
+    (envelope) => ({ key: (envelope.ext?.key as string) ?? "", input: envelope.data as Input }),
   );
 
-  const keys = {
-    seq: `${prefix}:${config.id}:seq`,
-    idempotencyPrefix: `${prefix}:${config.id}:idempotency`,
-  };
-  const workQueueId = `${config.id}:work`;
-  const resolveIdempotencyKey = async (key: string): Promise<string> => {
-    const legacyKey = `${keys.idempotencyPrefix}:${key}`;
-    const encodedKey =
-      `sync:job:claim:v2:${encodeURIComponent(JSON.stringify([prefix, config.id, key]))}`;
-    if (await redis.get(legacyKey)) {
-      throw new Error(
-        "job claim migration required; drain old workers and remove or migrate the legacy claim",
-      );
-    }
-    return encodedKey;
-  };
-  const resolveEnqueueReceiptKey = (key: string, jobId: JobId): string =>
-    `sync:job:enqueue-receipt:v2:${encodeURIComponent(JSON.stringify([prefix, config.id, key, jobId]))}`;
-  const resolveWorkQueueBase = async (): Promise<string> => {
-    const queuePrefix = `${prefix}:queue`;
-    return `sync:queue:namespace:v2:${encodeURIComponent(JSON.stringify([
-      queuePrefix,
-      "default",
-      workQueueId,
-    ]))}`;
-  };
-
-  const workQueue = queue<WorkPayload>({
-    id: `${config.id}:work`,
-    prefix: `${prefix}:queue`,
-    delivery: {
-      defaultLeaseMs,
-      maxDeliveries: Number.MAX_SAFE_INTEGER, // reschedule is user-controlled via ctx.reschedule
-    },
-    limits: {
-      maxMessageAgeMs: MAX_JOB_MESSAGE_AGE_MS,
-      maxNackDelayMs: MAX_JOB_DELAY_MS,
-    },
-  });
-
-  const metrics: JobMetrics = {
-    dispatches: 0,
-    failures: 0,
-    reschedules: 0,
-  };
-
-  const evalKeyScript = async (script: string, key: string, args: string[]): Promise<unknown> =>
-    await redis.send("EVAL", [script, "1", await resolveIdempotencyKey(key), ...args]);
-
-  const releaseKey = async (key: string, jobId: JobId): Promise<void> => {
-    try {
-      await evalKeyScript(RELEASE_KEY_SCRIPT, key, [jobId]);
-    } catch {
-      // best effort — if release fails, TTL will reclaim eventually
-    }
-  };
-
-  const extendKey = async (key: string, jobId: JobId, keyTtlMs: number): Promise<boolean> => {
-    const result = await evalKeyScript(REFRESH_KEY_SCRIPT, key, [jobId, String(keyTtlMs)]);
-    return Number(result) > 0;
-  };
-
-  const terminalAck = async (key: string, jobId: JobId, deliveryId: string): Promise<boolean> => {
-    const base = await resolveWorkQueueBase();
-    const result = await redis.send("EVAL", [
-      TERMINAL_ACK_SCRIPT,
-      "7",
-      `${base}:deliveries`,
-      `${base}:leases`,
-      `${base}:messages`,
-      `${base}:active`,
-      `${base}:delivery-owners`,
-      `${base}:orphan-candidates`,
-      await resolveIdempotencyKey(key),
-      deliveryId,
-      jobId,
-    ]);
-    return Number(result) > 0;
-  };
-
-  const transitionEnqueued = async (
-    key: string,
-    jobId: JobId,
-    keyTtlMs: number,
-    actor: "submit" | "worker",
-  ): Promise<"new" | "existing" | "worker-reported" | "lost"> => {
-    const result = await redis.send("EVAL", [
-      MARK_ENQUEUED_SCRIPT,
-      "2",
-      await resolveIdempotencyKey(key),
-      resolveEnqueueReceiptKey(key, jobId),
-      jobId,
-      String(keyTtlMs),
-      String(Math.min(MAX_KEY_TTL_MS, keyTtlMs)),
-      actor,
-    ]);
-    if (Number(result) === 1) return "new";
-    if (Number(result) === 2) return "existing";
-    if (Number(result) === 3) return "worker-reported";
-    return "lost";
-  };
-  const markEnqueued = async (
-    key: string,
-    jobId: JobId,
-    keyTtlMs: number,
-  ): Promise<"new" | "existing" | "worker-reported" | "lost"> =>
-    await transitionEnqueued(key, jobId, keyTtlMs, "submit");
-  const activateClaim = async (
-    key: string,
-    jobId: JobId,
-    keyTtlMs: number,
-  ): Promise<"new" | "existing" | "lost"> => {
-    const state = await transitionEnqueued(key, jobId, keyTtlMs, "worker");
-    return state === "worker-reported" ? "existing" : state;
-  };
-
-  const claimKey = async (
-    key: string,
-    keyTtlMs: number,
-    pendingPayloadJson: string,
-  ): Promise<{ jobId: JobId; shouldEnqueue: boolean; pendingPayloadJson?: string }> => {
-    const result = await redis.send("EVAL", [
-      CLAIM_KEY_SCRIPT,
-      "2",
-      await resolveIdempotencyKey(key),
-      keys.seq,
-      String(keyTtlMs),
-      String(Date.now()),
-      String(ENQUEUE_GRACE_MS),
-      pendingPayloadJson,
-    ]);
-    const arr = result as [string, number, string?];
+  const toSend = (job: JobSubmit<Input>) => {
+    assertName(job.key, "job key");
     return {
-      jobId: String(arr[0]),
-      shouldEnqueue: Number(arr[1]) === 1,
-      ...(typeof arr[2] === "string" && arr[2] ? { pendingPayloadJson: arr[2] } : {}),
+      message: {
+        data: job.input,
+        tenantId: job.tenantId,
+        idempotencyKey: job.key,
+        delayMs: job.delayMs,
+        at: job.at,
+        orderingKey: job.orderingKey,
+        meta: job.meta,
+      },
+      ext: { key: job.key } satisfies Record<string, JsonValue>,
     };
   };
 
-  // The worker belongs to this handle, not to the id. Keying it by
-  // `${prefix}:${id}` made a second same-id handle a silent no-op: its process,
-  // after and trace callbacks were never invoked because all work ran through
-  // the first handle's captured closures, and either handle's stop() killed the
-  // other's worker. Concurrent consumers on the same id are already resolved by
-  // the queue's atomic claim and lease.
-  let workerAc: AbortController | null = null;
-  // The controller of the callback currently running, so stop() can cancel it.
-  let activeJobAc: AbortController | null = null;
-  let restartRequested = false;
-
-  const startWorker = (): void => {
-    if (workerAc) {
-      if (workerAc.signal.aborted) restartRequested = true;
-      return;
-    }
-    restartRequested = false;
-    const ac = new AbortController();
-    workerAc = ac;
-
-    void (async () => {
-      try {
-        while (!ac.signal.aborted) {
-          try {
-            const message = await retry({
-              run: () =>
-                workQueue.recv({
-                  wait: true,
-                  timeoutMs: DEFAULT_WORKER_RECV_TIMEOUT_MS,
-                  leaseMs: defaultLeaseMs,
-                  signal: ac.signal,
-                }),
-              after: ({ ctx }) => {
-                if (ctx.error && isRetryableTransportError(ctx.error)) {
-                  ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
-                }
-              },
-              signal: ac.signal,
-            });
-
-            if (!message) continue;
-
-            const payload = message.data;
-            const attempt = message.attempt;
-            const failureCount = attempt - 1;
-            const startedAt = Date.now();
-            const jobAc = new AbortController();
-            let leaseLost = false;
-            let claimLost = false;
-            let claimActivated = false;
-            let reportSubmitted = false;
-            activeJobAc = jobAc;
-
-            try {
-              const keepLease = async (leaseMs = payload.leaseMs): Promise<boolean> => {
-                requireFutureDuration("heartbeat.leaseMs", leaseMs, 1);
-                const held = await message.touch({ leaseMs });
-                if (!held) {
-                  leaseLost = true;
-                  jobAc.abort();
-                  return false;
-                }
-                // A job may run only while it still owns the idempotency claim.
-                // Transport uncertainty aborts this attempt; a false result
-                // means a newer submit owns the key and this delivery is stale.
-                let ownsClaim: boolean;
-                try {
-                  const claimTtlMs = Math.max(payload.keyTtlMs, leaseMs);
-                  if (claimActivated) {
-                    ownsClaim = await extendKey(payload.key, payload.jobId, claimTtlMs);
-                  } else {
-                    const activation = await activateClaim(payload.key, payload.jobId, claimTtlMs);
-                    ownsClaim = activation !== "lost";
-                    reportSubmitted = ownsClaim && attempt === 1;
-                  }
-                } catch (error) {
-                  leaseLost = true;
-                  jobAc.abort();
-                  throw error;
-                }
-                if (!ownsClaim) {
-                  claimLost = true;
-                  jobAc.abort();
-                  return false;
-                }
-                claimActivated = true;
-                return true;
-              };
-              const canceled = (): boolean => ac.signal.aborted || leaseLost || jobAc.signal.aborted;
-              const renewIfActive = async (leaseMs = payload.leaseMs): Promise<boolean> => {
-                if (canceled() || !(await keepLease(leaseMs))) return false;
-                return !canceled();
-              };
-
-              const ctx = {
-                jobId: payload.jobId,
-                key: payload.key,
-                input: payload.input as Input,
-                failureCount,
-                signal: jobAc.signal,
-                heartbeat: async (cfg?: { leaseMs?: number }): Promise<void> => {
-                  if (canceled()) return;
-                  await keepLease(cfg?.leaseMs);
-                },
-              } as JobCtx<Input>;
-              Object.defineProperty(ctx, "duration", {
-                get: () => Date.now() - startedAt,
-                enumerable: true,
-              });
-
-              // Queue recv uses the handle default. Apply this submission's
-              // lease before trace or user code can outlive the wrong lease.
-              if (!(await renewIfActive(payload.leaseMs))) continue;
-
-              const traceInput = payload.input === undefined ? {} : { input: payload.input as Input };
-
-              if (reportSubmitted) {
-                await emitTrace(config.trace, {
-                  type: "submitted",
-                  jobId: payload.jobId,
-                  key: payload.key,
-                  ...traceInput,
-                  ...(payload.meta ? { meta: payload.meta } : {}),
-                });
-                reportSubmitted = false;
-              }
-              await emitTrace(config.trace, {
-                type: "started",
-                jobId: payload.jobId,
-                key: payload.key,
-                ...traceInput,
-                attempt,
-              });
-              if (!(await renewIfActive())) continue;
-
-              let result: Result | undefined;
-              let error: Error | undefined;
-              try {
-                result = await Promise.resolve(config.process({ ctx }));
-              } catch (err) {
-                error = asError(err);
-              }
-              if (!(await renewIfActive())) continue;
-
-              if (error) {
-                await emitTrace(config.trace, {
-                  type: "failed",
-                  jobId: payload.jobId,
-                  key: payload.key,
-                  ...traceInput,
-                  error,
-                  durationMs: Date.now() - startedAt,
-                });
-              } else {
-                await emitTrace(config.trace, {
-                  type: "succeeded",
-                  jobId: payload.jobId,
-                  key: payload.key,
-                  ...traceInput,
-                  data: result as Result,
-                  durationMs: Date.now() - startedAt,
-                });
-              }
-              if (!(await renewIfActive())) continue;
-
-              let rescheduleRequested: { delayMs: number } | null = null;
-              const afterCtx: JobAfterCtx<Input, Result> = Object.create(ctx) as JobAfterCtx<Input, Result>;
-              if (error) afterCtx.error = error;
-              if (!error) afterCtx.data = result;
-              afterCtx.reschedule = (rcfg?: { delayMs?: number }): void => {
-                rescheduleRequested = {
-                  delayMs: resolveDelayMs("reschedule.delayMs", rcfg?.delayMs),
-                };
-              };
-              afterCtx.expBackoff = (bcfg?: BackoffOptions): number => expBackoff(failureCount + 1, bcfg);
-              afterCtx.metric = metrics;
-
-              if (config.after) {
-                try {
-                  await Promise.resolve(config.after({ ctx: afterCtx }));
-                } catch {
-                  // after errors are swallowed — transport decision is made by ctx.reschedule flag
-                }
-              }
-              if (!(await renewIfActive())) continue;
-
-              if (rescheduleRequested) {
-                const delayMs = (rescheduleRequested as { delayMs: number }).delayMs;
-                const retryKeyTtlMs = Math.min(MAX_KEY_TTL_MS, delayMs + payload.keyTtlMs);
-                const extended = await extendKey(
-                  payload.key,
-                  payload.jobId,
-                  Math.max(payload.leaseMs, retryKeyTtlMs),
-                );
-                if (!extended || canceled()) continue;
-                const nacked = await message.nack({
-                  delayMs,
-                  reason: "reschedule",
-                  error: error?.message,
-                });
-                if (!nacked) {
-                  // Lease expired; message will be redelivered. Key stays claimed.
-                  continue;
-                }
-                await extendKey(payload.key, payload.jobId, retryKeyTtlMs);
-                metrics.reschedules += 1;
-                await emitTrace(config.trace, {
-                  type: "rescheduled",
-                  jobId: payload.jobId,
-                  key: payload.key,
-                  attempt,
-                  delayMs,
-                });
-                continue;
-              }
-
-              // Terminal queue settlement and claim release are one transition.
-              const acked = await terminalAck(payload.key, payload.jobId, message.deliveryId);
-              if (!acked) {
-                // Lease expired; message will be redelivered. Key stays claimed.
-                continue;
-              }
-
-              if (error) {
-                metrics.failures += 1;
-              } else {
-                metrics.dispatches += 1;
-              }
-              await emitTrace(config.trace, {
-                type: "finished",
-                jobId: payload.jobId,
-                key: payload.key,
-                status: error ? "failed" : "succeeded",
-                durationMs: Date.now() - startedAt,
-              });
-            } finally {
-              if (claimLost) {
-                try {
-                  await message.ack();
-                } catch {
-                  // A lost queue connection leaves the stale delivery to expire.
-                }
-              }
-              // Ordinary completion keeps the signal live through after().
-              // Only clear the controller if this attempt still owns the slot.
-              if (activeJobAc === jobAc) activeJobAc = null;
-            }
-          } catch {
-            if (ac.signal.aborted) break;
-            await sleep(25);
-          }
-        }
-      } finally {
-        if (workerAc === ac) workerAc = null;
-        if (restartRequested) startWorker();
-      }
-    })();
+  const submit: Job<Input>["submit"] = async (job) => {
+    const { message, ext } = toSend(job);
+    const receipt = await core.send(message, ext);
+    return { ...receipt, jobId: receipt.messageId };
   };
 
-  const submit = async (cfg: SubmitConfig<Input>): Promise<JobId> => {
-    if (!cfg.key) throw new Error("submit: key is required");
-
-    const leaseMs = requireFutureDuration("submit.leaseMs", cfg.leaseMs ?? defaultLeaseMs, 1);
-    const keyTtlMs = requireSafeInteger(
-      "submit.keyTtlMs",
-      cfg.keyTtlMs ?? defaultKeyTtlMs,
-      MIN_KEY_TTL_MS,
-      MAX_KEY_TTL_MS,
-    );
-    const now = Date.now();
-    const delayMs =
-      cfg.at !== undefined
-        ? resolveDelayMs("submit.at", Math.max(0, requireSafeInteger("submit.at", cfg.at, 0) - now))
-        : resolveDelayMs("submit.delayMs", cfg.delayMs);
-    const initialKeyTtlMs = Math.min(MAX_KEY_TTL_MS, delayMs + keyTtlMs);
-
-    const pendingPayloadJson = JSON.stringify({
-      payload: {
-        key: cfg.key,
-        input: (cfg as { input?: Input }).input,
-        keyTtlMs,
-        leaseMs,
-        meta: cfg.meta,
-      },
-      availableAt: now + delayMs,
-      idempotencyTtlMs: initialKeyTtlMs,
-    });
-    const claim = await claimKey(cfg.key, initialKeyTtlMs, pendingPayloadJson);
-    if (!claim.shouldEnqueue) {
-      startWorker();
-      return claim.jobId;
+  const submitMany: Job<Input>["submitMany"] = async (jobs, options = {}) => {
+    const publishConcurrency = options.publishConcurrency ?? 16;
+    const maxPendingBytes = options.maxPendingBytes ?? 8 * 1024 * 1024;
+    if (!Number.isSafeInteger(publishConcurrency) || publishConcurrency < 1) {
+      throw new RangeError("publishConcurrency must be a positive integer");
+    }
+    if (!Number.isSafeInteger(maxPendingBytes) || maxPendingBytes < 1) {
+      throw new RangeError("maxPendingBytes must be a positive integer");
     }
 
-    const pending = JSON.parse(claim.pendingPayloadJson ?? pendingPayloadJson) as PendingEnqueue;
-    const payload: WorkPayload = {
-      ...pending.payload,
-      jobId: claim.jobId,
+    let accepted = 0;
+    let duplicates = 0;
+    let pendingBytes = 0;
+    let firstError: Error | null = null;
+    const inflight = new Set<Promise<void>>();
+
+    const waitForCapacity = async (nextBytes: number): Promise<void> => {
+      // Byte backpressure never deadlocks: a single oversized item may fly alone.
+      while (
+        inflight.size >= publishConcurrency ||
+        (inflight.size > 0 && pendingBytes + nextBytes > maxPendingBytes)
+      ) {
+        await Promise.race(inflight);
+        if (firstError !== null) return;
+      }
     };
 
     try {
-      await workQueue.send({
-        data: payload,
-        delayMs: Math.max(0, pending.availableAt - Date.now()),
-        idempotencyKey: claim.jobId,
-        idempotencyTtlMs: pending.idempotencyTtlMs,
-        meta: payload.meta,
-      });
-    } catch (error) {
-      if (isRetryableTransportError(error)) {
-        // Redis may have committed the idempotent queue write and lost only the
-        // response. Keep the pending claim and start a worker for that message.
-        startWorker();
-      } else {
-        // Serialization, validation and deterministic Redis errors did not
-        // ambiguously accept work, so a corrected submit may claim the key.
-        await releaseKey(cfg.key, claim.jobId);
+      for await (const job of jobs as AsyncIterable<JobSubmit<Input>>) {
+        if (options.signal?.aborted) throw new Error("submitMany aborted");
+        const { message, ext } = toSend(job);
+        const prepared = await core.prepareSend(message, ext);
+        await waitForCapacity(prepared.byteLength);
+        if (firstError !== null) break;
+        pendingBytes += prepared.byteLength;
+        const task = prepared
+          .publish()
+          .then((receipt) => {
+            if (receipt.duplicate) duplicates += 1;
+            else accepted += 1;
+          })
+          .catch((error) => {
+            firstError ??= asError(error);
+          })
+          .finally(() => {
+            pendingBytes -= prepared.byteLength;
+            inflight.delete(task);
+          });
+        inflight.add(task);
       }
-      throw error;
+    } catch (error) {
+      firstError ??= asError(error);
     }
-
-    // Only now is the claim genuinely backed by queued work. A crash before
-    // this point leaves the claim pending; a later submit retries the enqueue,
-    // while the queue's jobId key prevents a successful send from duplicating.
-    startWorker();
-    const enqueueState = await markEnqueued(cfg.key, claim.jobId, pending.idempotencyTtlMs);
-    if (enqueueState === "lost") {
-      throw new Error(`job submit lost idempotency claim for key ${cfg.key}`);
+    await Promise.all(inflight);
+    if (firstError !== null) {
+      // Not atomic by design: prior accepted items stay accepted.
+      throw new BatchSubmitError("submitMany failed", accepted, duplicates, firstError);
     }
-
-    return claim.jobId;
+    return { accepted, duplicates };
   };
 
-  const metric = (): JobMetrics => ({ ...metrics });
-
-  const stop = (): void => {
-    restartRequested = false;
-    workerAc?.abort();
-    // Cancel the in-flight callback too, so `ctx.signal.aborted` is a usable
-    // cancellation signal rather than something that is always false.
-    activeJobAc?.abort();
+  const process: Job<Input>["process"] = (options, handler) => {
+    const { onError, ...processOptions } = options;
+    const toContext = (message: {
+      messageId: string;
+      data: Input;
+      attempt: number;
+      signal: AbortSignal;
+      heartbeat(): Promise<void>;
+    }, key: string): JobContext<Input> => ({
+      jobId: message.messageId,
+      key,
+      input: message.data,
+      attempt: message.attempt,
+      failureCount: message.attempt - 1,
+      signal: message.signal,
+      heartbeat: message.heartbeat,
+    });
+    return core.process(
+      processOptions,
+      async (message, envelope) => {
+        await handler(toContext(message, (envelope.ext?.key as string) ?? ""));
+      },
+      onError === undefined
+        ? undefined
+        : async ({ message, envelope, error }) => {
+            const decision = await onError({
+              context: toContext(message, (envelope.ext?.key as string) ?? ""),
+              error,
+            });
+            return decision.action === "retry"
+              ? { action: "retry", ...(decision.delayMs !== undefined ? { delayMs: decision.delayMs } : {}) }
+              : { action: "dead_letter", reason: decision.reason };
+          },
+    );
   };
 
   return {
-    id: config.id,
+    ready: () => core.declarationReady(),
     submit,
-    metric,
-    stop,
+    submitMany,
+    process,
+    deadLetters: core.deadLetters,
   };
 };

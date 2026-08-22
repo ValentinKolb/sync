@@ -1,4 +1,4 @@
-import { sleep } from "bun";
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 // ==========================
 // Types
@@ -50,8 +50,6 @@ const parseCode = (error: unknown): string => {
   return typeof code === "string" ? code.toUpperCase() : "";
 };
 
-const RETRYABLE_REDIS_CODES = new Set(["LOADING", "TRYAGAIN", "CLUSTERDOWN", "MASTERDOWN"]);
-
 export const isRetryableTransportError = (error: unknown): boolean => {
   const code = parseCode(error);
   if (
@@ -61,8 +59,7 @@ export const isRetryableTransportError = (error: unknown): boolean => {
     code === "ENOTFOUND" ||
     code === "EPIPE" ||
     code === "EHOSTUNREACH" ||
-    code === "ECONNABORTED" ||
-    RETRYABLE_REDIS_CODES.has(code)
+    code === "ECONNABORTED"
   ) {
     return true;
   }
@@ -70,9 +67,7 @@ export const isRetryableTransportError = (error: unknown): boolean => {
   // Anchored on transport vocabulary rather than bare words: "connection" and
   // "loading" match plenty of application error messages, and misclassifying a
   // user error as retryable replays it silently.
-  const rawMessage = asError(error).message;
-  const message = rawMessage.toLowerCase();
-  const responseCode = rawMessage.trimStart().split(/\s+/, 1)[0] ?? "";
+  const message = asError(error).message.toLowerCase();
   return (
     message.includes("econnreset") ||
     message.includes("econnrefused") ||
@@ -85,8 +80,7 @@ export const isRetryableTransportError = (error: unknown): boolean => {
     message.includes("socket closed") ||
     message.includes("socket hang up") ||
     message.includes("broken pipe") ||
-    message.includes("network error") ||
-    RETRYABLE_REDIS_CODES.has(responseCode)
+    message.includes("network error")
   );
 };
 

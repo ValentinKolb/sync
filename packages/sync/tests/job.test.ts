@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { NatsConnection } from "@nats-io/nats-core";
-import { createSync } from "../../src/v6/sync.ts";
-import type { Sync } from "../../src/v6/sync.ts";
-import { BatchSubmitError } from "../../src/v6/errors.ts";
+import { createSync } from "../src/sync.ts";
+import type { Sync } from "../src/sync.ts";
+import { BatchSubmitError } from "../src/errors.ts";
 import { connectToCluster } from "./cluster.ts";
 import { cleanupNamespaces, testNamespace, waitFor } from "./helpers.ts";
 

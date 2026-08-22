@@ -1,20 +1,18 @@
 {
   "name": "@k2b/sync",
-  "version": "5.7.0",
-  "description": "Distributed sync primitives for TypeScript and Bun \u2014 ratelimit, mutex, queue, topic, job, pump, scheduler, ephemeral, retry",
+  "version": "6.0.0",
+  "description": "NATS-native distributed sync primitives for TypeScript and Bun — queue, topic, job, pump, scheduler, mutex, ephemeral, object store, retry",
   "module": "index.ts",
   "type": "module",
   "exports": {
     ".": "./index.ts",
-    "./browser": "./browser.ts"
+    "./retry": "./retry.ts"
   },
   "scripts": {
-    "test": "REDIS_URL=redis://127.0.0.1:6399 bun test --preload ./tests/preload.ts",
-    "test:fault": "REDIS_URL=redis://127.0.0.1:6399 bun test --preload ./tests/preload.ts tests/fault-*.test.ts",
-    "test:all": "REDIS_URL=redis://127.0.0.1:6399 bun test --preload ./tests/preload.ts tests/*.test.ts",
-    "typecheck": "bunx tsc --noEmit",
-    "test:v6": "bun test --preload ./tests/v6/preload.ts tests/v6/*.test.ts",
-    "test:v6:serial": "bun test --preload ./tests/v6/preload.ts tests/v6/serial/fault.test.ts && bun test --preload ./tests/v6/preload.ts tests/v6/serial/probe.test.ts"
+    "test": "bun test --preload ./tests/preload.ts tests/*.test.ts",
+    "test:serial": "bun test --preload ./tests/preload.ts tests/serial/fault.test.ts && bun test --preload ./tests/preload.ts tests/serial/probe.test.ts",
+    "test:all": "bun run test && bun run test:serial",
+    "typecheck": "bunx tsc --noEmit"
   },
   "peerDependencies": {
     "typescript": "^5"

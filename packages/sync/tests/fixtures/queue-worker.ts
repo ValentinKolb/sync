@@ -7,7 +7,7 @@
  *      SYNC_CONCURRENCY, SYNC_HANDLER_MS
  */
 import { connect } from "@nats-io/transport-node";
-import { createSync } from "../../../src/v6/sync.ts";
+import { createSync } from "../../src/sync.ts";
 
 const nc = await connect({
   servers: ["nats://127.0.0.1:14222", "nats://127.0.0.1:14223", "nats://127.0.0.1:14224"],

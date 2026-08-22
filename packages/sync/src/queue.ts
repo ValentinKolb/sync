@@ -1,1212 +1,653 @@
-import { redis, RedisClient, sleep } from "bun";
-import { randomUUID } from "crypto";
-import { isRetryableTransportError, retry } from "./retry";
-
-const DAY_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_PREFIX = "sync:queue";
-const DEFAULT_TENANT = "default";
-const DEFAULT_LEASE_MS = 30_000;
-const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
-const DEFAULT_MAX_DELIVERIES = 10;
-const DEFAULT_MAX_NACK_DELAY_MS = 7 * DAY_MS;
-const DEFAULT_MAX_MESSAGE_AGE_MS = 7 * DAY_MS;
-const DEFAULT_DLQ_RETENTION_MS = 7 * DAY_MS;
-const DEFAULT_IDEMPOTENCY_TTL_MS = 7 * DAY_MS;
-const DEFAULT_PAYLOAD_BYTES = 128 * 1024;
-const MAINTENANCE_BATCH_SIZE = 200;
-const DEFAULT_MAINTENANCE_INTERVAL_MS = 1_000;
-// Old workers moved ready -> active before writing the delivery record. Give
-// that non-atomic claim window one default lease to finish before recovery.
-const LEGACY_ORPHAN_GRACE_MS = DEFAULT_LEASE_MS;
-// Longest single block on the notify list. Bounding it keeps a parked consumer
-// running maintenance and re-checking the ready list roughly once a second, so
-// delayed sends and expired leases can no longer wait out a long recv timeout.
-const NOTIFY_BLOCK_MS = 1_000;
-// How many dead ids one claim may drain before giving up for this round.
-const CLAIM_MAX_SKIPS = 32;
-const NAMESPACE_CACHE_MAX = 1_024;
-
-// Stored message records are envelopes whose user-controlled parts (`dataJson`,
-// `metaJson`) are opaque pre-serialized JSON strings. Lua may copy them but never
-// decodes and re-encodes them, because Redis' bundled cjson is lossy: an empty
-// array round-trips to an empty object and integers past 14 significant digits
-// lose precision. Records written by <= 5.8.0 carry the decoded values under
-// `data`/`meta` instead; `readMessage` upgrades those in place on first touch,
-// which preserves exactly the fidelity 5.8.0 itself had for them.
-const LUA_MESSAGE_HELPERS = `
-  local function readMessage(raw)
-    local ok, message = pcall(cjson.decode, raw)
-    if not ok or type(message) ~= "table" then return nil end
-    if message.dataJson ~= nil or message.v == 2 then return message end
-    return {
-      v = 2,
-      attempt = tonumber(message.attempt) or 0,
-      enqueuedAt = tonumber(message.enqueuedAt) or 0,
-      orderingKey = message.orderingKey,
-      dataJson = message.data ~= nil and cjson.encode(message.data) or nil,
-      metaJson = message.meta ~= nil and cjson.encode(message.meta) or nil,
-    }
-  end
-
-  -- Dead letters live in one hash with a movedAt-scored index. Retention is
-  -- enforced per entry against that index; the whole-key TTL is only a
-  -- last-resort sweep for a queue that goes permanently idle. Previously the
-  -- single whole-key PEXPIRE was refreshed by every insert, so a steady trickle
-  -- of failures kept the hash alive forever while a pause dropped fresh entries.
-  local function writeDeadLetter(dlqKey, indexKey, messageId, message, movedAt, reason, lastError, ttlMs)
-    redis.call("HSET", dlqKey, messageId, cjson.encode({
-      v = 2,
-      messageId = messageId,
-      dataJson = message.dataJson,
-      metaJson = message.metaJson,
-      orderingKey = message.orderingKey,
-      attempts = tonumber(message.attempt) or 0,
-      movedAt = movedAt,
-      reason = reason,
-      lastError = lastError,
-    }))
-    redis.call("ZADD", indexKey, tostring(movedAt), messageId)
-
-    if ttlMs > 0 then
-      local stale = redis.call("ZRANGEBYSCORE", indexKey, "-inf", tostring(movedAt - ttlMs))
-      for _, staleId in ipairs(stale) do
-        redis.call("HDEL", dlqKey, staleId)
-        redis.call("ZREM", indexKey, staleId)
-      end
-      redis.call("PEXPIRE", dlqKey, tostring(ttlMs))
-      redis.call("PEXPIRE", indexKey, tostring(ttlMs))
-    end
-  end
-
-`;
-
-// Wake one parked consumer. The notify list is a wake-up signal only: it is
-// trimmed, it may lag the ready list, and every consumer re-checks by running
-// CLAIM_SCRIPT, so a lost or surplus token costs latency, never correctness.
-const LUA_NOTIFY_HELPER = `
-  local function notifyReady(notifyKey)
-    redis.call("LPUSH", notifyKey, "1")
-    redis.call("LTRIM", notifyKey, 0, 255)
-  end
-`;
-
-const SEND_SCRIPT = `
-  ${LUA_NOTIFY_HELPER}
-
-  local now = tonumber(ARGV[1])
-  local delayMs = tonumber(ARGV[2])
-  local payload = ARGV[3]
-  -- Declared as a key, not an argument: a script must declare every key it
-  -- touches for key-routing topologies to route it correctly.
-  local idemKey = KEYS[6]
-  local idemTtlMs = tonumber(ARGV[4])
-
-  if idemKey ~= "" then
-    local existing = redis.call("GET", idemKey)
-    if existing then
-      return { existing, "duplicate" }
-    end
-  end
-
-  local messageId = tostring(redis.call("INCR", KEYS[1]))
-  redis.call("HSET", KEYS[2], messageId, payload)
-
-  if delayMs > 0 then
-    redis.call("ZADD", KEYS[4], tostring(now + delayMs), messageId)
-  else
-    redis.call("LPUSH", KEYS[3], messageId)
-    notifyReady(KEYS[5])
-  end
-
-  if idemKey ~= "" then
-    redis.call("SET", idemKey, messageId, "PX", tostring(idemTtlMs))
-  end
-
-  return { messageId, "new" }
-`;
-
-const MAINTENANCE_SCRIPT = `
-  ${LUA_MESSAGE_HELPERS}
-  ${LUA_NOTIFY_HELPER}
-
-  local now = tonumber(ARGV[1])
-  local maxDeliveries = tonumber(ARGV[2])
-  local maxMessageAgeMs = tonumber(ARGV[3])
-  local batch = tonumber(ARGV[4])
-  local dlqTtlMs = tonumber(ARGV[5])
-  local orphanGraceMs = tonumber(ARGV[6])
-
-  local function toDlq(messageId, message, reason)
-    writeDeadLetter(KEYS[7], KEYS[9], messageId, message, now, reason, nil, dlqTtlMs)
-    redis.call("HDEL", KEYS[5], messageId)
-    redis.call("HDEL", KEYS[10], messageId)
-    redis.call("HDEL", KEYS[11], messageId)
-  end
-
-  local delayedIds = redis.call("ZRANGEBYSCORE", KEYS[2], "0", tostring(now), "LIMIT", "0", tostring(batch))
-  for _, messageId in ipairs(delayedIds) do
-    local removed = redis.call("ZREM", KEYS[2], messageId)
-    if removed > 0 then
-      local messageRaw = redis.call("HGET", KEYS[5], messageId)
-      if messageRaw then
-        local message = readMessage(messageRaw)
-        if message then
-          local enqueuedAt = tonumber(message.enqueuedAt) or now
-          if (now - enqueuedAt) > maxMessageAgeMs then
-            toDlq(messageId, message, "expired")
-          else
-            redis.call("LPUSH", KEYS[1], messageId)
-            notifyReady(KEYS[8])
-          end
-        else
-          redis.call("HDEL", KEYS[5], messageId)
-        end
-      end
-    end
-  end
-
-  local expiredDeliveryIds = redis.call("ZRANGEBYSCORE", KEYS[3], "0", tostring(now), "LIMIT", "0", tostring(batch))
-  for _, deliveryId in ipairs(expiredDeliveryIds) do
-    local deliveryRaw = redis.call("HGET", KEYS[4], deliveryId)
-    redis.call("ZREM", KEYS[3], deliveryId)
-
-    if deliveryRaw then
-      redis.call("HDEL", KEYS[4], deliveryId)
-      local ok, delivery = pcall(cjson.decode, deliveryRaw)
-      if ok then
-        local messageId = delivery.messageId
-        if redis.call("HGET", KEYS[10], messageId) == deliveryId then
-          redis.call("HDEL", KEYS[10], messageId)
-        end
-        redis.call("HDEL", KEYS[11], messageId)
-        redis.call("LREM", KEYS[6], 1, messageId)
-
-        local messageRaw = redis.call("HGET", KEYS[5], messageId)
-        if messageRaw then
-          local message = readMessage(messageRaw)
-          if message then
-            local enqueuedAt = tonumber(message.enqueuedAt) or now
-            if (now - enqueuedAt) > maxMessageAgeMs then
-              toDlq(messageId, message, "expired")
-            elseif (tonumber(message.attempt) or 0) >= maxDeliveries then
-              toDlq(messageId, message, "max_deliveries_exceeded")
-            else
-              redis.call("LPUSH", KEYS[1], messageId)
-              notifyReady(KEYS[8])
-            end
-          else
-            redis.call("HDEL", KEYS[5], messageId)
-          end
-        end
-      end
-    end
-  end
-
-  -- New claims maintain message -> delivery directly. During rolling upgrades,
-  -- old workers do not, so incrementally backfill their live deliveries first.
-  -- A candidate is only reaped after two complete delivery scans started after
-  -- observation and a time grace, which gives a genuine legacy claim time to
-  -- materialize and be backfilled before recovery.
-  local deliveryCursor = redis.call("HGET", KEYS[12], "deliveryCursor") or "0"
-  local generation = tonumber(redis.call("HGET", KEYS[12], "deliveryGeneration")) or 0
-  local deliveryScan = redis.call("HSCAN", KEYS[4], deliveryCursor, "COUNT", tostring(batch))
-  local nextDeliveryCursor = deliveryScan[1]
-  local deliveryEntries = deliveryScan[2]
-  for i = 1, #deliveryEntries, 2 do
-    local deliveryId = deliveryEntries[i]
-    local ok, delivery = pcall(cjson.decode, deliveryEntries[i + 1])
-    if ok and type(delivery) == "table" and delivery.messageId then
-      redis.call("HSET", KEYS[10], delivery.messageId, deliveryId)
-      redis.call("HDEL", KEYS[11], delivery.messageId)
-    end
-  end
-  if nextDeliveryCursor == "0" then generation = generation + 1 end
-  redis.call("HSET", KEYS[12], "deliveryCursor", nextDeliveryCursor, "deliveryGeneration", tostring(generation))
-
-  -- Old workers can settle a delivery without cleaning the new reverse index.
-  -- Sweep stale index entries incrementally as long as mixed versions coexist.
-  local ownerCursor = redis.call("HGET", KEYS[12], "ownerCursor") or "0"
-  local ownerScan = redis.call("HSCAN", KEYS[10], ownerCursor, "COUNT", tostring(batch))
-  redis.call("HSET", KEYS[12], "ownerCursor", ownerScan[1])
-  local ownerEntries = ownerScan[2]
-  for i = 1, #ownerEntries, 2 do
-    if redis.call("HEXISTS", KEYS[4], ownerEntries[i + 1]) == 0 then
-      redis.call("HDEL", KEYS[10], ownerEntries[i])
-    end
-  end
-
-  local activeLength = tonumber(redis.call("LLEN", KEYS[6])) or 0
-  local inspectCount = math.min(activeLength, batch)
-  for _ = 1, inspectCount do
-    -- Claims enter at the head. Rotating from the tail guarantees that old
-    -- entries are inspected even while new claims arrive continuously.
-    local messageId = redis.call("RPOPLPUSH", KEYS[6], KEYS[6])
-    if not messageId then break end
-
-    local deliveryId = redis.call("HGET", KEYS[10], messageId)
-    if deliveryId and redis.call("HEXISTS", KEYS[4], deliveryId) == 1 then
-      redis.call("HDEL", KEYS[11], messageId)
-    else
-      redis.call("HDEL", KEYS[10], messageId)
-      local candidate = redis.call("HGET", KEYS[11], messageId)
-      local observedGeneration = candidate and tonumber(string.match(candidate, "^([^:]+)"))
-      local observedAttempt = candidate and tonumber(string.match(candidate, "^[^:]+:([^:]+)"))
-      local observedAt = candidate and tonumber(string.match(candidate, "^[^:]+:[^:]+:(.+)$"))
-      local messageRaw = redis.call("HGET", KEYS[5], messageId)
-      local message = messageRaw and readMessage(messageRaw)
-      if not message then
-        redis.call("LPOP", KEYS[6])
-        redis.call("HDEL", KEYS[11], messageId)
-      elseif not observedGeneration
-        or not observedAt
-        or observedAttempt ~= (tonumber(message.attempt) or 0)
-      then
-        -- A legacy nack + claim increments the attempt without touching this
-        -- hash. Two-field candidates came from an older release and have no
-        -- trustworthy observation time. Observe either case afresh.
-        redis.call(
-          "HSET",
-          KEYS[11],
-          messageId,
-          tostring(generation) .. ":" .. tostring(tonumber(message.attempt) or 0) .. ":" .. tostring(now)
-        )
-      elseif observedGeneration + 2 <= generation and now - observedAt >= orphanGraceMs then
-        -- RPOPLPUSH put this entry at the head, so removal is O(1).
-        redis.call("LPOP", KEYS[6])
-        redis.call("HDEL", KEYS[11], messageId)
-        if redis.call("HEXISTS", KEYS[5], messageId) == 1 then
-          redis.call("LPUSH", KEYS[1], messageId)
-          notifyReady(KEYS[8])
-        end
-      end
-    end
-  end
-
-  -- A legacy worker can ack after a candidate was recorded. Clean terminal
-  -- candidates incrementally; nacked candidates are cleared by the next claim.
-  local candidateCursor = redis.call("HGET", KEYS[12], "candidateCursor") or "0"
-  local candidateScan = redis.call("HSCAN", KEYS[11], candidateCursor, "COUNT", tostring(batch))
-  redis.call("HSET", KEYS[12], "candidateCursor", candidateScan[1])
-  local candidateEntries = candidateScan[2]
-  for i = 1, #candidateEntries, 2 do
-    local messageId = candidateEntries[i]
-    if redis.call("HEXISTS", KEYS[5], messageId) == 0 then
-      redis.call("HDEL", KEYS[11], messageId)
-    end
-  end
-
-  return 1
-`;
-
-// Moving ready -> active and creating the delivery record must be one atomic
-// step. When they were two round-trips, a consumer that died in between left the
-// id parked in the active list with no delivery and no lease, where nothing ever
-// looked for it again: the message was lost permanently. Blocking consumers now
-// wait on a notify list purely as a wake-up signal and always claim through this
-// script.
-const CLAIM_SCRIPT = `
-  ${LUA_MESSAGE_HELPERS}
-
-  local deliveryId = ARGV[1]
-  local leaseUntil = tonumber(ARGV[2])
-  local maxSkips = tonumber(ARGV[3])
-  local consumerId = ARGV[4]
-  local now = tonumber(ARGV[5])
-  local maxMessageAgeMs = tonumber(ARGV[6])
-  local dlqTtlMs = tonumber(ARGV[7])
-
-  local messageId = nil
-  local message = nil
-
-  for _ = 1, maxSkips do
-    local candidate = redis.call("RPOPLPUSH", KEYS[5], KEYS[4])
-    if not candidate then return nil end
-
-    local messageRaw = redis.call("HGET", KEYS[1], candidate)
-    if messageRaw then
-      local parsed = readMessage(messageRaw)
-      if parsed then
-        local enqueuedAt = tonumber(parsed.enqueuedAt) or now
-        if (now - enqueuedAt) > maxMessageAgeMs then
-          writeDeadLetter(KEYS[8], KEYS[9], candidate, parsed, now, "expired", nil, dlqTtlMs)
-          redis.call("HDEL", KEYS[1], candidate)
-          redis.call("LREM", KEYS[4], 1, candidate)
-          redis.call("HDEL", KEYS[6], candidate)
-          redis.call("HDEL", KEYS[7], candidate)
-        else
-          messageId = candidate
-          message = parsed
-          break
-        end
-      else
-        redis.call("HDEL", KEYS[1], candidate)
-      end
-    end
-    -- Dead id: drop it from active and keep draining.
-    redis.call("LREM", KEYS[4], 1, candidate)
-  end
-
-  if not messageId then
-    if redis.call("LLEN", KEYS[5]) > 0 then return "retry" end
-    return nil
-  end
-
-  message.attempt = (tonumber(message.attempt) or 0) + 1
-  redis.call("HSET", KEYS[1], messageId, cjson.encode(message))
-
-  local delivery = {
-    messageId = messageId,
-    leaseUntil = leaseUntil,
-    attempt = message.attempt,
-    consumerId = consumerId ~= "" and consumerId or nil
-  }
-
-  redis.call("HSET", KEYS[2], deliveryId, cjson.encode(delivery))
-  redis.call("ZADD", KEYS[3], tostring(leaseUntil), deliveryId)
-  redis.call("HSET", KEYS[6], messageId, deliveryId)
-  redis.call("HDEL", KEYS[7], messageId)
-
-  return cjson.encode({
-    messageId = messageId,
-    deliveryId = deliveryId,
-    leaseUntil = leaseUntil,
-    attempt = message.attempt,
-    orderingKey = message.orderingKey,
-    enqueuedAt = message.enqueuedAt,
-    metaJson = message.metaJson,
-    dataJson = message.dataJson
-  })
-`;
-
-const ACK_SCRIPT = `
-  local deliveryId = ARGV[1]
-
-  local deliveryRaw = redis.call("HGET", KEYS[1], deliveryId)
-  if not deliveryRaw then
-    return 0
-  end
-
-  local ok, delivery = pcall(cjson.decode, deliveryRaw)
-  if not ok then
-    redis.call("HDEL", KEYS[1], deliveryId)
-    redis.call("ZREM", KEYS[2], deliveryId)
-    return 0
-  end
-
-  redis.call("HDEL", KEYS[1], deliveryId)
-  redis.call("ZREM", KEYS[2], deliveryId)
-  redis.call("LREM", KEYS[4], 1, delivery.messageId)
-  redis.call("HDEL", KEYS[3], delivery.messageId)
-  if redis.call("HGET", KEYS[5], delivery.messageId) == deliveryId then
-    redis.call("HDEL", KEYS[5], delivery.messageId)
-  end
-  redis.call("HDEL", KEYS[6], delivery.messageId)
-
-  return 1
-`;
-
-const NACK_SCRIPT = `
-  ${LUA_MESSAGE_HELPERS}
-  ${LUA_NOTIFY_HELPER}
-
-  local deliveryId = ARGV[1]
-  local now = tonumber(ARGV[2])
-  local delayMs = tonumber(ARGV[3])
-  local maxDeliveries = tonumber(ARGV[4])
-  local reason = ARGV[5]
-  local error = ARGV[6]
-  local dlqTtlMs = tonumber(ARGV[7])
-
-  local deliveryRaw = redis.call("HGET", KEYS[1], deliveryId)
-  if not deliveryRaw then
-    return 0
-  end
-
-  local dOk, delivery = pcall(cjson.decode, deliveryRaw)
-  if not dOk then
-    redis.call("HDEL", KEYS[1], deliveryId)
-    redis.call("ZREM", KEYS[2], deliveryId)
-    return 0
-  end
-
-  local messageId = delivery.messageId
-
-  redis.call("HDEL", KEYS[1], deliveryId)
-  redis.call("ZREM", KEYS[2], deliveryId)
-  redis.call("LREM", KEYS[4], 1, messageId)
-  if redis.call("HGET", KEYS[10], messageId) == deliveryId then
-    redis.call("HDEL", KEYS[10], messageId)
-  end
-  redis.call("HDEL", KEYS[11], messageId)
-
-  local messageRaw = redis.call("HGET", KEYS[3], messageId)
-  if not messageRaw then
-    return 0
-  end
-
-  local message = readMessage(messageRaw)
-  if not message then
-    redis.call("HDEL", KEYS[3], messageId)
-    return 0
-  end
-
-  if (tonumber(message.attempt) or 0) >= maxDeliveries then
-    writeDeadLetter(
-      KEYS[7],
-      KEYS[9],
-      messageId,
-      message,
-      now,
-      reason ~= "" and reason or "max_deliveries_exceeded",
-      error ~= "" and error or nil,
-      dlqTtlMs
-    )
-    redis.call("HDEL", KEYS[3], messageId)
-    return 2
-  end
-
-  if delayMs > 0 then
-    redis.call("ZADD", KEYS[6], tostring(now + delayMs), messageId)
-  else
-    redis.call("LPUSH", KEYS[5], messageId)
-    notifyReady(KEYS[8])
-  end
-
-  return 1
-`;
-
-const TOUCH_SCRIPT = `
-  local deliveryId = ARGV[1]
-  local now = tonumber(ARGV[2])
-  local leaseUntil = tonumber(ARGV[3])
-
-  local deliveryRaw = redis.call("HGET", KEYS[1], deliveryId)
-  if not deliveryRaw then
-    return 0
-  end
-
-  local ok, delivery = pcall(cjson.decode, deliveryRaw)
-  if not ok then
-    redis.call("HDEL", KEYS[1], deliveryId)
-    redis.call("ZREM", KEYS[2], deliveryId)
-    return 0
-  end
-
-  if (tonumber(delivery.leaseUntil) or 0) <= now then
-    return 0
-  end
-
-  delivery.leaseUntil = leaseUntil
-  redis.call("HSET", KEYS[1], deliveryId, cjson.encode(delivery))
-  redis.call("ZADD", KEYS[2], tostring(leaseUntil), deliveryId)
-
-  return 1
-`;
-
-const DLQ_READ_SCRIPT = `
-  local cutoff = tonumber(ARGV[1])
-  local limit = tonumber(ARGV[2])
-
-  local function purgeExpired()
-    local staleIds = redis.call("ZRANGEBYSCORE", KEYS[2], "-inf", tostring(cutoff))
-    for _, messageId in ipairs(staleIds) do
-      redis.call("HDEL", KEYS[1], messageId)
-      redis.call("ZREM", KEYS[2], messageId)
-    end
-  end
-  purgeExpired()
-
-  -- Entries written by <= 5.8.0 have no index member. Check every hash entry:
-  -- count equality cannot prove membership equality after an interrupted legacy
-  -- remove left a stale index id in place of a valid unindexed hash entry.
-  local entries = redis.call("HGETALL", KEYS[1])
-  for i = 1, #entries, 2 do
-    local messageId = entries[i]
-    if not redis.call("ZSCORE", KEYS[2], messageId) then
-      local movedAt = 0
-      local ok, record = pcall(cjson.decode, entries[i + 1])
-      if ok and type(record) == "table" then
-        movedAt = tonumber(record.movedAt) or 0
-      end
-      redis.call("ZADD", KEYS[2], tostring(movedAt), messageId)
-    end
-  end
-  purgeExpired()
-
-  local ids = redis.call("ZRANGE", KEYS[2], "0", "-1")
-  local result = {}
-  for _, messageId in ipairs(ids) do
-    local raw = redis.call("HGET", KEYS[1], messageId)
-    if raw then
-      local ok, record = pcall(cjson.decode, raw)
-      if ok and type(record) == "table" and record.messageId then
-        table.insert(result, raw)
-        if #result >= limit then break end
-      else
-        redis.call("HDEL", KEYS[1], messageId)
-        redis.call("ZREM", KEYS[2], messageId)
-      end
-    else
-      redis.call("ZREM", KEYS[2], messageId)
-    end
-  end
-  return result
-`;
-
-const DLQ_REMOVE_SCRIPT = `
-  local removed = redis.call("HDEL", KEYS[1], ARGV[1])
-  redis.call("ZREM", KEYS[2], ARGV[1])
-  return removed
-`;
-
-const textEncoder = new TextEncoder();
-
-const asError = (error: unknown): Error => (error instanceof Error ? error : new Error(String(error)));
-/** Internal switch for versioned queues that intentionally leave legacy work for old workers to drain. */
-export const INTERNAL_QUEUE_IGNORE_LEGACY_NAMESPACE = Symbol("sync.queue.ignoreLegacyNamespace");
-const requireSafeInteger = (name: string, value: number, min: number, max = Number.MAX_SAFE_INTEGER): number => {
-  if (!Number.isSafeInteger(value) || value < min || value > max) {
-    throw new RangeError(`${name} must be a safe integer between ${min} and ${max}`);
-  }
-  return value;
-};
-
-const requireFutureDuration = (name: string, value: number, min: number): number =>
-  requireSafeInteger(name, value, min, Number.MAX_SAFE_INTEGER - Date.now());
-
-const safeClose = (client: RedisClient): void => {
-  if (!client.connected) return;
-  try {
-    client.close();
-  } catch {
-    // ignore close races
-  }
-};
-
-const asObject = <T>(value: unknown): T | null => {
-  if (!value || typeof value !== "object") return null;
-  return value as T;
-};
-
-const evalScript = async (script: string, keys: string[], args: Array<string | number>): Promise<unknown> => {
-  return await redis.send("EVAL", [script, keys.length.toString(), ...keys, ...args.map((v) => String(v))]);
-};
-
-type QueueKeys = {
-  seq: string;
-  ready: string;
-  notify: string;
-  delayed: string;
-  leases: string;
-  deliveries: string;
-  messages: string;
-  active: string;
-  deliveryOwners: string;
-  orphanCandidates: string;
-  maintenance: string;
-  dlq: string;
-  dlqIndex: string;
-  idempotencyPrefix: string;
-};
-
-export type QueueConfig<T = unknown> = {
+import { createHash } from "node:crypto";
+import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType } from "@nats-io/jetstream";
+import type { Consumer, JsMsg } from "@nats-io/jetstream";
+import { decodeEnvelope, encodeEnvelope } from "./codec.ts";
+import type { Envelope, JsonValue } from "./codec.ts";
+import { confirmedAck, runPullLoop } from "./consume.ts";
+import { InvalidNameError, asError } from "./errors.ts";
+import { assertName, consumerName, dlqStreamName, resourceIdentity, streamName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
+import type { ResourceIdentity, SyncResourceKind } from "./naming.ts";
+import { ensureConsumer, ensureStream } from "./resources.ts";
+import type { ProvisionContext } from "./resources.ts";
+import type { SyncRuntime } from "./runtime.ts";
+import {
+  DEFAULT_DEDUPE_WINDOW_MS,
+  DEFAULT_MESSAGE_PAYLOAD_BYTES,
+  DEFAULT_TENANT,
+  assertRetention,
+  backoffDelayMs,
+  nanos,
+  resolveDelivery,
+} from "./types.ts";
+import type { DeliveryConfig, MessageMeta, OrderingConfig, PublishReceipt, RetentionConfig } from "./types.ts";
+import { createWorkerRuntime } from "./worker.ts";
+import type { ProcessOptions, Worker } from "./worker.ts";
+
+// ==========================
+// Types
+// ==========================
+
+export type QueueConfig = {
   id: string;
-  tenantId?: string;
-  prefix?: string;
-  ordering?: {
-    mode?: "best_effort" | "ordering_key_partitioned";
-    partitions?: number;
-  };
-  limits?: {
-    payloadBytes?: number;
-    maxMessageAgeMs?: number;
-    maxNackDelayMs?: number;
-    dlqRetentionMs?: number;
-  };
-  delivery?: {
-    defaultLeaseMs?: number;
-    maxDeliveries?: number;
-  };
+  owner?: string;
+  delivery?: DeliveryConfig;
+  retention?: RetentionConfig;
+  /** One stream-level NATS duplicate window. Default 120_000. */
+  dedupeWindowMs?: number;
+  ordering?: OrderingConfig;
+  maxPayloadBytes?: number;
+  replicas?: number;
 };
 
-export type QueueSendConfig<T> = {
-  tenantId?: string;
+export type QueueSend<T> = {
   data: T;
-  delayMs?: number;
-  orderingKey?: string;
-  idempotencyKey?: string;
-  idempotencyTtlMs?: number;
-  meta?: Record<string, unknown>;
-};
-
-export type QueueRecvConfig = {
   tenantId?: string;
-  wait?: boolean;
-  timeoutMs?: number;
-  leaseMs?: number;
-  consumerId?: string;
-  signal?: AbortSignal;
+  idempotencyKey?: string;
+  orderingKey?: string;
+  delayMs?: number;
+  at?: Date;
+  meta?: MessageMeta;
 };
 
-export type QueueReceived<T> = {
+export type QueueMessage<T> = {
   data: T;
   messageId: string;
-  deliveryId: string;
   attempt: number;
-  leaseUntil: number;
+  publishedAt: Date;
+  tenantId: string;
   orderingKey?: string;
-  meta?: Record<string, unknown>;
-  ack(): Promise<boolean>;
-  nack(cfg?: { delayMs?: number; reason?: string; error?: string }): Promise<boolean>;
-  touch(cfg?: { leaseMs?: number }): Promise<boolean>;
+  meta?: MessageMeta;
+  signal: AbortSignal;
+  /** In-progress acknowledgement: resets ackWaitMs for this delivery. */
+  heartbeat(): Promise<void>;
+};
+
+export type QueueDelivery<T> = QueueMessage<T> & {
+  ack(): Promise<void>;
+  retry(options?: { delayMs?: number; reason?: string }): Promise<void>;
+  deadLetter(options: { reason: string; error?: string }): Promise<void>;
 };
 
 export type QueueReader<T> = {
-  recv(cfg?: QueueRecvConfig): Promise<QueueReceived<T> | null>;
-  stream(cfg?: QueueRecvConfig): AsyncIterable<QueueReceived<T>>;
+  receive(options?: { waitMs?: number; signal?: AbortSignal }): Promise<QueueDelivery<T> | null>;
+  stream(options?: { signal?: AbortSignal }): AsyncIterable<QueueDelivery<T>>;
+  close(): Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
 };
 
-export type QueueDeadLetter<T> = {
+export type DeadLetter<T> = {
   messageId: string;
   data: T;
+  tenantId: string;
   attempts: number;
-  movedAt: number;
+  failedAt: Date;
   reason: string;
-  orderingKey?: string;
-  meta?: Record<string, unknown>;
-  lastError?: string;
+  error?: string;
 };
 
-export type Queue<T> = QueueReader<T> & {
-  send(cfg: QueueSendConfig<T>): Promise<{ messageId: string }>;
-  reader(): QueueReader<T>;
-  /** Oldest dead letters first. Read-only; use `dlqRemove` to drain. */
-  dlq(cfg?: { tenantId?: string; limit?: number }): Promise<Array<QueueDeadLetter<T>>>;
-  dlqRemove(cfg: { messageId: string; tenantId?: string }): Promise<boolean>;
+export type DeadLetterStore<T> = {
+  list(options?: { limit?: number; after?: string }): Promise<DeadLetter<T>[]>;
+  requeue(input: { messageId: string; idempotencyKey: string }): Promise<PublishReceipt>;
+  delete(input: { messageId: string }): Promise<boolean>;
 };
 
-/**
- * Stored message envelope, version 2. `dataJson` and `metaJson` hold the
- * caller's values as opaque pre-serialized JSON so that Lua only ever copies
- * the strings. Records written by <= 5.8.0 have no `v` and carry decoded
- * `data`/`meta` instead; Lua upgrades those on first touch.
- */
-type StoredMessage = {
-  v: 2;
-  attempt: number;
-  enqueuedAt: number;
-  orderingKey?: string;
-  dataJson?: string;
-  metaJson?: string;
+export type Queue<T> = {
+  ready(): Promise<void>;
+  send(message: QueueSend<T>): Promise<PublishReceipt>;
+  process(options: ProcessOptions, handler: (message: QueueMessage<T>) => Promise<void>): Promise<Worker>;
+  reader(options?: { signal?: AbortSignal }): Promise<QueueReader<T>>;
+  deadLetters: DeadLetterStore<T>;
 };
 
-type ClaimResult = {
+// ==========================
+// Internal queue core (shared with job)
+// ==========================
+
+export type PreparedSend = {
   messageId: string;
-  deliveryId: string;
-  attempt: number;
-  leaseUntil: number;
-  orderingKey?: string;
-  enqueuedAt: number;
-  dataJson?: string;
-  metaJson?: string;
+  bytes: Uint8Array;
+  byteLength: number;
 };
 
-const parseOpaque = <T>(json: string | undefined): T | undefined => {
-  if (json === undefined) return undefined;
-  try {
-    return JSON.parse(json) as T;
-  } catch {
-    return undefined;
-  }
+export type QueueCore<T, D = T> = {
+  identity: ResourceIdentity;
+  declarationReady(): Promise<void>;
+  send(message: QueueSend<T>, ext?: Record<string, JsonValue>): Promise<PublishReceipt>;
+  /** Encode a message now (byte size known), publish it later — for bounded fan-out. */
+  prepareSend(message: QueueSend<T>, ext?: Record<string, JsonValue>): Promise<PreparedSend & { publish(): Promise<PublishReceipt> }>;
+  process(
+    options: ProcessOptions,
+    handler: (message: QueueMessage<T>, envelope: Envelope, msg: JsMsg) => Promise<void>,
+    onFailure?: (input: {
+      message: QueueMessage<T>;
+      envelope: Envelope;
+      error: Error;
+    }) => Promise<{ action: "retry"; delayMs?: number } | { action: "dead_letter"; reason: string }>,
+  ): Promise<Worker>;
+  reader(options?: { signal?: AbortSignal }): Promise<QueueReader<T>>;
+  deadLetters: DeadLetterStore<D>;
+  maxPayloadBytes: number;
+  dedupeWindowMs: number;
 };
 
-export const queue = <T>(config: QueueConfig<T>): Queue<T> => {
-  type TData = T;
-  const ignoreLegacyNamespace = Boolean(
-    (config as QueueConfig<T> & { [INTERNAL_QUEUE_IGNORE_LEGACY_NAMESPACE]?: boolean })[
-      INTERNAL_QUEUE_IGNORE_LEGACY_NAMESPACE
-    ],
-  );
+const partitionOf = (orderingKey: string, partitions: number): number => {
+  const digest = createHash("sha256").update(orderingKey, "utf8").digest();
+  return digest.readUInt32BE(0) % partitions;
+};
 
-  if (config.ordering?.mode === "ordering_key_partitioned") {
-    // Nothing in this module partitions or serialises by ordering key, so
-    // accepting the option would silently break the per-key order it promises.
-    throw new Error("ordering.mode 'ordering_key_partitioned' is not implemented; use 'best_effort'");
+export const scopedMessageId = (tenantId: string, key: string): string =>
+  `k.${subjectToken(tenantId, "tenantId")}.${subjectToken(key, "idempotencyKey")}`;
+
+export const createQueueCore = <T, D = T>(
+  runtime: SyncRuntime,
+  config: QueueConfig & { dlqMaxAgeMs?: number },
+  kind: SyncResourceKind,
+  deadLetterData: (envelope: Envelope) => D = (envelope) => envelope.data as D,
+): QueueCore<T, D> => {
+  const identity = resourceIdentity(runtime.namespace, kind, config.id);
+  const owner = config.owner ?? runtime.application;
+  const delivery = resolveDelivery(config.delivery);
+  const retention = assertRetention(config.retention ?? { maxAgeMs: 7 * 24 * 60 * 60 * 1_000, maxBytes: 1024 ** 3 });
+  const dedupeWindowMs = config.dedupeWindowMs ?? DEFAULT_DEDUPE_WINDOW_MS;
+  const maxPayloadBytes = config.maxPayloadBytes ?? DEFAULT_MESSAGE_PAYLOAD_BYTES;
+  const replicas = config.replicas ?? runtime.defaults.replicas;
+  const storage = runtime.defaults.storage === "memory" ? StorageType.Memory : StorageType.File;
+  const ordering: OrderingConfig = config.ordering ?? { mode: "none" };
+  if (ordering.mode === "partitioned") {
+    if (!Number.isSafeInteger(ordering.partitions) || ordering.partitions < 1 || ordering.partitions > 1_024) {
+      throw new RangeError("ordering.partitions must be an integer between 1 and 1024");
+    }
   }
 
-  const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const defaultTenant = config.tenantId ?? DEFAULT_TENANT;
-  const maxPayloadBytes = requireSafeInteger(
-    "limits.payloadBytes",
-    config.limits?.payloadBytes ?? DEFAULT_PAYLOAD_BYTES,
-    1,
-  );
-  const maxMessageAgeMs = requireSafeInteger(
-    "limits.maxMessageAgeMs",
-    config.limits?.maxMessageAgeMs ?? DEFAULT_MAX_MESSAGE_AGE_MS,
-    1,
-  );
-  const maxNackDelayMs = requireSafeInteger(
-    "limits.maxNackDelayMs",
-    config.limits?.maxNackDelayMs ?? DEFAULT_MAX_NACK_DELAY_MS,
-    0,
-  );
-  const dlqRetentionMs = requireSafeInteger(
-    "limits.dlqRetentionMs",
-    config.limits?.dlqRetentionMs ?? DEFAULT_DLQ_RETENTION_MS,
-    1,
-  );
-  const defaultLeaseMs = requireFutureDuration(
-    "delivery.defaultLeaseMs",
-    config.delivery?.defaultLeaseMs ?? DEFAULT_LEASE_MS,
-    1,
-  );
-  const maxDeliveries = requireSafeInteger(
-    "delivery.maxDeliveries",
-    config.delivery?.maxDeliveries ?? DEFAULT_MAX_DELIVERIES,
-    1,
-  );
+  const stream = streamName(identity);
+  const dlqStream = dlqStreamName(identity);
+  const root = subjectRoot(identity);
+  const label = `${kind} ${config.id}`;
 
-  const resolveTenant = (tenantId?: string): string => tenantId ?? defaultTenant;
-  const namespaceBases = new Map<string, string>();
+  const workSubject = (tenantId: string, partition: number | null): string => {
+    const base = `${root}.t.${subjectToken(tenantId, "tenantId")}.work`;
+    const subject = partition === null ? base : `${base}.p${partition}`;
+    assertSubjectLength(subject);
+    return subject;
+  };
+  const dlqSubject = (tenantId: string): string => `${root}.t.${subjectToken(tenantId, "tenantId")}.dlq`;
 
-  const cacheNamespaceBase = (tenantId: string, base: string): string => {
-    if (!namespaceBases.has(tenantId) && namespaceBases.size >= NAMESPACE_CACHE_MAX) {
-      const oldest = namespaceBases.keys().next().value;
-      if (oldest !== undefined) namespaceBases.delete(oldest);
+  const workFilter = ordering.mode === "partitioned" ? `${root}.t.*.work.*` : `${root}.t.*.work`;
+  const partitionFilter = (partition: number): string => `${root}.t.*.work.p${partition}`;
+  const durableFor = (partition: number | null): string =>
+    partition === null ? `S6_QC_${identity.hash}` : `S6_QC_${identity.hash}_p${partition}`;
+
+  const declaration = runtime.declare({
+    identity,
+    owner,
+    configKey: JSON.stringify([
+      kind,
+      config.id,
+      owner,
+      delivery,
+      retention,
+      dedupeWindowMs,
+      ordering,
+      maxPayloadBytes,
+      replicas,
+      config.dlqMaxAgeMs ?? null,
+    ]),
+    natsNames: [stream, dlqStream],
+    provision: async (ctx: ProvisionContext) => {
+      await ensureStream(ctx, identity, owner, {
+        name: stream,
+        subjects: [workFilter, `${root}.t.*.delay.>`],
+        retention: RetentionPolicy.Workqueue,
+        discard: DiscardPolicy.Old,
+        storage,
+        num_replicas: replicas,
+        max_age: nanos(retention.maxAgeMs),
+        max_bytes: retention.maxBytes,
+        max_msgs: retention.maxMessages ?? -1,
+        max_msg_size: -1,
+        duplicate_window: nanos(dedupeWindowMs),
+        allow_msg_schedules: true,
+        allow_msg_ttl: true,
+      });
+      await ensureStream(ctx, identity, owner, {
+        name: dlqStream,
+        subjects: [`${root}.t.*.dlq`],
+        retention: RetentionPolicy.Limits,
+        discard: DiscardPolicy.Old,
+        storage,
+        num_replicas: replicas,
+        max_age: nanos(config.dlqMaxAgeMs ?? retention.maxAgeMs),
+        max_bytes: retention.maxBytes,
+        max_msgs: -1,
+        max_msg_size: -1,
+        duplicate_window: nanos(dedupeWindowMs),
+      });
+    },
+    summary: async (ctx: ProvisionContext) => {
+      const info = await ctx.jsm.streams.info(stream);
+      const dlq = await ctx.jsm.streams.info(dlqStream);
+      const consumers: Record<string, JsonValue> = {};
+      const partitions = ordering.mode === "partitioned" ? ordering.partitions : 1;
+      for (let p = 0; p < partitions; p++) {
+        const durable = durableFor(ordering.mode === "partitioned" ? p : null);
+        const consumerInfo = await ctx.jsm.consumers.info(stream, durable).catch(() => null);
+        if (consumerInfo) {
+          consumers[durable] = {
+            pending: consumerInfo.num_pending,
+            ackPending: consumerInfo.num_ack_pending,
+            redelivered: consumerInfo.num_redelivered,
+          };
+        }
+      }
+      return {
+        messages: info.state.messages,
+        bytes: info.state.bytes,
+        deadLetters: dlq.state.messages,
+        consumers,
+      } satisfies Record<string, JsonValue>;
+    },
+  });
+
+  const ensureWorkConsumers = async (ctx: ProvisionContext): Promise<string[]> => {
+    if (ordering.mode === "partitioned") {
+      const durables: string[] = [];
+      for (let p = 0; p < ordering.partitions; p++) {
+        const durable = durableFor(p);
+        await ensureConsumer(ctx, stream, {
+          durable_name: durable,
+          ack_policy: AckPolicy.Explicit,
+          filter_subject: partitionFilter(p),
+          ack_wait: nanos(delivery.ackWaitMs),
+          max_deliver: delivery.maxAttempts + 1,
+          // Serial per-partition delivery is the whole point of partitioning.
+          max_ack_pending: 1,
+          deliver_policy: DeliverPolicy.All,
+        });
+        durables.push(durable);
+      }
+      return durables;
     }
-    namespaceBases.set(tenantId, base);
-    return base;
+    const durable = durableFor(null);
+    await ensureConsumer(ctx, stream, {
+      durable_name: durable,
+      ack_policy: AckPolicy.Explicit,
+      filter_subject: workFilter,
+      ack_wait: nanos(delivery.ackWaitMs),
+      max_deliver: delivery.maxAttempts + 1,
+      max_ack_pending: delivery.maxInFlight,
+      deliver_policy: DeliverPolicy.All,
+    });
+    return [durable];
   };
 
-  const legacyNamespaceExists = async (base: string): Promise<boolean> => {
-    const suffixes = [
-      "seq",
-      "ready",
-      "notify",
-      "delayed",
-      "leases",
-      "deliveries",
-      "messages",
-      "active",
-      "delivery-owners",
-      "orphan-candidates",
-      "maintenance",
-      "dlq",
-      "dlq:index",
-    ];
-    return Number(await redis.send("EXISTS", suffixes.map((suffix) => `${base}:${suffix}`))) > 0;
-  };
+  // ==========================
+  // Send
+  // ==========================
 
-  const resolveNamespaceBase = async (tenantId: string): Promise<string> => {
-    const cached = namespaceBases.get(tenantId);
-    if (cached) return cached;
-
-    const legacyBase = `${prefix}:${tenantId}:${config.id}`;
-    const encodedBase =
-      `sync:queue:namespace:v2:${encodeURIComponent(JSON.stringify([prefix, tenantId, config.id]))}`;
-    if (!ignoreLegacyNamespace && await legacyNamespaceExists(legacyBase)) {
-      throw new Error(
-        "queue namespace migration required; drain old workers and migrate or remove legacy keys",
-      );
+  const prepareSend: QueueCore<T, D>["prepareSend"] = async (message, ext) => {
+    runtime.assertActive();
+    await declaration.ready();
+    const tenantId = message.tenantId ?? DEFAULT_TENANT;
+    if (message.delayMs !== undefined && message.at !== undefined) {
+      throw new InvalidNameError("delayMs and at are mutually exclusive");
     }
-    return cacheNamespaceBase(tenantId, encodedBase);
-  };
-
-  const keysForTenant = async (tenantId: string): Promise<QueueKeys> => {
-    const base = await resolveNamespaceBase(tenantId);
-    return {
-      seq: `${base}:seq`,
-      ready: `${base}:ready`,
-      notify: `${base}:notify`,
-      delayed: `${base}:delayed`,
-      leases: `${base}:leases`,
-      deliveries: `${base}:deliveries`,
-      messages: `${base}:messages`,
-      active: `${base}:active`,
-      deliveryOwners: `${base}:delivery-owners`,
-      orphanCandidates: `${base}:orphan-candidates`,
-      maintenance: `${base}:maintenance`,
-      dlq: `${base}:dlq`,
-      dlqIndex: `${base}:dlq:index`,
-      idempotencyPrefix: `${base}:idempotency`,
-    };
-  };
-
-  const lastMaintenanceByTenant = new Map<string, number>();
-
-  const runMaintenance = async (keys: QueueKeys, now: number): Promise<void> => {
-    await evalScript(
-      MAINTENANCE_SCRIPT,
-      [
-        keys.ready,
-        keys.delayed,
-        keys.leases,
-        keys.deliveries,
-        keys.messages,
-        keys.active,
-        keys.dlq,
-        keys.notify,
-        keys.dlqIndex,
-        keys.deliveryOwners,
-        keys.orphanCandidates,
-        keys.maintenance,
-      ],
-      [
-        now,
-        maxDeliveries,
-        maxMessageAgeMs,
-        MAINTENANCE_BATCH_SIZE,
-        dlqRetentionMs,
-        LEGACY_ORPHAN_GRACE_MS,
-      ],
-    );
-  };
-
-  const maybeRunMaintenance = async (tenantId: string, keys: QueueKeys, currentTs: number, force = false): Promise<void> => {
-    if (!force) {
-      const lastTs = lastMaintenanceByTenant.get(tenantId) ?? 0;
-      if (currentTs - lastTs < DEFAULT_MAINTENANCE_INTERVAL_MS) return;
+    if (ordering.mode === "partitioned" && message.orderingKey === undefined) {
+      throw new InvalidNameError(`${label} is partitioned; send() requires an orderingKey`);
     }
-    lastMaintenanceByTenant.set(tenantId, currentTs);
-    await runMaintenance(keys, currentTs);
+    const messageId = message.idempotencyKey
+      ? scopedMessageId(tenantId, message.idempotencyKey)
+      : crypto.randomUUID();
+    const envelope: Envelope = {
+      v: 6,
+      data: message.data,
+      tenantId,
+      publishedAt: new Date().toISOString(),
+      ...(message.orderingKey !== undefined ? { orderingKey: message.orderingKey } : {}),
+      ...(message.meta !== undefined ? { meta: message.meta } : {}),
+      ext: { ...ext, messageId },
+    };
+    const bytes = encodeEnvelope(label, envelope, maxPayloadBytes);
+    const partition = ordering.mode === "partitioned" ? partitionOf(message.orderingKey!, ordering.partitions) : null;
+    const target = workSubject(tenantId, partition);
+    const fireAt = message.at ?? (message.delayMs !== undefined ? new Date(Date.now() + message.delayMs) : null);
+
+    const publish = async (): Promise<PublishReceipt> => {
+      const ctx = await runtime.context();
+      if (fireAt !== null && fireAt.getTime() > Date.now()) {
+        const delaySubject = `${root}.t.${subjectToken(tenantId, "tenantId")}.delay.${crypto.randomUUID()}`;
+        const ack = await ctx.js.publish(delaySubject, bytes, {
+          msgID: messageId,
+          schedule: { specification: { at: fireAt }, target, ttl: "never" },
+        });
+        return { messageId, streamSequence: ack.seq, duplicate: ack.duplicate };
+      }
+      const ack = await ctx.js.publish(target, bytes, { msgID: messageId });
+      return { messageId, streamSequence: ack.seq, duplicate: ack.duplicate };
+    };
+
+    return { messageId, bytes, byteLength: bytes.byteLength, publish };
   };
 
-  const createReader = (): QueueReader<TData> => {
-    let blockingClient: RedisClient | null = null;
+  const send: QueueCore<T, D>["send"] = async (message, ext) => {
+    const prepared = await prepareSend(message, ext);
+    return prepared.publish();
+  };
 
-    const resetBlockingClient = (): void => {
-      if (!blockingClient) return;
-      safeClose(blockingClient);
-      blockingClient = null;
+  // ==========================
+  // Delivery handling
+  // ==========================
+
+  const toMessage = (envelope: Envelope, msg: JsMsg, signal: AbortSignal): QueueMessage<T> => ({
+    data: envelope.data as T,
+    messageId: (envelope.ext?.messageId as string) ?? `seq-${msg.seq}`,
+    attempt: msg.info.deliveryCount,
+    publishedAt: new Date(envelope.publishedAt),
+    tenantId: envelope.tenantId,
+    orderingKey: envelope.orderingKey,
+    meta: envelope.meta,
+    signal,
+    heartbeat: async () => {
+      msg.working();
+    },
+  });
+
+  const deadLetterTransfer = async (
+    ctx: ProvisionContext,
+    msg: JsMsg,
+    envelope: Envelope | null,
+    reason: string,
+    error?: string,
+  ): Promise<void> => {
+    const messageId = (envelope?.ext?.messageId as string) ?? `seq-${msg.seq}`;
+    const tenantId = envelope?.tenantId ?? DEFAULT_TENANT;
+    const dlqEnvelope: Envelope = {
+      v: 6,
+      data: envelope?.data ?? null,
+      tenantId,
+      publishedAt: new Date().toISOString(),
+      ext: {
+        ...envelope?.ext,
+        messageId,
+        attempts: msg.info.deliveryCount,
+        reason,
+        failedAt: new Date().toISOString(),
+        ...(error !== undefined ? { error } : {}),
+      },
     };
+    const bytes = encodeEnvelope(`${label} dlq`, dlqEnvelope, maxPayloadBytes);
+    // The original message ID keys the DLQ dedupe window, so a crash between
+    // DLQ publish and source ack repeats the transfer without duplicating it.
+    await ctx.js.publish(dlqSubject(tenantId), bytes, { msgID: `dlq.${messageId}` });
+    await confirmedAck(msg, label).catch(() => {});
+    runtime.events.emit({
+      type: "dead_letter",
+      resource: config.id,
+      kind,
+      detail: { messageId, reason },
+    });
+  };
 
-    const ensureBlockingClient = async (): Promise<RedisClient> => {
-      if (blockingClient?.connected) return blockingClient;
-      resetBlockingClient();
-      const client = new RedisClient();
-      blockingClient = client;
-      await client.connect();
-      // Return the local handle: a concurrent reset may already have cleared the
-      // slot while this connect was in flight.
-      return client;
-    };
+  const process: QueueCore<T>["process"] = async (options, handler, onFailure) => {
+    runtime.assertActive();
+    await declaration.ready();
+    const ctx = await runtime.context();
+    const durables = await ensureWorkConsumers(ctx);
 
-    // Block until someone signals that the ready list may be non-empty. The
-    // result is deliberately discarded — the caller re-checks by claiming.
-    const awaitNotification = async (keys: QueueKeys, waitMs: number): Promise<void> => {
-      const timeoutSecs = Math.max(0.001, waitMs / 1000).toFixed(3);
+    const wr = createWorkerRuntime(options, { onFinished: () => runtime.unregisterWorker(wr) });
+    runtime.registerWorker(wr);
+    runtime.events.emit({ type: "worker_started", resource: config.id, kind });
+
+    const onMessage = async (msg: JsMsg, signal: AbortSignal): Promise<void> => {
+      let envelope: Envelope;
       try {
-        const client = await ensureBlockingClient();
-        await client.send("BRPOP", [keys.notify, timeoutSecs]);
-      } catch {
-        // A broken blocking connection must not spin: drop it, pause briefly and
-        // let the next claim surface a genuine Redis outage.
-        resetBlockingClient();
-        await sleep(25);
+        envelope = decodeEnvelope(msg.data);
+      } catch (error) {
+        await deadLetterTransfer(ctx, msg, null, "invalid envelope", asError(error).message);
+        return;
+      }
+      const attempt = msg.info.deliveryCount;
+      if (attempt > delivery.maxAttempts) {
+        await deadLetterTransfer(ctx, msg, envelope, "max attempts exhausted");
+        return;
+      }
+      const message = toMessage(envelope, msg, signal);
+      try {
+        await handler(message, envelope, msg);
+        await confirmedAck(msg, label);
+      } catch (error) {
+        if (signal.aborted) {
+          msg.nak();
+          return;
+        }
+        const err = asError(error);
+        runtime.events.emit({ type: "handler_error", resource: config.id, kind, error: err.message });
+        let decision: { action: "retry"; delayMs?: number } | { action: "dead_letter"; reason: string } = {
+          action: "retry",
+        };
+        if (onFailure) {
+          try {
+            decision = await onFailure({ message, envelope, error: err });
+          } catch {
+            // A throwing failure policy must never settle work accidentally.
+            decision = { action: "retry" };
+          }
+        }
+        if (decision.action === "dead_letter") {
+          await deadLetterTransfer(ctx, msg, envelope, decision.reason, err.message);
+        } else if (attempt >= delivery.maxAttempts) {
+          await deadLetterTransfer(ctx, msg, envelope, "max attempts exhausted", err.message);
+        } else {
+          msg.nak(decision.delayMs ?? backoffDelayMs(delivery, attempt));
+          runtime.events.emit({ type: "redelivery", resource: config.id, kind, detail: { attempt } });
+        }
       }
     };
 
-    const recv = async (recvCfg: QueueRecvConfig = {}): Promise<QueueReceived<TData> | null> => {
-      const tenantId = resolveTenant(recvCfg.tenantId);
-      const keys = await keysForTenant(tenantId);
-      const wait = recvCfg.wait ?? true;
-      const timeoutMs = requireFutureDuration(
-        "recv.timeoutMs",
-        recvCfg.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS,
-        0,
-      );
-      const leaseMs = requireFutureDuration("recv.leaseMs", recvCfg.leaseMs ?? defaultLeaseMs, 1);
-      const deadline = Date.now() + timeoutMs;
+    const loops = durables.map((durable) =>
+      runPullLoop(wr, () => ctx.js.consumers.get(stream, durable), onMessage, {
+        events: runtime.events,
+        resource: config.id,
+      }),
+    );
+    Promise.all(loops).finally(() => {
+      runtime.events.emit({ type: "worker_stopped", resource: config.id, kind });
+    });
+    return wr.worker;
+  };
 
-      const onAbort = (): void => {
-        resetBlockingClient();
+  // ==========================
+  // Manual reader
+  // ==========================
+
+  const reader: QueueCore<T>["reader"] = async (options = {}) => {
+    runtime.assertActive();
+    if (ordering.mode === "partitioned") {
+      throw new InvalidNameError(`${label} is partitioned; use process() — reader() supports unpartitioned queues`);
+    }
+    await declaration.ready();
+    const ctx = await runtime.context();
+    const [durable] = await ensureWorkConsumers(ctx);
+    let closed = false;
+    const controller = new AbortController();
+    options.signal?.addEventListener("abort", () => controller.abort(), { once: true });
+
+    const toDelivery = (msg: JsMsg): QueueDelivery<T> | null => {
+      let envelope: Envelope;
+      try {
+        envelope = decodeEnvelope(msg.data);
+      } catch (error) {
+        void deadLetterTransfer(ctx, msg, null, "invalid envelope", asError(error).message);
+        return null;
+      }
+      const message = toMessage(envelope, msg, controller.signal);
+      return {
+        ...message,
+        ack: () => confirmedAck(msg, label),
+        retry: async (retryOptions = {}) => {
+          if (message.attempt >= delivery.maxAttempts) {
+            await deadLetterTransfer(ctx, msg, envelope, retryOptions.reason ?? "retry requested on final attempt");
+            return;
+          }
+          msg.nak(retryOptions.delayMs ?? backoffDelayMs(delivery, message.attempt));
+        },
+        deadLetter: (dlOptions) => deadLetterTransfer(ctx, msg, envelope, dlOptions.reason, dlOptions.error),
       };
-      recvCfg.signal?.addEventListener("abort", onAbort, { once: true });
+    };
 
+    const receive = async (receiveOptions: { waitMs?: number; signal?: AbortSignal } = {}) => {
+      if (closed || controller.signal.aborted) return null;
+      const consumer = await ctx.js.consumers.get(stream, durable!);
+      // NATS requires a fetch expiry of at least one second.
+      const batch = await consumer.fetch({ max_messages: 1, expires: Math.max(receiveOptions.waitMs ?? 5_000, 1_000) });
+      const stop = (): void => batch.stop();
+      receiveOptions.signal?.addEventListener("abort", stop, { once: true });
+      controller.signal.addEventListener("abort", stop, { once: true });
       try {
-        while (true) {
-          if (recvCfg.signal?.aborted) return null;
-
-          await maybeRunMaintenance(tenantId, keys, Date.now(), !wait);
-
-          const deliveryId = randomUUID();
-          const claimRaw = await evalScript(
-            CLAIM_SCRIPT,
-            [
-              keys.messages,
-              keys.deliveries,
-              keys.leases,
-              keys.active,
-              keys.ready,
-              keys.deliveryOwners,
-              keys.orphanCandidates,
-              keys.dlq,
-              keys.dlqIndex,
-            ],
-            [
-              deliveryId,
-              Date.now() + leaseMs,
-              CLAIM_MAX_SKIPS,
-              recvCfg.consumerId ?? "",
-              Date.now(),
-              maxMessageAgeMs,
-              dlqRetentionMs,
-            ],
-          );
-
-          if (claimRaw === "retry") continue;
-
-          let claimed: ClaimResult | null = null;
-          if (typeof claimRaw === "string") {
-            try {
-              claimed = JSON.parse(claimRaw) as ClaimResult;
-            } catch {
-              claimed = null;
-            }
-          }
-
-          if (!claimed) {
-            if (!wait) return null;
-            const remainingMs = deadline - Date.now();
-            if (remainingMs <= 0) return null;
-            await awaitNotification(keys, Math.min(NOTIFY_BLOCK_MS, remainingMs));
-            continue;
-          }
-
-          const ack = async (): Promise<boolean> => {
-            const result = await evalScript(
-              ACK_SCRIPT,
-              [
-                keys.deliveries,
-                keys.leases,
-                keys.messages,
-                keys.active,
-                keys.deliveryOwners,
-                keys.orphanCandidates,
-              ],
-              [claimed.deliveryId],
-            );
-            return Number(result) > 0;
-          };
-
-          const nack = async (
-            nackCfg: { delayMs?: number; reason?: string; error?: string } = {},
-          ): Promise<boolean> => {
-            const delayMs = requireFutureDuration("nack.delayMs", nackCfg.delayMs ?? 0, 0);
-            if (delayMs > maxNackDelayMs) {
-              throw new Error(`delayMs exceeds maxNackDelayMs (${maxNackDelayMs})`);
-            }
-
-            const result = await evalScript(
-              NACK_SCRIPT,
-              [
-                keys.deliveries,
-                keys.leases,
-                keys.messages,
-                keys.active,
-                keys.ready,
-                keys.delayed,
-                keys.dlq,
-                keys.notify,
-                keys.dlqIndex,
-                keys.deliveryOwners,
-                keys.orphanCandidates,
-              ],
-              [
-                claimed.deliveryId,
-                Date.now(),
-                delayMs,
-                maxDeliveries,
-                nackCfg.reason ?? "",
-                nackCfg.error ?? "",
-                dlqRetentionMs,
-              ],
-            );
-
-            return Number(result) > 0;
-          };
-
-          const touch = async (touchCfg: { leaseMs?: number } = {}): Promise<boolean> => {
-            const nextLeaseMs = requireFutureDuration("touch.leaseMs", touchCfg.leaseMs ?? leaseMs, 1);
-            const nextLeaseUntil = Date.now() + nextLeaseMs;
-            const result = await evalScript(
-              TOUCH_SCRIPT,
-              [keys.deliveries, keys.leases],
-              [claimed.deliveryId, Date.now(), nextLeaseUntil],
-            );
-            return Number(result) > 0;
-          };
-
-          return {
-            data: parseOpaque<TData>(claimed.dataJson) as TData,
-            messageId: claimed.messageId,
-            deliveryId: claimed.deliveryId,
-            attempt: claimed.attempt,
-            leaseUntil: claimed.leaseUntil,
-            orderingKey: claimed.orderingKey,
-            meta: asObject<Record<string, unknown>>(parseOpaque(claimed.metaJson)) ?? undefined,
-            ack,
-            nack,
-            touch,
-          };
+        for await (const msg of batch) {
+          const queueDelivery = toDelivery(msg);
+          if (queueDelivery !== null) return queueDelivery;
         }
       } finally {
-        recvCfg.signal?.removeEventListener("abort", onAbort);
+        receiveOptions.signal?.removeEventListener("abort", stop);
+        controller.signal.removeEventListener("abort", stop);
       }
-    };
-
-    const stream = async function* (streamCfg: QueueRecvConfig = {}): AsyncIterable<QueueReceived<TData>> {
-      const wait = streamCfg.wait ?? true;
-      try {
-        while (!streamCfg.signal?.aborted) {
-          const message = wait
-            ? await retry({
-                run: () => recv(streamCfg),
-                after: ({ ctx }) => {
-                  if (ctx.error && isRetryableTransportError(ctx.error)) {
-                    ctx.reschedule({ delayMs: ctx.expBackoff({ baseMs: 50, maxMs: 1_000 }) });
-                  }
-                },
-                signal: streamCfg.signal,
-              })
-            : await recv(streamCfg);
-          if (message) {
-            yield message;
-            continue;
-          }
-          if (!wait) break;
-        }
-      } finally {
-        resetBlockingClient();
-      }
-    };
-
-    return { recv, stream };
-  };
-
-  const send = async (sendCfg: QueueSendConfig<TData>): Promise<{ messageId: string }> => {
-    const tenantId = resolveTenant(sendCfg.tenantId);
-    const keys = await keysForTenant(tenantId);
-
-    const now = Date.now();
-    const delayMs = requireFutureDuration("send.delayMs", sendCfg.delayMs ?? 0, 0);
-    const idempotencyTtlMs = requireFutureDuration(
-      "send.idempotencyTtlMs",
-      sendCfg.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS,
-      1,
-    );
-
-    const dataJson = sendCfg.data === undefined ? undefined : JSON.stringify(sendCfg.data);
-    const metaJson = sendCfg.meta === undefined ? undefined : JSON.stringify(sendCfg.meta);
-
-    // The limit is measured against the logical envelope the caller sees, not
-    // against the stored representation, so that escaping `dataJson` into the
-    // envelope does not silently shrink the accepted payload size.
-    const logical: string[] = [];
-    if (dataJson !== undefined) logical.push(`"data":${dataJson}`);
-    logical.push(`"attempt":0`);
-    if (sendCfg.orderingKey !== undefined) logical.push(`"orderingKey":${JSON.stringify(sendCfg.orderingKey)}`);
-    if (metaJson !== undefined) logical.push(`"meta":${metaJson}`);
-    logical.push(`"enqueuedAt":${now}`);
-    const payloadBytes = textEncoder.encode(`{${logical.join(",")}}`).byteLength;
-    if (payloadBytes > maxPayloadBytes) {
-      throw new Error(`payload exceeds limit (${maxPayloadBytes} bytes)`);
-    }
-
-    const message: StoredMessage = {
-      v: 2,
-      attempt: 0,
-      enqueuedAt: now,
-      orderingKey: sendCfg.orderingKey,
-      dataJson,
-      metaJson,
-    };
-    const payload = JSON.stringify(message);
-
-    const idempotencyKey = sendCfg.idempotencyKey
-      ? `${keys.idempotencyPrefix}:${sendCfg.idempotencyKey}`
-      : "";
-
-    const result = await evalScript(
-      SEND_SCRIPT,
-      [keys.seq, keys.messages, keys.ready, keys.delayed, keys.notify, idempotencyKey],
-      [now, delayMs, payload, idempotencyTtlMs],
-    );
-
-    const messageId = Array.isArray(result) && typeof result[0] === "string" ? result[0] : String(result);
-    return { messageId };
-  };
-
-  const parseDeadLetter = (raw: unknown): QueueDeadLetter<TData> | null => {
-    if (typeof raw !== "string") return null;
-    let record: {
-      messageId?: string;
-      dataJson?: string;
-      metaJson?: string;
-      orderingKey?: string;
-      attempts?: number;
-      movedAt?: number;
-      reason?: string;
-      lastError?: string;
-      data?: unknown;
-      meta?: unknown;
-    };
-    try {
-      record = JSON.parse(raw) as typeof record;
-    } catch {
       return null;
-    }
-    if (!record.messageId) return null;
-    return {
-      messageId: record.messageId,
-      // `data`/`meta` are how <= 5.8.0 wrote dead letters.
-      data: (record.dataJson !== undefined ? parseOpaque<TData>(record.dataJson) : (record.data as TData)) as TData,
-      meta:
-        asObject<Record<string, unknown>>(
-          record.metaJson !== undefined ? parseOpaque(record.metaJson) : record.meta,
-        ) ?? undefined,
-      orderingKey: record.orderingKey,
-      attempts: record.attempts ?? 0,
-      movedAt: record.movedAt ?? 0,
-      reason: record.reason ?? "unknown",
-      lastError: record.lastError,
     };
+
+    const queueReader: QueueReader<T> = {
+      receive,
+      stream: (streamOptions = {}) => ({
+        async *[Symbol.asyncIterator]() {
+          while (!closed && !controller.signal.aborted && !streamOptions.signal?.aborted) {
+            const queueDelivery = await receive({ signal: streamOptions.signal });
+            if (queueDelivery !== null) yield queueDelivery;
+          }
+        },
+      }),
+      close: async () => {
+        closed = true;
+        controller.abort();
+      },
+      [Symbol.asyncDispose]: async () => {
+        closed = true;
+        controller.abort();
+      },
+    };
+    return queueReader;
   };
 
-  const dlq = async (cfg: { tenantId?: string; limit?: number } = {}): Promise<Array<QueueDeadLetter<TData>>> => {
-    const keys = await keysForTenant(resolveTenant(cfg.tenantId));
-    const limit = requireSafeInteger("dlq.limit", cfg.limit ?? 100, 1);
-    const raws = (await evalScript(
-      DLQ_READ_SCRIPT,
-      [keys.dlq, keys.dlqIndex],
-      [Date.now() - dlqRetentionMs, limit],
-    )) as unknown[];
-    if (!Array.isArray(raws) || raws.length === 0) return [];
+  // ==========================
+  // Dead letter store
+  // ==========================
 
-    const entries: Array<QueueDeadLetter<TData>> = [];
-    for (const raw of raws) {
-      const entry = parseDeadLetter(raw);
-      if (entry) entries.push(entry);
+  const scanDeadLetters = async function* (): AsyncGenerator<{ seq: number; envelope: Envelope }> {
+    const ctx = await runtime.context();
+    const info = await ctx.jsm.streams.info(dlqStream).catch(() => null);
+    if (info === null || info.state.messages === 0) return;
+    const lastSeq = info.state.last_seq;
+    const consumer = await ctx.js.consumers.get(dlqStream);
+    const messages = await consumer.consume({ max_messages: 256 });
+    try {
+      for await (const msg of messages) {
+        try {
+          yield { seq: msg.seq, envelope: decodeEnvelope(msg.data) };
+        } catch {
+          // Skip foreign messages.
+        }
+        if (msg.seq >= lastSeq) return;
+      }
+    } finally {
+      messages.stop();
     }
-    return entries;
   };
 
-  const dlqRemove = async (cfg: { messageId: string; tenantId?: string }): Promise<boolean> => {
-    const keys = await keysForTenant(resolveTenant(cfg.tenantId));
-    const removed = await evalScript(DLQ_REMOVE_SCRIPT, [keys.dlq, keys.dlqIndex], [cfg.messageId]);
-    return Number(removed) > 0;
+  const findDeadLetter = async (messageId: string): Promise<{ seq: number; envelope: Envelope } | null> => {
+    for await (const entry of scanDeadLetters()) {
+      if (entry.envelope.ext?.messageId === messageId) return entry;
+    }
+    return null;
   };
 
-  const defaultReader = createReader();
-  const reader = (): QueueReader<TData> => createReader();
+  const toDeadLetter = (envelope: Envelope): DeadLetter<D> => ({
+    messageId: (envelope.ext?.messageId as string) ?? "",
+    data: deadLetterData(envelope),
+    tenantId: envelope.tenantId,
+    attempts: (envelope.ext?.attempts as number) ?? 0,
+    failedAt: new Date((envelope.ext?.failedAt as string) ?? envelope.publishedAt),
+    reason: (envelope.ext?.reason as string) ?? "unknown",
+    ...(envelope.ext?.error !== undefined ? { error: envelope.ext.error as string } : {}),
+  });
+
+  const deadLetters: DeadLetterStore<D> = {
+    list: async (options = {}) => {
+      await declaration.ready();
+      const limit = options.limit ?? 100;
+      const entries: DeadLetter<D>[] = [];
+      let skipping = options.after !== undefined;
+      for await (const entry of scanDeadLetters()) {
+        if (skipping) {
+          if (entry.envelope.ext?.messageId === options.after) skipping = false;
+          continue;
+        }
+        entries.push(toDeadLetter(entry.envelope));
+        if (entries.length >= limit) break;
+      }
+      return entries;
+    },
+    requeue: async (input) => {
+      await declaration.ready();
+      assertName(input.idempotencyKey, "idempotencyKey");
+      const entry = await findDeadLetter(input.messageId);
+      if (entry === null) throw new InvalidNameError(`dead letter ${input.messageId} not found`);
+      const ctx = await runtime.context();
+      // Preserve primitive-specific ext fields (e.g. a job key) on requeue.
+      const { attempts: _a, reason: _r, failedAt: _f, error: _e, messageId: _m, ...restExt } = entry.envelope.ext ?? {};
+      const receipt = await send(
+        {
+          data: entry.envelope.data as T,
+          tenantId: entry.envelope.tenantId,
+          idempotencyKey: input.idempotencyKey,
+          ...(entry.envelope.orderingKey !== undefined ? { orderingKey: entry.envelope.orderingKey } : {}),
+          ...(entry.envelope.meta !== undefined ? { meta: entry.envelope.meta } : {}),
+        },
+        restExt,
+      );
+      await ctx.jsm.streams.deleteMessage(dlqStream, entry.seq).catch(() => {});
+      return receipt;
+    },
+    delete: async (input) => {
+      await declaration.ready();
+      const entry = await findDeadLetter(input.messageId);
+      if (entry === null) return false;
+      const ctx = await runtime.context();
+      return ctx.jsm.streams.deleteMessage(dlqStream, entry.seq).catch(() => false);
+    },
+  };
 
   return {
+    identity,
+    declarationReady: () => declaration.ready(),
     send,
-    recv: defaultReader.recv,
-    stream: defaultReader.stream,
+    prepareSend,
+    process,
     reader,
-    dlq,
-    dlqRemove,
+    deadLetters,
+    maxPayloadBytes,
+    dedupeWindowMs,
+  };
+};
+
+// ==========================
+// Public queue factory
+// ==========================
+
+export const createQueue = <T>(runtime: SyncRuntime, config: QueueConfig): Queue<T> => {
+  const core = createQueueCore<T>(runtime, config, "queue");
+  return {
+    ready: () => core.declarationReady(),
+    send: (message) => core.send(message),
+    process: (options, handler) => core.process(options, (message) => handler(message)),
+    reader: core.reader,
+    deadLetters: core.deadLetters,
   };
 };

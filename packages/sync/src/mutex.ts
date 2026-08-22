@@ -1,51 +1,13 @@
-import { redis, sleep } from "bun";
-import { createHash, randomBytes } from "crypto";
-
-const DEFAULT_PREFIX = "sync:mutex";
-const DEFAULT_RETRY_COUNT = 10;
-const DEFAULT_RETRY_DELAY = 200;
-const DEFAULT_TTL = 10_000;
-const MAX_RESOURCE_LENGTH = 128;
-
-const RELEASE_SCRIPT = `
-  if redis.call("get", KEYS[1]) == ARGV[1] then
-    return redis.call("del", KEYS[1])
-  else
-    return 0
-  end
-`;
-
-const EXTEND_SCRIPT = `
-  if redis.call("get", KEYS[1]) == ARGV[1] then
-    return redis.call("pexpire", KEYS[1], ARGV[2])
-  else
-    return 0
-  end
-`;
-
-const normalizeResource = (resource: string): string => {
-  if (resource.length <= MAX_RESOURCE_LENGTH) return resource;
-  const hash = createHash("sha256").update(resource).digest("hex");
-  return `hash:${hash}`;
-};
-
-const assertTtl = (ttl: number, label = "ttl"): void => {
-  if (!Number.isSafeInteger(ttl) || ttl <= 0) {
-    throw new RangeError(`${label} must be a positive safe integer`);
-  }
-};
-
-const assertRetryCount = (value: number): void => {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new RangeError("retryCount must be a non-negative safe integer");
-  }
-};
-
-const assertRetryDelay = (value: number): void => {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new RangeError("retryDelay must be a non-negative safe integer");
-  }
-};
+import { headers as natsHeaders } from "@nats-io/nats-core";
+import { StorageType } from "@nats-io/jetstream";
+import type { KV } from "@nats-io/kv";
+import { decodeJson, encodeJson } from "./codec.ts";
+import { asError } from "./errors.ts";
+import { assertName, kvBucketName, resourceIdentity, subjectToken } from "./naming.ts";
+import { ensureKv } from "./resources.ts";
+import type { ProvisionContext } from "./resources.ts";
+import type { SyncRuntime } from "./runtime.ts";
+import type { JsonValue } from "./codec.ts";
 
 // ==========================
 // Types
@@ -53,121 +15,210 @@ const assertRetryDelay = (value: number): void => {
 
 export type Lock = {
   resource: string;
-  value: string;
-  ttl: number;
-  expiration: number;
+  ownerToken: string;
+  /**
+   * Monotonic fencing token: the KV revision of the successful acquisition.
+   * A lease alone cannot stop a stale owner from writing to external systems
+   * after expiry — persist and compare the fence, or make effects idempotent.
+   */
+  fence: bigint;
+  expiresAt: Date;
 };
 
 export type MutexConfig = {
   id: string;
-  prefix?: string;
-  retryCount?: number;
-  retryDelay?: number;
-  defaultTtl?: number;
+  owner?: string;
+  /** Lease TTL. Rounded up to whole seconds (NATS minimum 1s). Default 10_000. */
+  ttlMs?: number;
+  retry?: { attempts?: number; delayMs?: number };
+  replicas?: number;
 };
 
 export type Mutex = {
-  id: string;
-  acquire(resource: string, ttl?: number): Promise<Lock | null>;
-  release(lock: Lock): Promise<void>;
-  withLock<T>(resource: string, fn: (lock: Lock) => Promise<T> | T, ttl?: number): Promise<T | null>;
-  withLockOrThrow<T>(resource: string, fn: (lock: Lock) => Promise<T> | T, ttl?: number): Promise<T>;
-  extend(lock: Lock, ttl?: number): Promise<boolean>;
+  ready(): Promise<void>;
+  acquire(resource: string, options?: { ttlMs?: number; signal?: AbortSignal }): Promise<Lock | null>;
+  extend(lock: Lock, options?: { ttlMs?: number }): Promise<boolean>;
+  release(lock: Lock): Promise<boolean>;
+  withLock<T>(
+    resource: string,
+    fn: (lock: Lock) => Promise<T>,
+    options?: { ttlMs?: number; signal?: AbortSignal },
+  ): Promise<T | null>;
+};
+
+type LockRecord = {
+  ownerToken: string;
+  expiresAt: string;
 };
 
 // ==========================
-// Lock Error
+// Mutex factory
 // ==========================
 
-export class LockError extends Error {
-  readonly resource: string;
-
-  constructor(resource: string) {
-    super(`Failed to acquire lock on resource: ${resource}`);
-    this.name = "LockError";
-    this.resource = resource;
+export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex => {
+  const identity = resourceIdentity(runtime.namespace, "mutex", config.id);
+  const owner = config.owner ?? runtime.application;
+  const defaultTtlMs = config.ttlMs ?? 10_000;
+  if (!Number.isSafeInteger(defaultTtlMs) || defaultTtlMs <= 0) {
+    throw new RangeError("ttlMs must be a positive integer");
   }
-}
+  const retryAttempts = config.retry?.attempts ?? 10;
+  const retryDelayMs = config.retry?.delayMs ?? 200;
+  const replicas = config.replicas ?? runtime.defaults.replicas;
+  const storage = runtime.defaults.storage === "memory" ? StorageType.Memory : StorageType.File;
+  const bucket = kvBucketName(identity);
+  const label = `mutex ${config.id}`;
 
-// ==========================
-// Mutex Factory
-// ==========================
+  let kv: KV | null = null;
 
-export const mutex = (config: MutexConfig): Mutex => {
-  const prefix = config.prefix ?? DEFAULT_PREFIX;
-  const retryCount = config.retryCount ?? DEFAULT_RETRY_COUNT;
-  const retryDelay = config.retryDelay ?? DEFAULT_RETRY_DELAY;
-  const defaultTtl = config.defaultTtl ?? DEFAULT_TTL;
-  assertRetryCount(retryCount);
-  assertRetryDelay(retryDelay);
-  assertTtl(defaultTtl, "defaultTtl");
+  const declaration = runtime.declare({
+    identity,
+    owner,
+    configKey: JSON.stringify(["mutex", config.id, owner, replicas]),
+    natsNames: [`KV_${bucket}`],
+    provision: async (ctx: ProvisionContext) => {
+      kv = await ensureKv(ctx, identity, owner, bucket, {
+        history: 1,
+        replicas,
+        storage,
+        markerTTL: 1_000,
+      });
+    },
+    summary: async (ctx: ProvisionContext) => {
+      const status = await (kv ?? (await ctx.kvm.open(bucket))).status();
+      return { locks: status.values } satisfies Record<string, JsonValue>;
+    },
+  });
 
-  const acquire = async (resource: string, ttl: number = defaultTtl): Promise<Lock | null> => {
-    assertTtl(ttl);
-    const safeResource = normalizeResource(resource);
-    const key = `${prefix}:${config.id}:${safeResource}`;
-    const value = randomBytes(16).toString("hex");
+  const getKv = async (): Promise<KV> => {
+    await declaration.ready();
+    if (kv === null) {
+      const ctx = await runtime.context();
+      kv = await ctx.kvm.open(bucket);
+    }
+    return kv;
+  };
 
-    for (let attempt = 0; attempt <= retryCount; attempt++) {
-      const result = await redis.send("SET", [key, value, "NX", "PX", ttl.toString()]);
+  const keyOf = (resource: string): string => {
+    assertName(resource, "resource");
+    return `r.${subjectToken(resource, "resource")}`;
+  };
 
-      if (result === "OK") {
-        return {
-          resource: key,
-          value,
-          ttl,
-          expiration: Date.now() + ttl,
-        };
-      }
+  const ttlSeconds = (ttlMs: number): number => Math.max(1, Math.ceil(ttlMs / 1_000));
 
-      if (attempt < retryCount) {
-        await sleep(retryDelay + Math.random() * 100);
+  /** CAS put with per-key TTL: expected-last-subject-sequence plus Nats-TTL headers. */
+  const casPutWithTtl = async (key: string, record: LockRecord, previousSeq: number, ttlMs: number): Promise<number | null> => {
+    const ctx = await runtime.context();
+    const hdrs = natsHeaders();
+    hdrs.set("Nats-Expected-Last-Subject-Sequence", String(previousSeq));
+    hdrs.set("Nats-TTL", `${ttlSeconds(ttlMs)}s`);
+    try {
+      const ack = await ctx.js.publish(`$KV.${bucket}.${key}`, encodeJson(label, record, 4_096), { headers: hdrs });
+      return ack.seq;
+    } catch (error) {
+      if (/wrong last sequence/i.test(asError(error).message)) return null;
+      throw error;
+    }
+  };
+
+  /** Last KV state of the resource key: live record, tombstone revision, or nothing. */
+  const readKey = async (
+    resource: string,
+  ): Promise<{ record: LockRecord | null; lastRevision: number }> => {
+    const store = await getKv();
+    const entry = await store.get(keyOf(resource));
+    if (entry === null) return { record: null, lastRevision: 0 };
+    if (entry.operation !== "PUT") return { record: null, lastRevision: entry.revision };
+    try {
+      return { record: decodeJson<LockRecord>(entry.value), lastRevision: entry.revision };
+    } catch {
+      return { record: null, lastRevision: entry.revision };
+    }
+  };
+
+  const tryAcquire = async (resource: string, ttlMs: number): Promise<Lock | null> => {
+    const key = keyOf(resource);
+    const { record: existing, lastRevision } = await readKey(resource);
+    if (existing !== null) return null;
+    const ownerToken = crypto.randomUUID();
+    const expiresAt = new Date(Date.now() + ttlSeconds(ttlMs) * 1_000);
+    const record: LockRecord = { ownerToken, expiresAt: expiresAt.toISOString() };
+    // A tombstone (expired/released lock) counts as the expected last revision.
+    const seq = await casPutWithTtl(key, record, lastRevision, ttlMs);
+    if (seq === null) return null;
+    // The acquisition revision is the fence; it is preserved across extends.
+    return { resource, ownerToken, fence: BigInt(seq), expiresAt };
+  };
+
+  const acquire: Mutex["acquire"] = async (resource, options = {}) => {
+    runtime.assertActive();
+    await declaration.ready();
+    const ttlMs = options.ttlMs ?? defaultTtlMs;
+    for (let attempt = 0; attempt <= retryAttempts; attempt++) {
+      if (options.signal?.aborted) return null;
+      const lock = await tryAcquire(resource, ttlMs);
+      if (lock !== null) return lock;
+      if (attempt < retryAttempts) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, retryDelayMs);
+          options.signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              resolve();
+            },
+            { once: true },
+          );
+        });
       }
     }
-
     return null;
   };
 
-  const release = async (lock: Lock): Promise<void> => {
-    await redis.send("EVAL", [RELEASE_SCRIPT, "1", lock.resource, lock.value]);
+  const extend: Mutex["extend"] = async (lock, options = {}) => {
+    runtime.assertActive();
+    const ttlMs = options.ttlMs ?? defaultTtlMs;
+    const current = await readKey(lock.resource);
+    if (current.record === null || current.record.ownerToken !== lock.ownerToken) {
+      runtime.events.emit({ type: "lock_lost", resource: config.id, kind: "mutex", detail: { resource: lock.resource } });
+      return false;
+    }
+    const expiresAt = new Date(Date.now() + ttlSeconds(ttlMs) * 1_000);
+    const record: LockRecord = { ...current.record, expiresAt: expiresAt.toISOString() };
+    const seq = await casPutWithTtl(keyOf(lock.resource), record, current.lastRevision, ttlMs);
+    if (seq === null) return false;
+    lock.expiresAt = expiresAt;
+    return true;
   };
 
-  const extend = async (lock: Lock, ttl: number = defaultTtl): Promise<boolean> => {
-    assertTtl(ttl);
-    const result = await redis.send("EVAL", [EXTEND_SCRIPT, "1", lock.resource, lock.value, ttl.toString()]);
-    // `Number(result) > 0` is what the rest of the package uses; a strict === 1
-    // silently returns false if the driver ever hands back a string.
-    if (Number(result) > 0) {
-      lock.ttl = ttl;
-      lock.expiration = Date.now() + ttl;
+  const release: Mutex["release"] = async (lock) => {
+    runtime.assertActive();
+    const store = await getKv();
+    const current = await readKey(lock.resource);
+    if (current.record === null || current.record.ownerToken !== lock.ownerToken) return false;
+    try {
+      await store.delete(keyOf(lock.resource), { previousSeq: current.lastRevision });
       return true;
+    } catch {
+      return false;
     }
-    return false;
   };
 
-  const withLock = async <T>(resource: string, fn: (lock: Lock) => Promise<T> | T, ttl?: number): Promise<T | null> => {
-    const lock = await acquire(resource, ttl);
-    if (!lock) return null;
-
+  const withLock: Mutex["withLock"] = async (resource, fn, options = {}) => {
+    const lock = await acquire(resource, options);
+    if (lock === null) return null;
     try {
       return await fn(lock);
     } finally {
-      await release(lock);
+      await release(lock).catch(() => {});
     }
   };
 
-  const withLockOrThrow = async <T>(resource: string, fn: (lock: Lock) => Promise<T> | T, ttl?: number): Promise<T> => {
-    const lock = await acquire(resource, ttl);
-    if (!lock) {
-      throw new LockError(resource);
-    }
-
-    try {
-      return await fn(lock);
-    } finally {
-      await release(lock);
-    }
+  return {
+    ready: () => declaration.ready(),
+    acquire,
+    extend,
+    release,
+    withLock,
   };
-
-  return { id: config.id, acquire, release, withLock, withLockOrThrow, extend };
 };
