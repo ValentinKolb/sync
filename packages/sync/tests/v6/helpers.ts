@@ -28,9 +28,9 @@ export const collect = async <T>(iterable: AsyncIterable<T>, limit?: number): Pr
   return items;
 };
 
-export const waitFor = async (predicate: () => boolean, timeoutMs = 10_000): Promise<void> => {
+export const waitFor = async (predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
+  while (!(await predicate())) {
     if (Date.now() > deadline) throw new Error("waitFor timed out");
     await Bun.sleep(25);
   }

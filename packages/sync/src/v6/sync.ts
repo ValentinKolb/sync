@@ -7,6 +7,8 @@ import { createJob } from "./job.ts";
 import type { Job, JobConfig } from "./job.ts";
 import { createMutex } from "./mutex.ts";
 import type { Mutex, MutexConfig } from "./mutex.ts";
+import { createPump } from "./pump.ts";
+import type { Pump, PumpConfig, PumpItem } from "./pump.ts";
 import { createObjectStore } from "./object-store.ts";
 import type { ObjectStore, ObjectStoreConfig } from "./object-store.ts";
 import { createQueue } from "./queue.ts";
@@ -31,6 +33,7 @@ export type Sync = {
   ephemeral<T>(config: EphemeralConfig): Ephemeral<T>;
   objectStore(config: ObjectStoreConfig): ObjectStore;
   mutex(config: MutexConfig): Mutex;
+  pump<Input, Cursor, Item extends PumpItem>(config: PumpConfig<Input, Cursor, Item>): Pump<Input, Cursor>;
 };
 
 /**
@@ -52,5 +55,7 @@ export const createSync = (config: SyncConfig): Sync => {
     ephemeral: <T>(ephemeralConfig: EphemeralConfig) => createEphemeral<T>(runtime, ephemeralConfig),
     objectStore: (objectStoreConfig: ObjectStoreConfig) => createObjectStore(runtime, objectStoreConfig),
     mutex: (mutexConfig: MutexConfig) => createMutex(runtime, mutexConfig),
+    pump: <Input, Cursor, Item extends PumpItem>(pumpConfig: PumpConfig<Input, Cursor, Item>) =>
+      createPump<Input, Cursor, Item>(runtime, pumpConfig),
   };
 };
