@@ -111,3 +111,9 @@ export class SnapshotOverflowError extends SyncError {
     this.maxEntries = maxEntries;
   }
 }
+
+/** The API was called in a way its contract forbids (not a name/bounds problem). */
+export class SyncUsageError extends SyncError {}
+
+/** A referenced entity (dead letter, schedule, ...) does not exist. */
+export class NotFoundError extends SyncError {}

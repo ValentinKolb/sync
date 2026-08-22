@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy, StorageType } from "@nats-io/jetstream";
-import type { Consumer, JsMsg } from "@nats-io/jetstream";
+import type { JsMsg } from "@nats-io/jetstream";
 import { decodeEnvelope, encodeEnvelope } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
-import { confirmedAck, runPullLoop } from "./consume.ts";
-import { InvalidNameError, asError } from "./errors.ts";
-import { assertName, consumerName, dlqStreamName, resourceIdentity, streamName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
-import type { ResourceIdentity, SyncResourceKind } from "./naming.ts";
+import { confirmedAck, runPullLoop, settleSuccess } from "./consume.ts";
+import { NotFoundError, SyncUsageError, asError } from "./errors.ts";
+import { assertName, dlqStreamName, resourceIdentity, streamName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
+import type { SyncResourceKind } from "./naming.ts";
 import { ensureConsumer, ensureStream } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
@@ -103,14 +103,13 @@ export type Queue<T> = {
 // Internal queue core (shared with job)
 // ==========================
 
-export type PreparedSend = {
+type PreparedSend = {
   messageId: string;
   bytes: Uint8Array;
   byteLength: number;
 };
 
 export type QueueCore<T, D = T> = {
-  identity: ResourceIdentity;
   declarationReady(): Promise<void>;
   send(message: QueueSend<T>, ext?: Record<string, JsonValue>): Promise<PublishReceipt>;
   /** Encode a message now (byte size known), publish it later — for bounded fan-out. */
@@ -126,8 +125,6 @@ export type QueueCore<T, D = T> = {
   ): Promise<Worker>;
   reader(options?: { signal?: AbortSignal }): Promise<QueueReader<T>>;
   deadLetters: DeadLetterStore<D>;
-  maxPayloadBytes: number;
-  dedupeWindowMs: number;
 };
 
 const partitionOf = (orderingKey: string, partitions: number): number => {
@@ -135,7 +132,7 @@ const partitionOf = (orderingKey: string, partitions: number): number => {
   return digest.readUInt32BE(0) % partitions;
 };
 
-export const scopedMessageId = (tenantId: string, key: string): string =>
+const scopedMessageId = (tenantId: string, key: string): string =>
   `k.${subjectToken(tenantId, "tenantId")}.${subjectToken(key, "idempotencyKey")}`;
 
 export const createQueueCore = <T, D = T>(
@@ -198,6 +195,10 @@ export const createQueueCore = <T, D = T>(
         name: stream,
         subjects: [workFilter, `${root}.t.*.delay.>`],
         retention: RetentionPolicy.Workqueue,
+        // DiscardPolicy.New would be the honest failure mode at the limits,
+        // but NATS forbids it on streams with message schedules (delays live
+        // here). Retention limits are therefore a hard loss boundary for the
+        // oldest pending work — size maxBytes/maxAgeMs generously.
         discard: DiscardPolicy.Old,
         storage,
         num_replicas: replicas,
@@ -258,8 +259,9 @@ export const createQueueCore = <T, D = T>(
           ack_policy: AckPolicy.Explicit,
           filter_subject: partitionFilter(p),
           ack_wait: nanos(delivery.ackWaitMs),
-          max_deliver: delivery.maxAttempts + 1,
           // Serial per-partition delivery is the whole point of partitioning.
+          // No max_deliver: the client-side attempt guard bounds handler runs,
+          // and an unbounded redelivery keeps the DLQ transfer crash-safe.
           max_ack_pending: 1,
           deliver_policy: DeliverPolicy.All,
         });
@@ -273,7 +275,6 @@ export const createQueueCore = <T, D = T>(
       ack_policy: AckPolicy.Explicit,
       filter_subject: workFilter,
       ack_wait: nanos(delivery.ackWaitMs),
-      max_deliver: delivery.maxAttempts + 1,
       max_ack_pending: delivery.maxInFlight,
       deliver_policy: DeliverPolicy.All,
     });
@@ -289,10 +290,10 @@ export const createQueueCore = <T, D = T>(
     await declaration.ready();
     const tenantId = message.tenantId ?? DEFAULT_TENANT;
     if (message.delayMs !== undefined && message.at !== undefined) {
-      throw new InvalidNameError("delayMs and at are mutually exclusive");
+      throw new SyncUsageError("delayMs and at are mutually exclusive");
     }
     if (ordering.mode === "partitioned" && message.orderingKey === undefined) {
-      throw new InvalidNameError(`${label} is partitioned; send() requires an orderingKey`);
+      throw new SyncUsageError(`${label} is partitioned; send() requires an orderingKey`);
     }
     const messageId = message.idempotencyKey
       ? scopedMessageId(tenantId, message.idempotencyKey)
@@ -337,10 +338,10 @@ export const createQueueCore = <T, D = T>(
   // Delivery handling
   // ==========================
 
-  const toMessage = (envelope: Envelope, msg: JsMsg, signal: AbortSignal): QueueMessage<T> => ({
+  const toMessage = (envelope: Envelope, msg: JsMsg, signal: AbortSignal, attempt: number): QueueMessage<T> => ({
     data: envelope.data as T,
     messageId: (envelope.ext?.messageId as string) ?? `seq-${msg.seq}`,
-    attempt: msg.info.deliveryCount,
+    attempt,
     publishedAt: new Date(envelope.publishedAt),
     tenantId: envelope.tenantId,
     orderingKey: envelope.orderingKey,
@@ -371,10 +372,12 @@ export const createQueueCore = <T, D = T>(
         attempts: msg.info.deliveryCount,
         reason,
         failedAt: new Date().toISOString(),
-        ...(error !== undefined ? { error } : {}),
+        ...(error !== undefined ? { error: error.slice(0, 2_048) } : {}),
       },
     };
-    const bytes = encodeEnvelope(`${label} dlq`, dlqEnvelope, maxPayloadBytes);
+    // Headroom: the transfer adds bookkeeping on top of the original payload
+    // and must never be the reason a message cannot be dead-lettered.
+    const bytes = encodeEnvelope(`${label} dlq`, dlqEnvelope, maxPayloadBytes + 4_096);
     // The original message ID keys the DLQ dedupe window, so a crash between
     // DLQ publish and source ack repeats the transfer without duplicating it.
     await ctx.js.publish(dlqSubject(tenantId), bytes, { msgID: `dlq.${messageId}` });
@@ -397,6 +400,18 @@ export const createQueueCore = <T, D = T>(
     runtime.registerWorker(wr);
     runtime.events.emit({ type: "worker_started", resource: config.id, kind });
 
+    /** Sleep out a retry delay while holding the delivery alive. */
+    const holdWithHeartbeat = async (msg: JsMsg, delayMs: number, signal: AbortSignal): Promise<void> => {
+      const step = Math.max(1_000, Math.floor(delivery.ackWaitMs / 2));
+      let remaining = delayMs;
+      while (remaining > 0 && !signal.aborted) {
+        const slice = Math.min(step, remaining);
+        await Promise.race([Bun.sleep(slice), new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }))]);
+        remaining -= slice;
+        msg.working();
+      }
+    };
+
     const onMessage = async (msg: JsMsg, signal: AbortSignal): Promise<void> => {
       let envelope: Envelope;
       try {
@@ -405,41 +420,68 @@ export const createQueueCore = <T, D = T>(
         await deadLetterTransfer(ctx, msg, null, "invalid envelope", asError(error).message);
         return;
       }
-      const attempt = msg.info.deliveryCount;
+      let attempt = msg.info.deliveryCount;
       if (attempt > delivery.maxAttempts) {
         await deadLetterTransfer(ctx, msg, envelope, "max attempts exhausted");
         return;
       }
-      const message = toMessage(envelope, msg, signal);
-      try {
-        await handler(message, envelope, msg);
-        await confirmedAck(msg, label);
-      } catch (error) {
+
+      while (true) {
+        const message = toMessage(envelope, msg, signal, attempt);
+        let handlerError: Error | null = null;
+        try {
+          await handler(message, envelope, msg);
+        } catch (error) {
+          handlerError = asError(error);
+        }
+        if (handlerError === null) {
+          // Success settles outside the failure logic: an unconfirmable ack
+          // means the delivery was superseded — never a handler failure.
+          await settleSuccess(msg, label, runtime.events, kind);
+          return;
+        }
         if (signal.aborted) {
           msg.nak();
           return;
         }
-        const err = asError(error);
-        runtime.events.emit({ type: "handler_error", resource: config.id, kind, error: err.message });
+        runtime.events.emit({ type: "handler_error", resource: config.id, kind, error: handlerError.message });
         let decision: { action: "retry"; delayMs?: number } | { action: "dead_letter"; reason: string } = {
           action: "retry",
         };
         if (onFailure) {
           try {
-            decision = await onFailure({ message, envelope, error: err });
+            decision = await onFailure({ message, envelope, error: handlerError });
           } catch {
             // A throwing failure policy must never settle work accidentally.
             decision = { action: "retry" };
           }
         }
         if (decision.action === "dead_letter") {
-          await deadLetterTransfer(ctx, msg, envelope, decision.reason, err.message);
-        } else if (attempt >= delivery.maxAttempts) {
-          await deadLetterTransfer(ctx, msg, envelope, "max attempts exhausted", err.message);
-        } else {
-          msg.nak(decision.delayMs ?? backoffDelayMs(delivery, attempt));
-          runtime.events.emit({ type: "redelivery", resource: config.id, kind, detail: { attempt } });
+          await deadLetterTransfer(ctx, msg, envelope, decision.reason, handlerError.message);
+          return;
         }
+        if (attempt >= delivery.maxAttempts) {
+          await deadLetterTransfer(ctx, msg, envelope, "max attempts exhausted", handlerError.message);
+          return;
+        }
+        const delayMs = decision.delayMs ?? backoffDelayMs(delivery, attempt);
+        if (ordering.mode === "partitioned") {
+          // A nak would free the MaxAckPending=1 slot and let younger messages
+          // of the same partition overtake during the backoff. Retry in place:
+          // the delivery is held with heartbeats, so per-key order survives
+          // handler failures.
+          await holdWithHeartbeat(msg, delayMs, signal);
+          if (signal.aborted) {
+            msg.nak();
+            return;
+          }
+          attempt += 1;
+          runtime.events.emit({ type: "redelivery", resource: config.id, kind, detail: { attempt, inPlace: true } });
+          continue;
+        }
+        msg.nak(delayMs);
+        runtime.events.emit({ type: "redelivery", resource: config.id, kind, detail: { attempt } });
+        return;
       }
     };
 
@@ -447,6 +489,7 @@ export const createQueueCore = <T, D = T>(
       runPullLoop(wr, () => ctx.js.consumers.get(stream, durable), onMessage, {
         events: runtime.events,
         resource: config.id,
+        ...(ordering.mode === "partitioned" ? { maxBatch: 1, pollExpiresMs: 1_500 } : {}),
       }),
     );
     Promise.all(loops).finally(() => {
@@ -462,7 +505,7 @@ export const createQueueCore = <T, D = T>(
   const reader: QueueCore<T>["reader"] = async (options = {}) => {
     runtime.assertActive();
     if (ordering.mode === "partitioned") {
-      throw new InvalidNameError(`${label} is partitioned; use process() — reader() supports unpartitioned queues`);
+      throw new SyncUsageError(`${label} is partitioned; use process() — reader() supports unpartitioned queues`);
     }
     await declaration.ready();
     const ctx = await runtime.context();
@@ -471,21 +514,21 @@ export const createQueueCore = <T, D = T>(
     const controller = new AbortController();
     options.signal?.addEventListener("abort", () => controller.abort(), { once: true });
 
-    const toDelivery = (msg: JsMsg): QueueDelivery<T> | null => {
+    const toDelivery = async (msg: JsMsg): Promise<QueueDelivery<T> | null> => {
       let envelope: Envelope;
       try {
         envelope = decodeEnvelope(msg.data);
       } catch (error) {
-        void deadLetterTransfer(ctx, msg, null, "invalid envelope", asError(error).message);
+        await deadLetterTransfer(ctx, msg, null, "invalid envelope", asError(error).message);
         return null;
       }
-      const message = toMessage(envelope, msg, controller.signal);
+      const message = toMessage(envelope, msg, controller.signal, msg.info.deliveryCount);
       return {
         ...message,
         ack: () => confirmedAck(msg, label),
         retry: async (retryOptions = {}) => {
           if (message.attempt >= delivery.maxAttempts) {
-            await deadLetterTransfer(ctx, msg, envelope, retryOptions.reason ?? "retry requested on final attempt");
+            await deadLetterTransfer(ctx, msg, envelope, "max attempts exhausted", retryOptions.reason);
             return;
           }
           msg.nak(retryOptions.delayMs ?? backoffDelayMs(delivery, message.attempt));
@@ -495,21 +538,29 @@ export const createQueueCore = <T, D = T>(
     };
 
     const receive = async (receiveOptions: { waitMs?: number; signal?: AbortSignal } = {}) => {
-      if (closed || controller.signal.aborted) return null;
-      const consumer = await ctx.js.consumers.get(stream, durable!);
-      // NATS requires a fetch expiry of at least one second.
-      const batch = await consumer.fetch({ max_messages: 1, expires: Math.max(receiveOptions.waitMs ?? 5_000, 1_000) });
-      const stop = (): void => batch.stop();
-      receiveOptions.signal?.addEventListener("abort", stop, { once: true });
-      controller.signal.addEventListener("abort", stop, { once: true });
-      try {
-        for await (const msg of batch) {
-          const queueDelivery = toDelivery(msg);
-          if (queueDelivery !== null) return queueDelivery;
+      // Poison messages are dead-lettered and skipped within the wait budget.
+      const deadline = Date.now() + (receiveOptions.waitMs ?? 5_000);
+      while (!closed && !controller.signal.aborted && !receiveOptions.signal?.aborted) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return null;
+        const consumer = await ctx.js.consumers.get(stream, durable!);
+        // NATS requires a fetch expiry of at least one second.
+        const batch = await consumer.fetch({ max_messages: 1, expires: Math.max(remaining, 1_000) });
+        const stop = (): void => batch.stop();
+        receiveOptions.signal?.addEventListener("abort", stop, { once: true });
+        controller.signal.addEventListener("abort", stop, { once: true });
+        let sawMessage = false;
+        try {
+          for await (const msg of batch) {
+            sawMessage = true;
+            const queueDelivery = await toDelivery(msg);
+            if (queueDelivery !== null) return queueDelivery;
+          }
+        } finally {
+          receiveOptions.signal?.removeEventListener("abort", stop);
+          controller.signal.removeEventListener("abort", stop);
         }
-      } finally {
-        receiveOptions.signal?.removeEventListener("abort", stop);
-        controller.signal.removeEventListener("abort", stop);
+        if (!sawMessage) return null; // fetch expired empty — queue is idle
       }
       return null;
     };
@@ -544,7 +595,6 @@ export const createQueueCore = <T, D = T>(
     const ctx = await runtime.context();
     const info = await ctx.jsm.streams.info(dlqStream).catch(() => null);
     if (info === null || info.state.messages === 0) return;
-    const lastSeq = info.state.last_seq;
     const consumer = await ctx.js.consumers.get(dlqStream);
     const messages = await consumer.consume({ max_messages: 256 });
     try {
@@ -554,7 +604,9 @@ export const createQueueCore = <T, D = T>(
         } catch {
           // Skip foreign messages.
         }
-        if (msg.seq >= lastSeq) return;
+        // pending counts the remaining deliverable messages — deterministic
+        // termination even when entries were deleted (last_seq never shrinks).
+        if (msg.info.pending === 0) return;
       }
     } finally {
       messages.stop();
@@ -598,7 +650,10 @@ export const createQueueCore = <T, D = T>(
       await declaration.ready();
       assertName(input.idempotencyKey, "idempotencyKey");
       const entry = await findDeadLetter(input.messageId);
-      if (entry === null) throw new InvalidNameError(`dead letter ${input.messageId} not found`);
+      if (entry === null) throw new NotFoundError(`dead letter ${input.messageId} not found`);
+      if (entry.envelope.ext?.reason === "invalid envelope") {
+        throw new SyncUsageError(`dead letter ${input.messageId} is an undecodable poison message; delete it instead`);
+      }
       const ctx = await runtime.context();
       // Preserve primitive-specific ext fields (e.g. a job key) on requeue.
       const { attempts: _a, reason: _r, failedAt: _f, error: _e, messageId: _m, ...restExt } = entry.envelope.ext ?? {};
@@ -612,7 +667,14 @@ export const createQueueCore = <T, D = T>(
         },
         restExt,
       );
-      await ctx.jsm.streams.deleteMessage(dlqStream, entry.seq).catch(() => {});
+      await ctx.jsm.streams.deleteMessage(dlqStream, entry.seq).catch((error) => {
+        runtime.events.emit({
+          type: "handler_error",
+          resource: config.id,
+          kind,
+          error: `requeued dead letter ${input.messageId} could not be removed from the DLQ: ${asError(error).message}`,
+        });
+      });
       return receipt;
     },
     delete: async (input) => {
@@ -625,15 +687,12 @@ export const createQueueCore = <T, D = T>(
   };
 
   return {
-    identity,
     declarationReady: () => declaration.ready(),
     send,
     prepareSend,
     process,
     reader,
     deadLetters,
-    maxPayloadBytes,
-    dedupeWindowMs,
   };
 };
 

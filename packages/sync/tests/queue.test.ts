@@ -201,3 +201,73 @@ describe("partitioned ordering", () => {
     await expect(queue.reader()).rejects.toThrow("partitioned");
   });
 });
+
+describe("hardening regressions", () => {
+  test("deadLetters.list terminates after the newest DLQ entry was deleted", async () => {
+    const queue = sync.queue<Task>({
+      id: "dlq-scan",
+      delivery: { maxAttempts: 1, backoffMs: [100], ackWaitMs: 5_000 },
+    });
+    const w = await queue.process({}, async () => {
+      throw new Error("always fails");
+    });
+    await queue.send({ data: { n: 1 }, idempotencyKey: "d1" });
+    await queue.send({ data: { n: 2 }, idempotencyKey: "d2" });
+    await waitFor(async () => (await queue.deadLetters.list()).length === 2, 15_000);
+    await w.drain();
+
+    const entries = await queue.deadLetters.list();
+    // Delete the newest entry (highest sequence): the scan must still
+    // terminate instead of waiting for the removed last_seq forever.
+    expect(await queue.deadLetters.delete({ messageId: entries[1]!.messageId })).toBe(true);
+    const remaining = await queue.deadLetters.list();
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0]!.messageId).toBe(entries[0]!.messageId);
+  }, 30_000);
+
+  test("partitioned processing honors local concurrency below the partition count", async () => {
+    const queue = sync.queue<Task>({
+      id: "part-cap",
+      ordering: { mode: "partitioned", partitions: 4 },
+      delivery: { ackWaitMs: 10_000 },
+    });
+    let active = 0;
+    let maxActive = 0;
+    const done: number[] = [];
+    const w = await queue.process({ concurrency: 1 }, async (message) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await Bun.sleep(50);
+      active -= 1;
+      done.push(message.data.n);
+    });
+    const sends = [];
+    for (let n = 1; n <= 8; n++) sends.push(queue.send({ data: { n }, orderingKey: `k${n % 4}` }));
+    await Promise.all(sends);
+    await waitFor(() => done.length >= 8, 30_000);
+    expect(maxActive).toBe(1);
+    await w.drain();
+  }, 45_000);
+
+  test("per-key order survives a failing handler (in-place retry, no overtake)", async () => {
+    const queue = sync.queue<Task>({
+      id: "part-order-fail",
+      ordering: { mode: "partitioned", partitions: 2 },
+      delivery: { maxAttempts: 3, backoffMs: [300], ackWaitMs: 10_000 },
+    });
+    const completed: number[] = [];
+    let failedOnce = false;
+    const w = await queue.process({ concurrency: 2 }, async (message) => {
+      if (message.data.n === 2 && !failedOnce) {
+        failedOnce = true;
+        throw new Error("transient");
+      }
+      completed.push(message.data.n);
+    });
+    for (let n = 1; n <= 4; n++) await queue.send({ data: { n }, orderingKey: "same" });
+    await waitFor(() => completed.length >= 4, 30_000);
+    // Without in-place retry, 3 would overtake 2 during the nak backoff.
+    expect(completed).toEqual([1, 2, 3, 4]);
+    await w.drain();
+  }, 45_000);
+});

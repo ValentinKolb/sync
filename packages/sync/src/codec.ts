@@ -39,7 +39,13 @@ export const encodeEnvelope = (label: string, envelope: Envelope, maxBytes: numb
 
 export const decodeEnvelope = (bytes: Uint8Array): Envelope => {
   const parsed = JSON.parse(decoder.decode(bytes)) as Envelope;
-  if (parsed === null || typeof parsed !== "object" || parsed.v !== 6) {
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    parsed.v !== 6 ||
+    typeof parsed.tenantId !== "string" ||
+    typeof parsed.publishedAt !== "string"
+  ) {
     throw new TypeError("message is not a Sync v6 envelope");
   }
   return parsed;

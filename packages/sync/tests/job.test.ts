@@ -132,3 +132,45 @@ describe("job processing", () => {
     await worker.drain();
   }, 30_000);
 });
+
+describe("hardening regressions", () => {
+  test("an unconfirmable ack after a successful handler is not a failure", async () => {
+    const jobs = sync.job<RunInput>({
+      id: "stale-ack",
+      delivery: { maxAttempts: 3, backoffMs: [200], ackWaitMs: 5_000 },
+    });
+    const { jetstreamManager } = await import("@nats-io/jetstream");
+    const jsm = await jetstreamManager(nc);
+    const onErrorCalls: string[] = [];
+    let ran = 0;
+    const worker = await jobs.process(
+      {
+        onError: async ({ error }) => {
+          onErrorCalls.push(error.message);
+          return { action: "dead_letter", reason: "should never happen" };
+        },
+      },
+      async () => {
+        ran += 1;
+        // Simulate the delivery being superseded: the consumer disappears
+        // before the ack, so the confirmed ack cannot succeed.
+        for await (const info of jsm.streams.list()) {
+          const meta = info.config.metadata;
+          if (meta?.["sync.kind"] === "job" && meta["sync.namespace"] === namespace && meta["sync.id"] === "stale-ack" && !info.config.name.includes("D_")) {
+            for await (const consumer of jsm.consumers.list(info.config.name)) {
+              await jsm.consumers.delete(info.config.name, consumer.name).catch(() => {});
+            }
+          }
+        }
+      },
+    );
+    await jobs.submit({ key: "job-1", input: { runId: "1" } });
+    await waitFor(() => ran >= 1, 15_000);
+    await Bun.sleep(1_000);
+    // Success stays success: no failure policy, no dead letter.
+    expect(onErrorCalls).toEqual([]);
+    expect(await jobs.deadLetters.list()).toHaveLength(0);
+    worker.stop();
+    await worker.drain({ timeoutMs: 1_000 });
+  }, 30_000);
+});

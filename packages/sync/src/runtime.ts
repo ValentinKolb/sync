@@ -90,7 +90,6 @@ export type SyncRuntime = {
   readonly application: string;
   readonly defaults: SyncDefaults;
   readonly events: EventHub;
-  readonly state: SyncHealth["state"];
   /** Global readiness: verifies the server and provisions all declarations. */
   ready(): Promise<void>;
   /** The shared provision/client context. Only valid after ready(). */
@@ -128,9 +127,10 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
 
   let state: SyncHealth["state"] = "starting";
   let connectionState: SyncHealth["connection"] = "connected";
-  let ctx: ProvisionContext | null = null;
+  let ctxPromise: Promise<ProvisionContext> | null = null;
   let readyPromise: Promise<void> | null = null;
   let statusMonitorStarted = false;
+  let monitorStopped = false;
 
   const assertActive = (): void => {
     if (state === "draining" || state === "stopped") {
@@ -143,6 +143,7 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
     statusMonitorStarted = true;
     (async () => {
       for await (const status of nc.status()) {
+        if (monitorStopped) break;
         if (status.type === "disconnect") {
           connectionState = "reconnecting";
           events.emit({ type: "connection", detail: { status: "reconnecting" } });
@@ -171,12 +172,13 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
     }
   };
 
-  const buildContext = async (): Promise<ProvisionContext> => {
-    if (ctx) return ctx;
-    const jsm = await jetstreamManager(nc);
-    const js = jetstream(nc);
-    ctx = { jsm, js, kvm: new Kvm(js), objm: new Objm(js) };
-    return ctx;
+  const buildContext = (): Promise<ProvisionContext> => {
+    ctxPromise ??= (async () => {
+      const jsm = await jetstreamManager(nc);
+      const js = jetstream(nc);
+      return { jsm, js, kvm: new Kvm(js), objm: new Objm(js) };
+    })();
+    return ctxPromise;
   };
 
   const provisionEntry = async (entry: DeclarationEntry, context: ProvisionContext): Promise<void> => {
@@ -206,8 +208,7 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
     return entry.inflight;
   };
 
-  const ready = (): Promise<void> => {
-    assertActive();
+  const baseReady = (): Promise<void> => {
     if (readyPromise) return readyPromise;
     readyPromise = (async () => {
       verifyServer();
@@ -232,6 +233,24 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
     return readyPromise;
   };
 
+  const ready = async (): Promise<void> => {
+    assertActive();
+    await baseReady();
+    // Declarations registered after the first ready() still provision here.
+    const pending = [...declarations.values()].filter((entry) => entry.state === "pending");
+    if (pending.length > 0) {
+      const context = await buildContext();
+      const failures: Error[] = [];
+      for (const entry of pending) {
+        await provisionEntry(entry, context).catch((error) => failures.push(asError(error)));
+      }
+      if (failures.length === 1) throw failures[0]!;
+      if (failures.length > 1) {
+        throw new SyncLifecycleError(`sync.ready() failed: ${failures.map((f) => f.message).join(" | ")}`);
+      }
+    }
+  };
+
   const declare = (declaration: Declaration): { ready(): Promise<void> } => {
     assertActive();
     const key = `${declaration.identity.kind}:${declaration.identity.id}`;
@@ -254,7 +273,7 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
     if (entry.state === "ready") return;
     // Global readiness first: verifies the server exactly once and provisions
     // everything declared before ready(). Late declarations provision here.
-    await ready();
+    await baseReady();
     await provisionEntry(entry, await buildContext());
   };
 
@@ -305,21 +324,29 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
     const timeoutMs = options.timeoutMs ?? 30_000;
     const deadline = Date.now() + timeoutMs;
     const snapshot = [...workers];
+    // Only handlers settled during this drain count into the result.
+    const baseline = new Map(snapshot.map((worker) => [worker, { completed: worker.completed, aborted: worker.aborted }]));
     await Promise.all(
       snapshot.map((worker) => worker.worker.drain({ timeoutMs: Math.max(1, deadline - Date.now()) })),
     );
     for (const sub of [...liveSubs]) {
-      await sub.drain().catch(() => {});
+      // Bounded: a drain flush cannot complete while disconnected.
+      await Promise.race([
+        sub.drain().catch(() => {}),
+        Bun.sleep(Math.min(2_000, Math.max(1, deadline - Date.now()))).then(() => sub.unsubscribe()),
+      ]).catch(() => {});
       liveSubs.delete(sub);
     }
     let completed = 0;
     let aborted = 0;
     for (const worker of snapshot) {
-      completed += worker.completed;
-      aborted += worker.aborted;
+      const base = baseline.get(worker)!;
+      completed += worker.completed - base.completed;
+      aborted += worker.aborted - base.aborted;
     }
     const timedOut = aborted > 0 || Date.now() > deadline;
     if (timedOut) events.emit({ type: "drain_timeout", detail: { aborted } });
+    monitorStopped = true;
     state = "stopped";
     return { completed, aborted, timedOut };
   };
@@ -330,16 +357,16 @@ export const createRuntime = (config: SyncConfig): SyncRuntime => {
     application,
     defaults,
     events,
-    get state() {
-      return state;
-    },
     ready,
     context: async () => {
       await ready();
       return buildContext();
     },
     declare,
-    registerWorker: (worker) => workers.add(worker),
+    registerWorker: (worker) => {
+      assertActive();
+      workers.add(worker);
+    },
     unregisterWorker: (worker) => workers.delete(worker),
     registerLiveSubscription: (sub) => liveSubs.add(sub),
     unregisterLiveSubscription: (sub) => liveSubs.delete(sub),

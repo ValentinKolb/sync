@@ -4,15 +4,14 @@ import { assertName } from "./naming.ts";
 import { createQueueCore } from "./queue.ts";
 import type { DeadLetterStore, QueueConfig } from "./queue.ts";
 import type { SyncRuntime } from "./runtime.ts";
-import type { MessageMeta, OrderingConfig, PublishReceipt } from "./types.ts";
+import type { MessageMeta, PublishReceipt } from "./types.ts";
 import type { ProcessOptions, Worker } from "./worker.ts";
 
 // ==========================
 // Types
 // ==========================
 
-export type JobConfig = Omit<QueueConfig, "ordering"> & {
-  ordering?: OrderingConfig;
+export type JobConfig = QueueConfig & {
   /** Retention for diagnostics and dead letters. Default 7 days. */
   terminalRetentionMs?: number;
 };

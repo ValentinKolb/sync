@@ -13,13 +13,11 @@ export type SyncEvent = {
   type:
     | "connection" // status: connected | reconnecting | closed
     | "ready"
-    | "resource_created"
     | "resource_verified"
     | "resource_drifted"
     | "worker_started"
     | "worker_stopped"
     | "handler_error"
-    | "publish_failed"
     | "redelivery"
     | "dead_letter"
     | "lock_lost"
@@ -28,8 +26,7 @@ export type SyncEvent = {
     | "pump_recovered"
     | "object_error"
     | "watch_resync_required"
-    | "drain_timeout"
-    | "observer_error";
+    | "drain_timeout";
   at: Date;
   /** Sync resource id (not the NATS name) when the event concerns a resource. */
   resource?: string;
@@ -82,34 +79,35 @@ export const createEventHub = (observe?: SyncObserver): EventHub => {
     }
   };
 
-  const subscribe = (options: { signal?: AbortSignal } = {}): AsyncIterable<SyncEvent> => {
-    const sub: EventSubscriber = { buffer: [], notify: null, done: false };
-    subscribers.add(sub);
-    const stop = (): void => {
-      sub.done = true;
-      subscribers.delete(sub);
-      sub.notify?.();
-    };
-    options.signal?.addEventListener("abort", stop, { once: true });
-
-    return {
-      async *[Symbol.asyncIterator]() {
-        try {
-          while (!sub.done) {
-            if (sub.buffer.length === 0) {
-              await new Promise<void>((resolve) => {
-                sub.notify = resolve;
-              });
-              sub.notify = null;
-            }
-            while (sub.buffer.length > 0) yield sub.buffer.shift()!;
+  const subscribe = (options: { signal?: AbortSignal } = {}): AsyncIterable<SyncEvent> => ({
+    // Each iteration owns an independent subscriber: buffering starts on
+    // first use, and one loop ending never affects another.
+    async *[Symbol.asyncIterator]() {
+      const sub: EventSubscriber = { buffer: [], notify: null, done: false };
+      subscribers.add(sub);
+      const stop = (): void => {
+        sub.done = true;
+        subscribers.delete(sub);
+        sub.notify?.();
+      };
+      options.signal?.addEventListener("abort", stop, { once: true });
+      try {
+        if (options.signal?.aborted) return;
+        while (!sub.done) {
+          if (sub.buffer.length === 0) {
+            await new Promise<void>((resolve) => {
+              sub.notify = resolve;
+            });
+            sub.notify = null;
           }
-        } finally {
-          stop();
+          while (sub.buffer.length > 0) yield sub.buffer.shift()!;
         }
-      },
-    };
-  };
+      } finally {
+        stop();
+        options.signal?.removeEventListener("abort", stop);
+      }
+    },
+  });
 
   return {
     emit,

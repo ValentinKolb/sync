@@ -30,10 +30,18 @@ export type WorkerRuntime = {
   readonly aborted: number;
   /** Number of currently free handler slots (0 while stopping). */
   freeSlots(): number;
+  /**
+   * Atomically reserve up to `want` slots before fetching. Several pull loops
+   * can share one runtime (partitions, schedules); reservations keep the sum
+   * of running handlers plus in-flight fetch requests within `capacity`.
+   */
+  reserve(want: number): number;
+  /** Return reservations that were not turned into handlers. */
+  releaseReserved(count: number): void;
   /** Resolves when at least one slot is free or the worker is stopping. */
   waitForSlot(): Promise<void>;
   /** Run a handler in one slot. The signal aborts on forced drain. */
-  track(fn: (signal: AbortSignal) => Promise<void>): void;
+  track(fn: (signal: AbortSignal) => Promise<void>, options?: { fromReservation?: boolean }): void;
   /** Resolves when the worker is stopping (used to interrupt long pulls). */
   readonly stopped: Promise<void>;
 };
@@ -47,8 +55,6 @@ export const assertConcurrency = (value: number): void => {
 export const createWorkerRuntime = (
   options: ProcessOptions,
   hooks: {
-    /** Called exactly once when the worker stops pulling (before handlers settle). */
-    onStop?: () => void;
     /** Called when the worker is fully drained or force-aborted. */
     onFinished?: () => void;
   } = {},
@@ -57,6 +63,7 @@ export const createWorkerRuntime = (
   assertConcurrency(capacity);
 
   let active = 0;
+  let reserved = 0;
   let completed = 0;
   let aborted = 0;
   let stopping = false;
@@ -73,24 +80,27 @@ export const createWorkerRuntime = (
     waiters.clear();
   };
 
+  const maybeFinish = (): void => {
+    if (!stopping || active > 0 || finished) return;
+    finished = true;
+    options.signal?.removeEventListener("abort", stop);
+    hooks.onFinished?.();
+  };
+
   const stop = (): void => {
     if (stopping) return;
     stopping = true;
     resolveStopped!();
     notifyWaiters();
-    hooks.onStop?.();
     maybeFinish();
-  };
-
-  const maybeFinish = (): void => {
-    if (!stopping || active > 0 || finished) return;
-    finished = true;
-    hooks.onFinished?.();
   };
 
   options.signal?.addEventListener("abort", stop, { once: true });
 
-  const track = (fn: (signal: AbortSignal) => Promise<void>): void => {
+  const freeSlots = (): number => (stopping ? 0 : Math.max(0, capacity - active - reserved));
+
+  const track: WorkerRuntime["track"] = (fn, trackOptions = {}) => {
+    if (trackOptions.fromReservation && reserved > 0) reserved -= 1;
     const controller = new AbortController();
     controllers.add(controller);
     active += 1;
@@ -100,8 +110,9 @@ export const createWorkerRuntime = (
           completed += 1;
         },
         () => {
-          if (controller.signal.aborted) aborted += 1;
-          else completed += 1;
+          // Force-aborted handlers were already bulk-counted in drain().
+          if (controller.signal.aborted && !finished) aborted += 1;
+          else if (!controller.signal.aborted) completed += 1;
         },
       )
       .finally(() => {
@@ -138,6 +149,7 @@ export const createWorkerRuntime = (
         // are recovered by other processes after ackWait expiry.
         aborted += active;
         finished = true;
+        options.signal?.removeEventListener("abort", stop);
         hooks.onFinished?.();
       }
     }
@@ -172,9 +184,19 @@ export const createWorkerRuntime = (
     get aborted() {
       return aborted;
     },
-    freeSlots: () => (stopping ? 0 : capacity - active),
+    freeSlots,
+    reserve: (want) => {
+      const granted = Math.min(want, freeSlots());
+      if (granted <= 0) return 0;
+      reserved += granted;
+      return granted;
+    },
+    releaseReserved: (count) => {
+      reserved = Math.max(0, reserved - count);
+      notifyWaiters();
+    },
     waitForSlot: () => {
-      if (stopping || active < capacity) return Promise.resolve();
+      if (stopping || freeSlots() > 0) return Promise.resolve();
       return new Promise<void>((resolve) => {
         waiters.add(resolve);
       });

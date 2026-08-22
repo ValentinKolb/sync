@@ -28,17 +28,25 @@ export type ProvisionContext = {
 const isNotFound = (error: unknown): boolean => {
   const err = error as { code?: unknown; message?: string };
   // JetStreamApiError exposes the JetStream error code; 10059 = stream not
-  // found, 10014 = consumer not found. Kvm/Objm surface the same errors.
-  return err?.code === 10059 || err?.code === 10014 || /not found/i.test(err?.message ?? "");
+  // found, 10014 = consumer not found. Kvm/Objm surface the same errors but
+  // sometimes only as messages — match those precisely, not any "not found".
+  return (
+    err?.code === 10059 ||
+    err?.code === 10014 ||
+    /stream not found|consumer not found|bucket not found|no message found/i.test(err?.message ?? "")
+  );
 };
 
 // ==========================
 // Drift comparison
 // ==========================
 
-const normalize = (value: unknown): unknown => {
+/** Subject lists are set-like; every other array (e.g. backoff) is ordered. */
+const SET_LIKE_FIELDS = new Set(["subjects", "filter_subjects"]);
+
+const normalize = (field: string, value: unknown): unknown => {
   if (value === undefined || value === null) return null;
-  if (Array.isArray(value)) return [...value].sort();
+  if (Array.isArray(value) && SET_LIKE_FIELDS.has(field)) return [...value].sort();
   return value;
 };
 
@@ -49,8 +57,8 @@ const compareFields = (
 ): ResourceDifference[] => {
   const differences: ResourceDifference[] = [];
   for (const field of fields) {
-    const d = normalize(declared[field]);
-    const a = normalize(actual[field]);
+    const d = normalize(field, declared[field]);
+    const a = normalize(field, actual[field]);
     if (JSON.stringify(d) !== JSON.stringify(a)) {
       differences.push({ field, declared: d, actual: a });
     }
