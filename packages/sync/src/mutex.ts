@@ -1,9 +1,10 @@
+import { JetStreamApiError } from "@nats-io/jetstream";
 import { headers as natsHeaders } from "@nats-io/nats-core";
 import { StorageType } from "@nats-io/jetstream";
 import type { KV } from "@nats-io/kv";
 import { decodeJson, encodeJson } from "./codec.ts";
 import { asError } from "./errors.ts";
-import { assertName, kvBucketName, resourceIdentity, subjectToken } from "./naming.ts";
+import { assertName, assertSubjectLength, kvBucketName, resourceIdentity, subjectToken } from "./naming.ts";
 import { ensureKv } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
@@ -101,10 +102,18 @@ export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex =>
 
   const keyOf = (resource: string): string => {
     assertName(resource, "resource");
-    return `r.${subjectToken(resource, "resource")}`;
+    const key = `r.${subjectToken(resource, "resource")}`;
+    assertSubjectLength(`$KV.${bucket}.${key}`);
+    return key;
   };
 
   const ttlSeconds = (ttlMs: number): number => Math.max(1, Math.ceil(ttlMs / 1_000));
+
+  // 10071/10164 = wrong last sequence; the numeric codes are the stable
+  // contract, the message text is only a fallback.
+  const isCasConflict = (error: unknown): boolean =>
+    (error instanceof JetStreamApiError && (error.code === 10071 || error.code === 10164)) ||
+    /wrong last sequence/i.test(asError(error).message);
 
   /** CAS put with per-key TTL: expected-last-subject-sequence plus Nats-TTL headers. */
   const casPutWithTtl = async (key: string, record: LockRecord, previousSeq: number, ttlMs: number): Promise<number | null> => {
@@ -116,7 +125,7 @@ export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex =>
       const ack = await ctx.js.publish(`$KV.${bucket}.${key}`, encodeJson(label, record, 4_096), { headers: hdrs });
       return ack.seq;
     } catch (error) {
-      if (/wrong last sequence/i.test(asError(error).message)) return null;
+      if (isCasConflict(error)) return null;
       throw error;
     }
   };
@@ -160,15 +169,15 @@ export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex =>
       if (lock !== null) return lock;
       if (attempt < retryAttempts) {
         await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, retryDelayMs);
-          options.signal?.addEventListener(
-            "abort",
-            () => {
-              clearTimeout(timer);
-              resolve();
-            },
-            { once: true },
-          );
+          const onAbort = (): void => {
+            clearTimeout(timer);
+            resolve();
+          };
+          const timer = setTimeout(() => {
+            options.signal?.removeEventListener("abort", onAbort);
+            resolve();
+          }, retryDelayMs);
+          options.signal?.addEventListener("abort", onAbort, { once: true });
         });
       }
     }
@@ -186,7 +195,10 @@ export const createMutex = (runtime: SyncRuntime, config: MutexConfig): Mutex =>
     const expiresAt = new Date(Date.now() + ttlSeconds(ttlMs) * 1_000);
     const record: LockRecord = { ...current.record, expiresAt: expiresAt.toISOString() };
     const seq = await casPutWithTtl(keyOf(lock.resource), record, current.lastRevision, ttlMs);
-    if (seq === null) return false;
+    if (seq === null) {
+      runtime.events.emit({ type: "lock_lost", resource: config.id, kind: "mutex", detail: { resource: lock.resource } });
+      return false;
+    }
     lock.expiresAt = expiresAt;
     return true;
   };

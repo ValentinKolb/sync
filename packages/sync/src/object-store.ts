@@ -1,6 +1,6 @@
 import { StorageType } from "@nats-io/jetstream";
 import type { ObjectInfo as NatsObjectInfo, ObjectStore as NatsObjectStore } from "@nats-io/obj";
-import { InvalidNameError, ObjectTooLargeError, asError } from "./errors.ts";
+import { InvalidNameError, ObjectTooLargeError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, decodeSubjectToken, objBucketName, resourceIdentity, subjectToken } from "./naming.ts";
 import { ensureObjectStore } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
@@ -63,7 +63,12 @@ export type ObjectStore = {
     metadata?: ObjectMetadata;
     signal?: AbortSignal;
   }): Promise<ObjectRef>;
-  get(ref: ObjectRef, options?: { signal?: AbortSignal }): Promise<StoredObject | null>;
+  /**
+   * Resolve a reference to the exact stored artifact. `idleTimeoutMs` bounds
+   * the wait between body chunks (default 30_000): an object purged or
+   * replaced mid-read errors the stream instead of hanging it forever.
+   */
+  get(ref: ObjectRef, options?: { signal?: AbortSignal; idleTimeoutMs?: number }): Promise<StoredObject | null>;
   info(input: { tenantId?: string; key: string }): Promise<SyncObjectInfo | null>;
   delete(input: { tenantId?: string; key: string }): Promise<boolean>;
   list(input?: { tenantId?: string; prefix?: string }): AsyncIterable<SyncObjectInfo>;
@@ -141,8 +146,15 @@ export const createObjectStore = (runtime: SyncRuntime, config: ObjectStoreConfi
 
   // Physical object names are injective token encodings; the original tenant
   // and key strings travel in object metadata and in every ObjectRef.
-  const objectName = (tenantId: string, key: string): string =>
-    `${subjectToken(tenantId, "tenantId")}.${subjectToken(key, "key")}`;
+  const objectName = (tenantId: string, key: string): string => {
+    const name = `${subjectToken(tenantId, "tenantId")}.${subjectToken(key, "key")}`;
+    // The obj client base64-encodes the name into its meta subject; keep the
+    // result inside the codebase-wide subject bound.
+    if (name.length > 160) {
+      throw new InvalidNameError(`tenantId plus key encode to ${name.length} characters; the maximum is 160`);
+    }
+    return name;
+  };
   const decodeName = (name: string): { tenantId: string; key: string } | null => {
     const parts = name.split(".");
     if (parts.length !== 2) return null;
@@ -171,6 +183,11 @@ export const createObjectStore = (runtime: SyncRuntime, config: ObjectStoreConfi
   const put: ObjectStore["put"] = async (input) => {
     runtime.assertActive();
     assertName(input.key, "key");
+    for (const metaKey of Object.keys(input.metadata ?? {})) {
+      if (metaKey.startsWith("sync.")) {
+        throw new SyncUsageError(`object metadata keys must not start with "sync." (got ${metaKey})`);
+      }
+    }
     const tenantId = input.tenantId ?? DEFAULT_TENANT;
     const store = await getStore();
 
@@ -217,11 +234,13 @@ export const createObjectStore = (runtime: SyncRuntime, config: ObjectStoreConfi
   const get: ObjectStore["get"] = async (ref, options = {}) => {
     runtime.assertActive();
     if (ref.storeId !== config.id) {
-      throw new InvalidNameError(`ObjectRef belongs to store ${ref.storeId}, not ${config.id}`);
+      throw new SyncUsageError(`ObjectRef belongs to store ${ref.storeId}, not ${config.id}`);
     }
     const store = await getStore();
-    const result = await store.get(objectName(ref.tenantId, ref.key)).catch(() => null);
-    if (result === null || result.info.deleted) return null;
+    // The obj client maps genuine not-found to null; anything thrown here is
+    // an infrastructure failure and must not read as "object deleted".
+    const result = await store.get(objectName(ref.tenantId, ref.key));
+    if (result === null) return null;
     // The reference pins an exact artifact: a replaced object (different
     // digest or size) is not the referenced object any more.
     if (result.info.digest !== ref.digest || result.info.size !== ref.size) {
@@ -230,11 +249,25 @@ export const createObjectStore = (runtime: SyncRuntime, config: ObjectStoreConfi
     }
     const info = toInfo(result.info);
     if (info === null) return null;
-    let body = result.data;
-    if (options.signal !== undefined) {
-      const signal = options.signal;
-      body = body.pipeThrough(new TransformStream(), { signal });
-    }
+    const idleTimeoutMs = options.idleTimeoutMs ?? 30_000;
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const watchdog = new TransformStream<Uint8Array, Uint8Array>({
+      start: (controller) => {
+        idleTimer = setTimeout(() => controller.error(new Error(`object body stalled for ${idleTimeoutMs}ms`)), idleTimeoutMs);
+      },
+      transform: (chunk, controller) => {
+        if (idleTimer !== null) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => controller.error(new Error(`object body stalled for ${idleTimeoutMs}ms`)), idleTimeoutMs);
+        controller.enqueue(chunk);
+      },
+      flush: () => {
+        if (idleTimer !== null) clearTimeout(idleTimer);
+      },
+    });
+    const body =
+      options.signal !== undefined
+        ? result.data.pipeThrough(watchdog).pipeThrough(new TransformStream(), { signal: options.signal })
+        : result.data.pipeThrough(watchdog);
     return { ...info, body };
   };
 
@@ -242,7 +275,7 @@ export const createObjectStore = (runtime: SyncRuntime, config: ObjectStoreConfi
     runtime.assertActive();
     assertName(input.key, "key");
     const store = await getStore();
-    const raw = await store.info(objectName(input.tenantId ?? DEFAULT_TENANT, input.key)).catch(() => null);
+    const raw = await store.info(objectName(input.tenantId ?? DEFAULT_TENANT, input.key));
     if (raw === null || raw.deleted) return null;
     return toInfo(raw);
   };
@@ -252,14 +285,10 @@ export const createObjectStore = (runtime: SyncRuntime, config: ObjectStoreConfi
     assertName(input.key, "key");
     const store = await getStore();
     const name = objectName(input.tenantId ?? DEFAULT_TENANT, input.key);
-    const existing = await store.info(name).catch(() => null);
+    const existing = await store.info(name);
     if (existing === null || existing.deleted) return false;
-    try {
-      const response = await store.delete(name);
-      return response.success;
-    } catch {
-      return false;
-    }
+    const response = await store.delete(name);
+    return response.success;
   };
 
   const list: ObjectStore["list"] = (input = {}) => ({

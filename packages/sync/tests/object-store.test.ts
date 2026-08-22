@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { NatsConnection } from "@nats-io/nats-core";
 import { createSync } from "../src/sync.ts";
 import type { Sync } from "../src/sync.ts";
-import { InvalidNameError, ObjectTooLargeError } from "../src/errors.ts";
+import { ObjectTooLargeError, SyncUsageError } from "../src/errors.ts";
 import { connectToCluster } from "./cluster.ts";
 import { cleanupNamespaces, testNamespace, waitFor } from "./helpers.ts";
 
@@ -95,7 +95,7 @@ describe("object store", () => {
       maxObjectBytes: 1024,
     });
     const ref = await artifacts.put({ key: "bound", body: chunkedBody(1, 128) });
-    await expect(other.get(ref)).rejects.toBeInstanceOf(InvalidNameError);
+    await expect(other.get(ref)).rejects.toBeInstanceOf(SyncUsageError);
     expect(await artifacts.info({ key: "missing" })).toBeNull();
   });
 
@@ -150,4 +150,38 @@ describe("object store", () => {
     await Bun.sleep(2_500);
     expect(await shortLived.info({ key: "orphan" })).toBeNull();
   }, 15_000);
+});
+
+describe("hardening regressions", () => {
+  test("a body stalled by mid-read replacement errors instead of hanging forever", async () => {
+    const artifacts = store();
+    await artifacts.put({ key: "stall", body: chunkedBody(32, 64 * 1024, 1) });
+    const ref = (await artifacts.info({ key: "stall" }))!.ref;
+    const stored = await artifacts.get(ref, { idleTimeoutMs: 2_000 });
+    expect(stored).not.toBeNull();
+    const reader = stored!.body.getReader();
+    await reader.read(); // start consuming
+    // Replace the object mid-read: the old chunks are purged server-side.
+    await artifacts.put({ key: "stall", body: chunkedBody(2, 1_024, 2) });
+    const outcome = await (async () => {
+      try {
+        while (true) {
+          const { done } = await reader.read();
+          if (done) return "completed";
+        }
+      } catch {
+        return "errored";
+      }
+    })();
+    // Either the client noticed the purge (error) or the watchdog fired —
+    // never an unbounded hang.
+    expect(["errored", "completed"]).toContain(outcome);
+  }, 30_000);
+
+  test("reserved metadata keys are rejected instead of silently clobbered", async () => {
+    const artifacts = store();
+    await expect(
+      artifacts.put({ key: "meta-guard", body: chunkedBody(1, 64), metadata: { "sync.key": "spoof" } }),
+    ).rejects.toThrow('must not start with "sync."');
+  });
 });

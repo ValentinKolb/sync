@@ -113,3 +113,51 @@ describe("ephemeral state", () => {
     await expect(tiny.snapshot()).rejects.toBeInstanceOf(SnapshotOverflowError);
   });
 });
+
+describe("hardening regressions", () => {
+  test("touch never reverts a concurrent upsert (CAS heartbeat)", async () => {
+    const state = sync.ephemeral<{ v: number }>({ id: "touch-cas", ttlMs: 60_000 });
+    await state.upsert({ key: "hot", value: { v: 0 } });
+    // Interleave value-bearing upserts with value-less touches; the final
+    // value must always be the last upsert's, never a stale touch replay.
+    for (let round = 1; round <= 15; round++) {
+      await Promise.all([
+        state.upsert({ key: "hot", value: { v: round } }),
+        state.touch({ key: "hot" }),
+        state.touch({ key: "hot" }),
+      ]);
+      const snap = await state.snapshot();
+      expect(snap.entries.find((e) => e.key === "hot")!.value.v).toBe(round);
+    }
+  }, 30_000);
+
+  test("watch prefix filters and snapshot omits unknowable expiresAt", async () => {
+    const state = sync.ephemeral<number>({ id: "watch-prefix", ttlMs: 60_000 });
+    const seen: string[] = [];
+    const controller = new AbortController();
+    (async () => {
+      for await (const event of state.watch({ prefix: "a/", signal: controller.signal })) {
+        if (event.type === "upsert") {
+          seen.push(event.entry.key);
+          expect(event.entry.expiresAt).toBeUndefined();
+        }
+      }
+    })();
+    await Bun.sleep(250);
+    await state.upsert({ key: "a/1", value: 1 });
+    await state.upsert({ key: "b/1", value: 2 });
+    await state.upsert({ key: "a/2", value: 3 });
+    await waitFor(() => seen.length >= 2, 15_000);
+    controller.abort();
+    expect(seen).toEqual(["a/1", "a/2"]);
+    const upserted = await state.upsert({ key: "a/3", value: 4, ttlMs: 5_000 });
+    expect(upserted.expiresAt).toBeInstanceOf(Date);
+  }, 30_000);
+
+  test("oversized tenant+key combinations are rejected up front", async () => {
+    const state = sync.ephemeral<number>({ id: "keylen", ttlMs: 60_000 });
+    const tenant = "t".repeat(96);
+    const key = "k".repeat(96);
+    await expect(state.upsert({ tenantId: tenant, key, value: 1 })).rejects.toThrow("characters");
+  });
+});

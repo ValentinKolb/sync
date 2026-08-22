@@ -3,7 +3,7 @@ import { StorageType } from "@nats-io/jetstream";
 import type { KV, KvWatchEntry } from "@nats-io/kv";
 import { decodeJson, encodeJson } from "./codec.ts";
 import { SnapshotOverflowError, asError } from "./errors.ts";
-import { assertName, decodeSubjectToken, kvBucketName, resourceIdentity, subjectToken } from "./naming.ts";
+import { assertName, assertSubjectLength, decodeSubjectToken, kvBucketName, resourceIdentity, subjectToken } from "./naming.ts";
 import { ensureKv } from "./resources.ts";
 import type { ProvisionContext } from "./resources.ts";
 import type { SyncRuntime } from "./runtime.ts";
@@ -31,9 +31,10 @@ export type EphemeralEntry<T> = {
   key: string;
   value: T;
   revision: string;
-  createdAt: Date;
+  /** Time of this revision (with history 1 the creation time is unknowable). */
   updatedAt: Date;
-  expiresAt: Date;
+  /** Only present where Sync knows the TTL it wrote (upsert results). */
+  expiresAt?: Date;
 };
 
 export type EphemeralSnapshot<T> = {
@@ -117,8 +118,13 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
   };
 
   // Keys are token-encoded so any UTF-8 tenant/key is KV-safe and injective.
-  const kvKey = (tenantId: string, key: string): string =>
-    `t.${subjectToken(tenantId, "tenantId")}.k.${subjectToken(key, "key")}`;
+  const kvKey = (tenantId: string, key: string): string => {
+    const raw = `t.${subjectToken(tenantId, "tenantId")}.k.${subjectToken(key, "key")}`;
+    // The combined tenant+key encoding must respect the subject bound the
+    // rest of the codebase promises.
+    assertSubjectLength(`$KV.${bucket}.${raw}`);
+    return raw;
+  };
   const tenantFilter = (tenantId: string): string => `t.${subjectToken(tenantId, "tenantId")}.k.>`;
   const decodeKvKey = (raw: string): string | null => {
     const parts = raw.split(".");
@@ -129,26 +135,47 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
   const ttlSeconds = (ttlMs: number | undefined): number => Math.max(1, Math.ceil((ttlMs ?? config.ttlMs) / 1_000));
 
   /**
-   * KV put with a per-message TTL header. The KV client's put() does not
-   * expose per-message TTL, so this publishes to the bucket's documented
-   * `$KV.<bucket>.<key>` subject directly.
+   * KV put with a per-message TTL header (and optional CAS). The KV client's
+   * put() does not expose per-message TTL, so this publishes to the bucket's
+   * documented `$KV.<bucket>.<key>` subject directly. With `previousSeq` set,
+   * a CAS conflict returns null instead of writing.
    */
-  const putWithTtl = async (rawKey: string, value: T, ttlMs: number | undefined): Promise<number> => {
+  const putWithTtl = async (
+    rawKey: string,
+    value: T,
+    ttlMs: number | undefined,
+    previousSeq?: number,
+  ): Promise<number | null> => {
     const ctx = await runtime.context();
     const bytes = encodeJson(label, value ?? null, maxValueBytes);
     const hdrs = natsHeaders();
     hdrs.set("Nats-TTL", `${ttlSeconds(ttlMs)}s`);
-    const ack = await ctx.js.publish(`$KV.${bucket}.${rawKey}`, bytes, { headers: hdrs });
-    return ack.seq;
+    if (previousSeq !== undefined) {
+      hdrs.set("Nats-Expected-Last-Subject-Sequence", String(previousSeq));
+    }
+    try {
+      const ack = await ctx.js.publish(`$KV.${bucket}.${rawKey}`, bytes, { headers: hdrs });
+      return ack.seq;
+    } catch (error) {
+      if (previousSeq !== undefined && /wrong last sequence/i.test(asError(error).message)) return null;
+      throw error;
+    }
   };
 
-  const toEntry = (rawKey: string, value: T, revision: number, created: Date, ttlMs: number | undefined): EphemeralEntry<T> => ({
+  const toEntry = (
+    rawKey: string,
+    value: T,
+    revision: number,
+    updated: Date,
+    ttlMs: number | undefined | null,
+  ): EphemeralEntry<T> => ({
     key: decodeKvKey(rawKey) ?? rawKey,
     value,
     revision: String(revision),
-    createdAt: created,
-    updatedAt: created,
-    expiresAt: new Date(created.getTime() + ttlSeconds(ttlMs) * 1_000),
+    updatedAt: updated,
+    // Read paths cannot know a custom per-key TTL; they omit expiresAt rather
+    // than reporting a wrong one.
+    ...(ttlMs !== null ? { expiresAt: new Date(updated.getTime() + ttlSeconds(ttlMs) * 1_000) } : {}),
   });
 
   const upsert: Ephemeral<T>["upsert"] = async (input) => {
@@ -158,7 +185,7 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
     await declaration.ready();
     const rawKey = kvKey(tenantId, input.key);
     const now = new Date();
-    const seq = await putWithTtl(rawKey, input.value, input.ttlMs);
+    const seq = (await putWithTtl(rawKey, input.value, input.ttlMs))!;
     return toEntry(rawKey, input.value, seq, now, input.ttlMs);
   };
 
@@ -168,10 +195,19 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
     const tenantId = input.tenantId ?? DEFAULT_TENANT;
     const store = await getKv();
     const rawKey = kvKey(tenantId, input.key);
-    const entry = await store.get(rawKey);
-    if (entry === null || entry.operation !== "PUT") return false;
-    await putWithTtl(rawKey, decodeJson<T>(entry.value), input.ttlMs);
-    return true;
+    // CAS on the read revision: a concurrent upsert must never be reverted by
+    // a heartbeat republishing the value it read.
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const entry = await store.get(rawKey);
+      if (entry === null || entry.operation !== "PUT") return false;
+      const seq = await putWithTtl(rawKey, decodeJson<T>(entry.value), input.ttlMs, entry.revision);
+      if (seq !== null) return true;
+      // Lost the race — whoever won also refreshed the key's TTL just now,
+      // so the touch goal is already achieved.
+      const current = await store.get(rawKey);
+      if (current !== null && current.operation === "PUT") return true;
+    }
+    return false;
   };
 
   const remove: Ephemeral<T>["remove"] = async (input) => {
@@ -192,18 +228,31 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
     const store = await getKv();
     const status = await store.status();
     const revision = String(status.streamInfo.state.last_seq);
-    const entries: EphemeralEntry<T>[] = [];
     const keys = await store.keys(tenantFilter(tenantId));
     const rawKeys: string[] = [];
-    for await (const rawKey of keys) rawKeys.push(rawKey);
-    for (const rawKey of rawKeys) {
+    for await (const rawKey of keys) {
       const key = decodeKvKey(rawKey);
       if (key === null) continue;
       if (input.prefix !== undefined && !key.startsWith(input.prefix)) continue;
-      const entry = await store.get(rawKey);
-      if (entry === null || entry.operation !== "PUT") continue;
-      entries.push(toEntry(rawKey, decodeJson<T>(entry.value), entry.revision, entry.created, undefined));
-      if (entries.length > maxEntries) throw new SnapshotOverflowError(label, maxEntries);
+      rawKeys.push(rawKey);
+      // Bound the snapshot before fetching any values.
+      if (rawKeys.length > maxEntries) throw new SnapshotOverflowError(label, maxEntries);
+    }
+    const entries: EphemeralEntry<T>[] = [];
+    const chunkSize = 32;
+    for (let i = 0; i < rawKeys.length; i += chunkSize) {
+      const chunk = rawKeys.slice(i, i + chunkSize);
+      const fetched = await Promise.all(chunk.map((rawKey) => store.get(rawKey)));
+      for (let j = 0; j < chunk.length; j++) {
+        const entry = fetched[j];
+        if (entry === null || entry === undefined || entry.operation !== "PUT") continue;
+        try {
+          entries.push(toEntry(chunk[j]!, decodeJson<T>(entry.value), entry.revision, entry.created, null));
+        } catch (error) {
+          // One corrupt value must not poison every snapshot.
+          runtime.events.emit({ type: "handler_error", resource: config.id, kind: "ephemeral", error: asError(error).message });
+        }
+      }
     }
     return { entries, revision };
   };
@@ -228,6 +277,12 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
       if (after + 1 < firstSeq) {
         // History no longer covers the requested revision. The caller must
         // take a fresh snapshot; Sync never silently skips to the head.
+        runtime.events.emit({
+          type: "watch_resync_required",
+          resource: config.id,
+          kind: "ephemeral",
+          detail: { requested: input.after, firstAvailable: String(firstSeq) },
+        });
         yield { type: "resync_required", requested: input.after, firstAvailable: String(firstSeq) };
         return;
       }
@@ -254,7 +309,7 @@ export const createEphemeral = <T>(runtime: SyncRuntime, config: EphemeralConfig
             runtime.events.emit({ type: "handler_error", resource: config.id, kind: "ephemeral", error: asError(error).message });
             continue;
           }
-          yield { type: "upsert", entry: toEntry(entry.key, value, entry.revision, entry.created, undefined), revision };
+          yield { type: "upsert", entry: toEntry(entry.key, value, entry.revision, entry.created, null), revision };
         } else {
           yield { type: entry.operation === "DEL" ? "delete" : "expire", key, revision };
         }
