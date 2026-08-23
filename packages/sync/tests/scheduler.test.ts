@@ -287,3 +287,41 @@ describe("pause and resume", () => {
     await worker.drain();
   }, 30_000);
 });
+
+describe("run introspection", () => {
+  test("awaitRun resolves on completion; get() exposes lastRunId, timestamps, lastError lifecycle", async () => {
+    const scheduler = sync.scheduler({
+      id: "introspect",
+      delivery: { maxAttempts: 1, backoffMs: [100], ackWaitMs: 5_000 },
+    });
+    let fail = true;
+    await scheduler.create({ id: "job", cron: "0 0 1 1 *", process: async () => {
+      if (fail) throw new Error("boom-introspect");
+    } });
+    const worker = await scheduler.process();
+
+    const failed = await scheduler.runNow({ id: "job", requestId: "r1" });
+    const failedResult = await scheduler.awaitRun({ id: "job", runId: failed.runId, timeoutMs: 15_000 });
+    expect(failedResult.completed).toBe(true);
+    expect(failedResult.error).toContain("boom-introspect");
+    let info = await scheduler.get({ id: "job" });
+    expect(info!.lastError).toContain("boom-introspect");
+    expect(info!.createdAt).toBeInstanceOf(Date);
+    expect(info!.updatedAt).toBeInstanceOf(Date);
+
+    fail = false;
+    const ok = await scheduler.runNow({ id: "job", requestId: "r2" });
+    const okResult = await scheduler.awaitRun({ id: "job", runId: ok.runId, timeoutMs: 15_000 });
+    expect(okResult.completed).toBe(true);
+    expect(okResult.error).toBeUndefined();
+    info = await scheduler.get({ id: "job" });
+    expect(info!.lastError).toBeUndefined(); // cleared by the success
+    expect(info!.lastRunId).toBe(ok.runId);
+    expect(info!.lastCompletedAt).toBeInstanceOf(Date);
+
+    // Timeout path: no such run settled.
+    const missing = await scheduler.awaitRun({ id: "job", runId: "job:manual:never", timeoutMs: 1_000 });
+    expect(missing.completed).toBe(false);
+    await worker.drain();
+  }, 60_000);
+});

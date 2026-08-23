@@ -166,7 +166,14 @@ const scopedMessageId = (tenantId: string, key: string): string =>
 
 export const createQueueCore = <T, D = T>(
   runtime: SyncRuntime,
-  config: QueueConfig & { dlqMaxAgeMs?: number },
+  config: QueueConfig & {
+    dlqMaxAgeMs?: number;
+    /** Additional resources provisioned with this declaration (job claims KV). */
+    provisionExtra?: (ctx: ProvisionContext) => Promise<void>;
+    extraNatsNames?: string[];
+    /** Called before a dead-letter transfer settles (job claim release). */
+    onDeadLetter?: (envelope: Envelope | null) => Promise<void>;
+  },
   kind: SyncResourceKind,
   deadLetterData: (envelope: Envelope) => D = (envelope) => envelope.data as D,
 ): QueueCore<T, D> => {
@@ -218,8 +225,9 @@ export const createQueueCore = <T, D = T>(
       replicas,
       config.dlqMaxAgeMs ?? null,
     ]),
-    natsNames: [stream, dlqStream],
+    natsNames: [stream, dlqStream, ...(config.extraNatsNames ?? [])],
     provision: async (ctx: ProvisionContext) => {
+      await config.provisionExtra?.(ctx);
       await ensureStream(ctx, identity, owner, {
         name: stream,
         subjects: [workFilter, `${root}.t.*.delay.>`],
@@ -492,6 +500,9 @@ export const createQueueCore = <T, D = T>(
     // The original message ID keys the DLQ dedupe window, so a crash between
     // DLQ publish and source ack repeats the transfer without duplicating it.
     await ctx.js.publish(dlqSubject(tenantId), bytes, { msgID: `dlq.${messageId}` });
+    // Terminal settlement: release resources tied to the submission (claims)
+    // before the ack, so a crash retries the release with the redelivery.
+    await config.onDeadLetter?.(envelope).catch(() => {});
     await confirmedAck(msg, label).catch(() => {});
     runtime.events.emit({
       type: "dead_letter",

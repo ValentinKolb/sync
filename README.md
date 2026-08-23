@@ -94,7 +94,8 @@ The normal shape for background tasks: a queue plus a **required idempotent key*
 ```ts
 const runs = sync.job<{ runId: string }>({ id: "workflow-runs" });
 
-await runs.submit({ key: `run:${runId}`, input: { runId } }); // duplicate keys dedupe
+await runs.submit({ key: `run:${runId}`, input: { runId } }); // duplicate keys dedupe (windowed)
+await runs.submit({ key: "reindex", input, coalesce: true }); // ≤1 queued-or-running; key frees on completion
 
 await runs.submitMany(
   runIds.map((runId) => ({ key: `run:${runId}`, input: { runId } })),

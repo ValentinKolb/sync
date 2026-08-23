@@ -1,7 +1,9 @@
-import { extString } from "./codec.ts";
+import type { KV } from "@nats-io/kv";
+import { decodeJson, encodeJson, extString } from "./codec.ts";
 import type { JsonValue } from "./codec.ts";
 import { BatchSubmitError, asError } from "./errors.ts";
-import { assertName } from "./naming.ts";
+import { assertName, kvBucketName, resourceIdentity, subjectToken } from "./naming.ts";
+import { ensureKv, toStorageType } from "./resources.ts";
 import { createQueueCore } from "./queue.ts";
 import type { BatchReceipt, DeadLetterStore, PauseInfo, QueueConfig } from "./queue.ts";
 import type { SyncRuntime } from "./runtime.ts";
@@ -21,6 +23,13 @@ export type JobSubmit<Input> = {
   /** Required idempotent submission key (the NATS message ID within the dedupe window). */
   key: string;
   input: Input;
+  /**
+   * Coalescing dedupe: at most one queued-or-running job per key; the key is
+   * released when the job settles (success or dead letter) — not after a time
+   * window. Coalesced submissions skip the windowed NATS dedupe, so a key can
+   * be resubmitted immediately after completion.
+   */
+  coalesce?: boolean;
   tenantId?: string;
   delayMs?: number;
   at?: Date;
@@ -78,9 +87,52 @@ export type Job<Input> = {
 
 export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<Input> => {
   const terminalRetentionMs = config.terminalRetentionMs ?? 7 * 24 * 60 * 60 * 1_000;
+  const identity = resourceIdentity(runtime.namespace, "job", config.id);
+  const claimsBucket = kvBucketName(identity);
+  let claims: KV | null = null;
+
+  const claimKey = (tenantId: string, key: string): string =>
+    `c.${subjectToken(tenantId, "tenantId")}.${subjectToken(key, "job key")}`;
+
+  const getClaims = async (): Promise<KV> => {
+    await core.declarationReady();
+    if (claims === null) {
+      const ctx = await runtime.context();
+      claims = await ctx.kvm.open(claimsBucket);
+    }
+    return claims;
+  };
+
+  /**
+   * Release-on-completion: delete the claim BEFORE the settlement ack, so a
+   * crash retries the release together with the redelivery.
+   */
+  const releaseClaim = async (tenantId: string, key: string): Promise<void> => {
+    const store = await getClaims();
+    await store.purge(claimKey(tenantId, key)).catch(() => {});
+  };
+
   const core = createQueueCore<Input, { key: string; input: Input }>(
     runtime,
-    { ...config, dlqMaxAgeMs: terminalRetentionMs },
+    {
+      ...config,
+      dlqMaxAgeMs: terminalRetentionMs,
+      extraNatsNames: [`KV_${claimsBucket}`],
+      provisionExtra: async (ctx) => {
+        claims = await ensureKv(ctx, identity, config.owner ?? runtime.application, claimsBucket, {
+          history: 1,
+          replicas: config.replicas ?? runtime.defaults.replicas,
+          storage: toStorageType(runtime.defaults.storage),
+          markerTTL: 1_000,
+        });
+      },
+      onDeadLetter: async (envelope) => {
+        const key = extString(envelope, "key");
+        if (envelope !== null && key !== undefined && extString(envelope, "coalesce") === "1") {
+          await releaseClaim(envelope.tenantId, key);
+        }
+      },
+    },
     "job",
     (envelope) => ({ key: extString(envelope, "key") ?? "", input: envelope.data as Input }),
   );
@@ -91,18 +143,60 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
       message: {
         data: job.input,
         tenantId: job.tenantId,
-        idempotencyKey: job.key,
+        // Coalesced submissions dedupe via the claim, not the window — a
+        // windowed message id would swallow the resubmit after completion.
+        idempotencyKey: job.coalesce === true ? undefined : job.key,
         delayMs: job.delayMs,
         at: job.at,
         orderingKey: job.orderingKey,
         meta: job.meta,
       },
-      ext: { key: job.key } satisfies Record<string, JsonValue>,
+      ext: {
+        key: job.key,
+        ...(job.coalesce === true ? { coalesce: "1" } : {}),
+      } satisfies Record<string, JsonValue>,
     };
   };
 
   const submit: Job<Input>["submit"] = async (job) => {
     const { message, ext } = toSend(job);
+    if (job.coalesce === true) {
+      const store = await getClaims();
+      const tenantId = job.tenantId ?? "default";
+      const ttl = `${Math.max(1, Math.ceil((config.retention?.maxAgeMs ?? 7 * 24 * 60 * 60 * 1_000) / 1_000))}s`;
+      const raw = claimKey(tenantId, job.key);
+      let claimed: number | null = null;
+      try {
+        claimed = await store.create(raw, encodeJson(`job ${config.id} claim`, { pending: true }, 4_096), ttl);
+      } catch {
+        claimed = null;
+      }
+      if (claimed === null) {
+        const existing = await store.get(raw);
+        if (existing !== null && existing.operation === "PUT") {
+          const stored = decodeJson<{ jobId?: string; seq?: number }>(existing.value);
+          return {
+            messageId: stored.jobId ?? "",
+            streamSequence: stored.seq ?? 0,
+            duplicate: true,
+            jobId: stored.jobId ?? "",
+          };
+        }
+        // Claim raced away (released between create and get) — retry once.
+        return submit(job);
+      }
+      try {
+        const receipt = await core.send(message, ext);
+        await store
+          .put(raw, encodeJson(`job ${config.id} claim`, { jobId: receipt.messageId, seq: receipt.streamSequence }, 4_096))
+          .catch(() => {});
+        return { ...receipt, jobId: receipt.messageId };
+      } catch (error) {
+        // Publish failed: free the claim instead of blocking the key until TTL.
+        await store.purge(raw).catch(() => {});
+        throw error;
+      }
+    }
     const receipt = await core.send(message, ext);
     return { ...receipt, jobId: receipt.messageId };
   };
@@ -189,6 +283,10 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
       processOptions,
       async (message, envelope) => {
         await handler(toContext(message, extString(envelope, "key") ?? ""));
+        if (extString(envelope, "coalesce") === "1") {
+          // Release-on-completion happens before the ack (delete-then-ack).
+          await releaseClaim(envelope.tenantId, extString(envelope, "key") ?? "");
+        }
       },
       onError === undefined
         ? undefined

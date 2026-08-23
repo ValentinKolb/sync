@@ -174,3 +174,49 @@ describe("hardening regressions", () => {
     await worker.drain({ timeoutMs: 1_000 });
   }, 30_000);
 });
+
+describe("coalescing submissions", () => {
+  test("at most one queued-or-running per key; released on completion, not by a window", async () => {
+    const jobs = sync.job<RunInput>({ id: "coalesce" });
+    let running = 0;
+    const runs: string[] = [];
+    const worker = await jobs.process({ concurrency: 4 }, async (context) => {
+      running += 1;
+      await Bun.sleep(1_200);
+      runs.push(context.jobId);
+      running -= 1;
+    });
+    const first = await jobs.submit({ key: "task", input: { runId: "1" }, coalesce: true });
+    expect(first.duplicate).toBe(false);
+    await waitFor(() => running === 1, 10_000);
+    // While queued-or-running: coalesced away, pointing at the original job.
+    const dup = await jobs.submit({ key: "task", input: { runId: "2" }, coalesce: true });
+    expect(dup.duplicate).toBe(true);
+    expect(dup.jobId).toBe(first.jobId);
+    await waitFor(() => runs.length === 1, 15_000);
+    // Released on completion: an immediate resubmit runs again — a windowed
+    // dedupe (2 min default) would have swallowed this.
+    const again = await jobs.submit({ key: "task", input: { runId: "3" }, coalesce: true });
+    expect(again.duplicate).toBe(false);
+    await waitFor(() => runs.length === 2, 15_000);
+    await worker.drain();
+  }, 45_000);
+
+  test("dead-lettered coalesced jobs release their key too", async () => {
+    const jobs = sync.job<RunInput>({
+      id: "coalesce-dlq",
+      delivery: { maxAttempts: 1, backoffMs: [100], ackWaitMs: 5_000 },
+    });
+    let attempts = 0;
+    const worker = await jobs.process({}, async () => {
+      attempts += 1;
+      throw new Error("always fails");
+    });
+    await jobs.submit({ key: "doomed", input: { runId: "1" }, coalesce: true });
+    await waitFor(async () => (await jobs.deadLetters.list()).length === 1, 20_000);
+    const retry = await jobs.submit({ key: "doomed", input: { runId: "2" }, coalesce: true });
+    expect(retry.duplicate).toBe(false); // terminal settle released the claim
+    await waitFor(() => attempts >= 2, 20_000);
+    await worker.drain();
+  }, 45_000);
+});

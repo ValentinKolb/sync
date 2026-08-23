@@ -88,8 +88,11 @@ await q.deadLetters.delete({ messageId });                       // boolean
 ```ts
 const j = sync.job<Input>({ ...QueueConfig, terminalRetentionMs? /* DLQ retention, default 7d */ });
 
-await j.submit({ key, input, tenantId?, delayMs?, at?, orderingKey?, meta? });
-// → PublishReceipt & { jobId }; key = NATS msgID within dedupe window, per tenant
+await j.submit({ key, input, tenantId?, delayMs?, at?, orderingKey?, meta?, coalesce? });
+// → PublishReceipt & { jobId }; key = NATS msgID within dedupe window, per tenant.
+// coalesce: true = at most one queued-or-running job per key, released when the
+// job settles (success or dead letter) — duplicate submits return the original
+// jobId; the key is immediately reusable after completion (no time window).
 
 await j.submitMany(iterableOrAsyncIterable, {
   publishConcurrency?,   // default 16 in-flight publish promises
@@ -182,7 +185,10 @@ await s.create({
 
 await s.process({ concurrency?, signal? }); // serves locally created schedules; serial per schedule
 await s.runNow({ id, requestId }); // → { runId }; durably accepted; requestId dedupes within the 120s window
-await s.get({ id });               // ScheduleInfo | null: cron, timezone, misfire, nextRunAt, runNumber, failureCount, handlerAvailable
+await s.awaitRun({ id, runId, timeoutMs? }); // { completed, error? } — wait for terminal settlement
+await s.get({ id });               // ScheduleInfo | null: cron, timezone, misfire, nextRunAt, runNumber,
+                                   // failureCount, lastError?, lastRunId?, lastCompletedAt?, createdAt,
+                                   // updatedAt, handlerAvailable (process-local)
 await s.list();
 await s.delete({ id });            // cancels the broker schedule and drops its retained ticks
 ```

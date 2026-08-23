@@ -68,7 +68,14 @@ export type ScheduleInfo = {
   nextRunAt: Date;
   runNumber: number;
   failureCount: number;
+  /** Message of the most recent terminally failed run; cleared by the next success. */
+  lastError?: string;
+  lastRunId?: string;
+  lastCompletedAt?: Date;
+  /** True when THIS process has a handler registered (process-local view). */
   handlerAvailable: boolean;
+  createdAt: Date;
+  updatedAt: Date;
   meta?: MessageMeta;
 };
 
@@ -85,6 +92,13 @@ export type Scheduler = {
    * consumers needing permanent uniqueness enforce it in their own store).
    */
   runNow(input: { id: string; requestId: string }): Promise<{ runId: string }>;
+  /**
+   * Wait until a specific run (from runNow) has settled terminally. Resolves
+   * `{ completed: true, error? }` when the run finished (error set when it
+   * dead-ended), or `{ completed: false }` on timeout — the run stays
+   * accepted and will still execute.
+   */
+  awaitRun(input: { id: string; runId: string; timeoutMs?: number }): Promise<{ completed: boolean; error?: string }>;
   /** Pause execution of one schedule (ticks keep accruing; misfire policy applies on resume). */
   pause(input: { id: string; untilMs?: number }): Promise<{ paused: boolean; pauseUntil?: Date }>;
   resume(input: { id: string }): Promise<{ paused: boolean }>;
@@ -106,6 +120,9 @@ type RunRecord = {
   runNumber: number;
   lastRun: string;
   failureCount: number;
+  lastError?: string;
+  lastRunId?: string;
+  lastCompletedAt?: string;
 };
 
 // ==========================
@@ -338,16 +355,22 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
       JSON.stringify(existing.record.meta ?? null) === JSON.stringify(record.meta ?? null);
 
     let revision: number | null = null;
+    // The result flags reflect what THIS call actually did — a racer that
+    // loses the KV create reports neither created nor updated.
+    let didCreate = false;
+    let didUpdate = false;
     for (let attempt = 0; attempt < 10 && revision === null; attempt++) {
       try {
         const current = attempt === 0 ? existing : await loadDef(definition.id);
         if (current === null) {
           revision = await store.create(defKey(definition.id), encodeJson(label, record, 16 * 1024));
-        } else if (unchanged) {
+          didCreate = true;
+        } else if (unchanged || JSON.stringify({ cron: current.record.cron, timezone: current.record.timezone, misfire: current.record.misfire, meta: current.record.meta ?? null }) === JSON.stringify({ cron: record.cron, timezone: record.timezone, misfire: record.misfire, meta: record.meta ?? null })) {
           revision = current.revision;
         } else {
           record.createdAt = current.record.createdAt;
           revision = await store.update(defKey(definition.id), encodeJson(label, record, 16 * 1024), current.revision);
+          didUpdate = true;
         }
       } catch (error) {
         // Two pods creating/updating the same schedule concurrently is normal
@@ -365,7 +388,7 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
 
     registry.set(definition.id, { ...definition, timezone, misfire });
     for (const active of activeWorkers) attachLoop(active, definition.id);
-    return { created: existing === null, updated: existing !== null && !unchanged };
+    return { created: didCreate, updated: didUpdate };
   };
 
   const deleteSchedule: Scheduler["delete"] = async (input) => {
@@ -418,7 +441,12 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
       nextRunAt: new Date(nextCronTimestamp(record.cron, record.timezone, Date.now())),
       runNumber: run.runNumber,
       failureCount: run.failureCount,
+      ...(run.lastError !== undefined ? { lastError: run.lastError } : {}),
+      ...(run.lastRunId !== undefined ? { lastRunId: run.lastRunId } : {}),
+      ...(run.lastCompletedAt !== undefined ? { lastCompletedAt: new Date(run.lastCompletedAt) } : {}),
       handlerAvailable: registry.has(record.id),
+      createdAt: new Date(record.createdAt),
+      updatedAt: new Date(record.updatedAt),
       ...(record.meta !== undefined ? { meta: record.meta } : {}),
     };
   };
@@ -470,6 +498,8 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
       // deaths; count the failure and drop the slot.
       await saveRun(scheduleId, (r) => {
         r.failureCount += 1;
+        r.lastError = "attempts exhausted across process restarts";
+        r.lastCompletedAt = new Date().toISOString();
       });
       await confirmedAck(msg, label).catch(() => {});
       return;
@@ -544,6 +574,9 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
       if (attempt >= delivery.maxAttempts) {
         await saveRun(scheduleId, (r) => {
           r.failureCount += 1;
+          r.lastError = err.message.slice(0, 2_048);
+          r.lastRunId = runId;
+          r.lastCompletedAt = new Date().toISOString();
         });
         await confirmedAck(msg, label).catch(() => {});
       } else {
@@ -551,6 +584,13 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
       }
       return;
     }
+    // Completion bookkeeping BEFORE the ack: a crash in between redelivers
+    // and repeats the (idempotent) write.
+    await saveRun(scheduleId, (r) => {
+      r.lastRunId = runId;
+      r.lastCompletedAt = new Date().toISOString();
+      delete r.lastError;
+    });
     // Success settles outside the failure logic: an unconfirmable ack means
     // the delivery was superseded — never a handler failure.
     await settleSuccess(msg, label, runtime.events, "scheduler");
@@ -641,6 +681,19 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
     });
   };
 
+  const awaitRun: Scheduler["awaitRun"] = async (input) => {
+    runtime.assertActive();
+    const deadline = Date.now() + (input.timeoutMs ?? 30_000);
+    while (Date.now() < deadline) {
+      const run = await loadRun(input.id);
+      if (run.lastRunId === input.runId && run.lastCompletedAt !== undefined) {
+        return { completed: true, ...(run.lastError !== undefined ? { error: run.lastError } : {}) };
+      }
+      await Bun.sleep(250);
+    }
+    return { completed: false };
+  };
+
   const pause: Scheduler["pause"] = async (input) => {
     runtime.assertActive();
     const existing = await loadDef(input.id);
@@ -668,6 +721,7 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
     process,
     delete: deleteSchedule,
     runNow,
+    awaitRun,
     pause,
     resume,
     get,
