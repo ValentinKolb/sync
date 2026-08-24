@@ -17,6 +17,8 @@ export type SyncEvent = {
     | "resource_drifted"
     | "worker_started"
     | "worker_stopped"
+    | "handler_started"
+    | "handler_settled"
     | "handler_error"
     | "redelivery"
     | "dead_letter"

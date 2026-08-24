@@ -2,7 +2,7 @@ import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from "@nats-
 import type { Consumer, JsMsg } from "@nats-io/jetstream";
 import { decodeEnvelope, encodeEnvelope, extString } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
-import { confirmedAck, runPullLoop, settleSuccess } from "./consume.ts";
+import { confirmedAck, emitRun, runPullLoop, settleSuccess } from "./consume.ts";
 import { ConflictError, CursorMismatchError, NotFoundError, RetentionGapError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, resourceIdentity, streamName, dlqStreamName, consumerName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
 import type { ResourceIdentity } from "./naming.ts";
@@ -72,6 +72,22 @@ export type TopicBatchEvent<T> = {
   meta?: MessageMeta;
 };
 
+export type TopicHub<T> = {
+  /**
+   * Tail the topic from `after` (or live-only when omitted). Catch-up events
+   * come from a replay, then the shared live tail continues seamlessly. A
+   * subscriber that falls more than `bufferLimit` events behind is ended with
+   * RetentionGapError (resumeAfter = last delivered cursor) — resubscribe.
+   */
+  subscribe(options?: {
+    after?: TopicCursor;
+    bufferLimit?: number;
+    signal?: AbortSignal;
+  }): AsyncIterable<TopicEvent<T>>;
+  /** Stop the shared follower and end every subscriber. */
+  close(): void;
+};
+
 export type TopicProcessOptions = ProcessOptions & {
   consumer: string;
   tenantId?: string;
@@ -92,6 +108,13 @@ export type Topic<T> = {
     events: TopicBatchEvent<T>[];
     expectedAfter?: TopicCursor | null;
   }): Promise<{ lastSequence: number; count: number; cursor: TopicCursor; eventIds: string[] }>;
+  /**
+   * In-process fanout hub: ONE shared follow() feeds any number of local
+   * subscribers, each with its own cursor. Built for per-connection tails
+   * (WebSocket/SSE) where a follow() per connection would stream the whole
+   * topic once per client.
+   */
+  hub(options?: { tenantId?: string }): TopicHub<T>;
   /** Pause delivery for one named durable consumer — global, all pods. */
   pauseConsumer(input: { consumer: string; tenantId?: string; untilMs?: number }): Promise<{ paused: boolean; pauseUntil?: Date }>;
   resumeConsumer(input: { consumer: string; tenantId?: string }): Promise<{ paused: boolean }>;
@@ -531,6 +554,11 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
         await deadLetter(msg, envelope, "max attempts exhausted");
         return;
       }
+      const settled = emitRun(runtime.events, config.id, "topic", {
+        id: extString(envelope, "eventId") ?? String(msg.seq),
+        key: options.consumer,
+        attempt,
+      });
       try {
         await handler({ ...toEvent(envelope, msg.seq), attempt, signal });
       } catch (error) {
@@ -541,8 +569,10 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
         const err = asError(error);
         runtime.events.emit({ type: "handler_error", resource: config.id, kind: "topic", error: err.message });
         if (attempt >= delivery.maxAttempts) {
+          settled("dead_letter");
           await deadLetter(msg, envelope, "max attempts exhausted", err.message);
         } else {
+          settled("retry");
           msg.nak(backoffDelayMs(delivery, attempt));
           runtime.events.emit({
             type: "redelivery",
@@ -553,6 +583,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
         }
         return;
       }
+      settled("success");
       // Success settles outside the failure logic: an unconfirmable ack means
       // the delivery was superseded — never a handler failure.
       await settleSuccess(msg, label, runtime.events, "topic");
@@ -661,6 +692,143 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     }
   };
 
+  const hub: Topic<T>["hub"] = (hubOptions = {}) => {
+    const tenantId = hubOptions.tenantId ?? DEFAULT_TENANT;
+    type Sub = {
+      buffer: TopicEvent<T>[];
+      limit: number;
+      lastSeq: number;
+      overflowed: boolean;
+      failed: Error | null;
+      notify: (() => void) | null;
+      done: boolean;
+    };
+    const subs = new Set<Sub>();
+    const follower = new AbortController();
+    let followerStarted = false;
+    let headSeq = 0;
+    let closed = false;
+
+    const wake = (sub: Sub): void => {
+      sub.notify?.();
+      sub.notify = null;
+    };
+
+    const ensureFollower = (): void => {
+      if (followerStarted || closed) return;
+      followerStarted = true;
+      (async () => {
+        try {
+          // The shared tail starts at the current head: history is served per
+          // subscriber via replay, never through the live buffer.
+          const head = await latestCursor({ tenantId });
+          if (head !== null) headSeq = parseCursor(identity, head, "cursor");
+          for await (const event of follow({ tenantId, ...(head !== null ? { after: head } : {}), signal: follower.signal })) {
+            headSeq = parseCursor(identity, event.cursor, "cursor");
+            for (const sub of subs) {
+              if (sub.done) continue;
+
+              if (sub.buffer.length >= sub.limit) {
+                // Slow subscriber: end it explicitly instead of buffering
+                // without bound — it resubscribes from its last cursor.
+                sub.overflowed = true;
+                wake(sub);
+                continue;
+              }
+              sub.buffer.push(event);
+              wake(sub);
+            }
+          }
+        } catch (error) {
+          const failure = asError(error);
+          for (const sub of subs) {
+            sub.failed = failure;
+            wake(sub);
+          }
+        }
+      })();
+    };
+
+    const subscribe: TopicHub<T>["subscribe"] = (options = {}) => ({
+      [Symbol.asyncIterator]: () => subscriber(options),
+    });
+
+    async function* subscriber(options: {
+      after?: TopicCursor;
+      bufferLimit?: number;
+      signal?: AbortSignal;
+    }): AsyncGenerator<TopicEvent<T>> {
+      runtime.assertActive();
+      if (closed || options.signal?.aborted) return;
+      const sub: Sub = {
+        buffer: [],
+        limit: options.bufferLimit ?? 1_024,
+        lastSeq: 0,
+        overflowed: false,
+        failed: null,
+        notify: null,
+        done: false,
+      };
+      // Register BEFORE the catch-up replay so no event can fall between the
+      // replay head and the live tail; duplicates are dropped by sequence.
+      subs.add(sub);
+      ensureFollower();
+      // Live-only subscribers must not receive events from before they
+      // subscribed (buffered for other subscribers or raced in).
+      if (options.after === undefined) sub.lastSeq = headSeq;
+      const onAbort = (): void => {
+        sub.done = true;
+        wake(sub);
+      };
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        if (options.after !== undefined) {
+          for await (const event of replay({ tenantId, after: options.after })) {
+            sub.lastSeq = parseCursor(identity, event.cursor, "cursor");
+            yield event;
+          }
+        }
+        while (!sub.done && !closed) {
+          if (sub.failed !== null) throw sub.failed;
+          if (sub.overflowed) {
+            throw new RetentionGapError(
+              cursorOf(identity, sub.lastSeq + 1),
+              cursorOf(identity, sub.lastSeq + 1),
+              cursorOf(identity, sub.lastSeq),
+            );
+          }
+          const event = sub.buffer.shift();
+          if (event === undefined) {
+            await new Promise<void>((resolve) => {
+              sub.notify = resolve;
+            });
+            continue;
+          }
+          const seq = parseCursor(identity, event.cursor, "cursor");
+          if (seq <= sub.lastSeq) continue; // replay/live overlap
+          sub.lastSeq = seq;
+          yield event;
+        }
+      } finally {
+        sub.done = true;
+        subs.delete(sub);
+        options.signal?.removeEventListener("abort", onAbort);
+      }
+    }
+
+    return {
+      subscribe,
+      close: () => {
+        closed = true;
+        follower.abort();
+        for (const sub of subs) {
+          sub.done = true;
+          wake(sub);
+        }
+      },
+    };
+  };
+
   return {
     ready: () => declaration.ready(),
     publish,
@@ -670,6 +838,7 @@ export const createTopic = <T>(runtime: SyncRuntime, config: TopicConfig): Topic
     replay,
     follow,
     process,
+    hub,
     pauseConsumer,
     resumeConsumer,
   };

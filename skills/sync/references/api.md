@@ -105,7 +105,9 @@ await j.process({
   onError?: async ({ context, error }) =>
     ({ action: "retry", delayMs? } | { action: "dead_letter", reason }),
 }, async (context) => {
-  // context: { jobId, key, input, attempt, failureCount, signal, heartbeat() }
+  // context: { jobId, key, input, attempt, failureCount, signal, heartbeat(),
+  //   resubmit({ delayMs?, input? }) } — continuation submitted after success,
+  //   BEFORE the ack (never lost; fresh msgID, coalesce claim carries over)
 });
 
 j.deadLetters // DeadLetterStore<{ key, input }>
@@ -130,6 +132,12 @@ for await (const e of t.follow({ tenantId?, after?, signal? })) {}         // st
 // foreign cursor → CursorMismatchError; mid-follow retention loss → RetentionGapError.
 // tenantId is a client-side filter: replay/follow stream the WHOLE topic from
 // the server — prefer one topic per tenant or process() for high volume.
+
+const h = t.hub({ tenantId? });  // ONE shared follow() for many local subscribers
+for await (const e of h.subscribe({ after?, bufferLimit? /* default 1024 */, signal? })) {}
+// catch-up replay splices into the live tail (seq-deduped); slow subscribers end
+// with RetentionGapError (resumeAfter = last delivered cursor) — resubscribe.
+h.close();
 
 await t.process({
   consumer,                       // same name competes, different names = independent cursors

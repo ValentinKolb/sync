@@ -41,6 +41,7 @@ export type {
   TopicConfig,
   TopicCursor,
   TopicEvent,
+  TopicHub,
   TopicLiveEvent,
   TopicProcessOptions,
   TopicPublish,

@@ -4,7 +4,7 @@ import { AckPolicy, DeliverPolicy, DiscardPolicy, RetentionPolicy } from "@nats-
 import type { JsMsg } from "@nats-io/jetstream";
 import { decodeEnvelope, encodeEnvelope, extNumber, extString } from "./codec.ts";
 import type { Envelope, JsonValue } from "./codec.ts";
-import { confirmedAck, runPullLoop, settleSuccess } from "./consume.ts";
+import { confirmedAck, emitRun, runPullLoop, settleSuccess } from "./consume.ts";
 import { NotFoundError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, dlqStreamName, resourceIdentity, streamName, subjectRoot, subjectToken, assertSubjectLength } from "./naming.ts";
 import type { SyncResourceKind } from "./naming.ts";
@@ -557,6 +557,11 @@ export const createQueueCore = <T, D = T>(
 
       while (true) {
         const message = toMessage(envelope, msg, signal, attempt);
+        const settled = emitRun(runtime.events, config.id, kind, {
+          id: message.messageId,
+          ...(extString(envelope, "key") !== undefined ? { key: extString(envelope, "key")! } : {}),
+          attempt,
+        });
         let handlerError: Error | null = null;
         try {
           await handler(message, envelope, msg);
@@ -564,6 +569,7 @@ export const createQueueCore = <T, D = T>(
           handlerError = asError(error);
         }
         if (handlerError === null) {
+          settled("success");
           // Success settles outside the failure logic: an unconfirmable ack
           // means the delivery was superseded — never a handler failure.
           await settleSuccess(msg, label, runtime.events, kind);
@@ -586,13 +592,16 @@ export const createQueueCore = <T, D = T>(
           }
         }
         if (decision.action === "dead_letter") {
+          settled("dead_letter");
           await deadLetterTransfer(ctx, msg, envelope, decision.reason, handlerError.message);
           return;
         }
         if (attempt >= delivery.maxAttempts) {
+          settled("dead_letter");
           await deadLetterTransfer(ctx, msg, envelope, "max attempts exhausted", handlerError.message);
           return;
         }
+        settled("retry");
         const delayMs = decision.delayMs ?? backoffDelayMs(delivery, attempt);
         if (ordering.mode === "partitioned") {
           // A nak would free the MaxAckPending=1 slot and let younger messages

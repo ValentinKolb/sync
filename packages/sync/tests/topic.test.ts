@@ -377,3 +377,96 @@ describe("optimistic concurrency and batches", () => {
     await w.drain();
   }, 30_000);
 });
+
+describe("fanout hub", () => {
+  test("many subscribers share one follower; catch-up splices into the live tail", async () => {
+    const topic = sync.topic<Event>(topicConfig("hub"));
+    const early = await topic.publish({ data: { n: 1 } });
+    await topic.publish({ data: { n: 2 } });
+    const hub = topic.hub();
+    const controller = new AbortController();
+    // A resumes from a cursor (catch-up + live), B is live-only.
+    const a: number[] = [];
+    const b: number[] = [];
+    const runA = (async () => {
+      for await (const e of hub.subscribe({ after: early.cursor, signal: controller.signal })) {
+        a.push(e.data.n);
+        if (a.length >= 3) break;
+      }
+    })();
+    const runB = (async () => {
+      for await (const e of hub.subscribe({ signal: controller.signal })) {
+        b.push(e.data.n);
+        if (b.length >= 2) break;
+      }
+    })();
+    await Bun.sleep(400);
+    await topic.publish({ data: { n: 3 } });
+    await topic.publish({ data: { n: 4 } });
+    await Promise.all([runA, runB]);
+    expect(a).toEqual([2, 3, 4]); // no gap, no duplicate at the splice point
+    expect(b).toEqual([3, 4]);
+    hub.close();
+  }, 30_000);
+
+  test("a slow subscriber overflows explicitly with a resumable cursor", async () => {
+    const topic = sync.topic<Event>(topicConfig("hub-slow"));
+    const hub = topic.hub();
+    const first = await topic.publish({ data: { n: 0 } });
+    let error: RetentionGapError | null = null;
+    const seen: number[] = [];
+    const run = (async () => {
+      try {
+        for await (const e of hub.subscribe({ bufferLimit: 2 })) {
+          seen.push(e.data.n);
+          await Bun.sleep(500); // slower than the publisher
+        }
+      } catch (err) {
+        error = err as RetentionGapError;
+      }
+    })();
+    await Bun.sleep(300);
+    for (let n = 1; n <= 10; n++) await topic.publish({ data: { n } });
+    await run;
+    expect(error).toBeInstanceOf(RetentionGapError);
+    expect(error!.resumeAfter).toBeDefined(); // resubscribe point
+    expect(seen.length).toBeGreaterThan(0);
+    hub.close();
+    void first;
+  }, 30_000);
+});
+
+describe("run lifecycle events", () => {
+  test("handler_started/handler_settled report status and duration", async () => {
+    const events: Array<{ type: string; detail?: Record<string, unknown> }> = [];
+    const observed = createSync({
+      connection: nc,
+      namespace,
+      application: "tests",
+      observe: (e) => {
+        if (e.type === "handler_started" || e.type === "handler_settled") {
+          events.push({ type: e.type, detail: e.detail as Record<string, unknown> });
+        }
+      },
+    });
+    const topic = observed.topic<Event>(topicConfig("lifecycle"));
+    let failFirst = true;
+    const w = await topic.process(
+      { consumer: "obs", delivery: { maxAttempts: 2, backoffMs: [100], ackWaitMs: 5_000 } },
+      async () => {
+        if (failFirst) {
+          failFirst = false;
+          throw new Error("first try fails");
+        }
+      },
+    );
+    await topic.publish({ data: { n: 1 } });
+    await waitFor(() => events.filter((e) => e.type === "handler_settled").length >= 2, 15_000);
+    const settled = events.filter((e) => e.type === "handler_settled").map((e) => e.detail?.status);
+    expect(settled).toEqual(["retry", "success"]);
+    expect(events[0]!.type).toBe("handler_started");
+    expect(typeof events.find((e) => e.type === "handler_settled")!.detail?.durationMs).toBe("number");
+    await w.drain();
+    await observed.drain({ timeoutMs: 1_000 });
+  }, 30_000);
+});

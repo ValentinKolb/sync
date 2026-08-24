@@ -118,3 +118,28 @@ export const settleSuccess = async (
     });
   }
 };
+
+// ==========================
+// Per-run lifecycle events
+// ==========================
+
+export type SettleStatus = "success" | "retry" | "dead_letter";
+
+/** Bracket a handler run with started/settled events (status + durationMs). */
+export const emitRun = (
+  events: EventHub,
+  resource: string,
+  kind: string,
+  detail: { id: string; key?: string; attempt: number },
+): ((status: SettleStatus) => void) => {
+  events.emit({ type: "handler_started", resource, kind, detail: { ...detail } });
+  const startedAt = Date.now();
+  return (status) => {
+    events.emit({
+      type: "handler_settled",
+      resource,
+      kind,
+      detail: { ...detail, status, durationMs: Date.now() - startedAt },
+    });
+  };
+};

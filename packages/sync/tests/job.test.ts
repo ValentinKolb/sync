@@ -220,3 +220,26 @@ describe("coalescing submissions", () => {
     await worker.drain();
   }, 45_000);
 });
+
+describe("continuations", () => {
+  test("resubmit chains runs without dedupe collisions, also with coalesce", async () => {
+    const jobs = sync.job<{ page: number }>({ id: "chain" });
+    const pages: number[] = [];
+    const worker = await jobs.process({}, async (context) => {
+      pages.push(context.input.page);
+      if (context.input.page < 3) {
+        context.resubmit({ input: { page: context.input.page + 1 } });
+      }
+    });
+    // Coalesced chain: the claim carries over across continuations.
+    await jobs.submit({ key: "walk", input: { page: 1 }, coalesce: true });
+    await waitFor(() => pages.length >= 3, 20_000);
+    expect(pages).toEqual([1, 2, 3]);
+    // Chain finished => claim released => same key immediately reusable
+    // (a windowed dedupe would swallow both the continuations AND this).
+    const again = await jobs.submit({ key: "walk", input: { page: 3 }, coalesce: true });
+    expect(again.duplicate).toBe(false);
+    await waitFor(() => pages.length >= 4, 15_000);
+    await worker.drain();
+  }, 45_000);
+});

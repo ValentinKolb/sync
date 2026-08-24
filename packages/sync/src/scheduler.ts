@@ -5,7 +5,7 @@ import type { KV } from "@nats-io/kv";
 import { assertValidTimeZone, nextCronTimestamp } from "./cron.ts";
 import { decodeJson, encodeJson } from "./codec.ts";
 import type { JsonValue } from "./codec.ts";
-import { confirmedAck, runPullLoop, settleSuccess } from "./consume.ts";
+import { confirmedAck, emitRun, runPullLoop, settleSuccess } from "./consume.ts";
 import { NotFoundError, SyncUsageError, asError } from "./errors.ts";
 import { assertName, consumerName, resourceIdentity, streamName, subjectRoot, subjectToken, decodeSubjectToken } from "./naming.ts";
 import { ensureConsumer, ensureKv, ensureStream, toStorageType } from "./resources.ts";
@@ -551,6 +551,7 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
       kind: "scheduler",
       detail: { scheduleId, runId, runNumber, trigger, attempt },
     });
+    const settled = emitRun(runtime.events, config.id, "scheduler", { id: runId, key: scheduleId, attempt });
     try {
       await definition.process({
         scheduleId,
@@ -572,6 +573,7 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
       const err = asError(error);
       runtime.events.emit({ type: "handler_error", resource: config.id, kind: "scheduler", error: err.message });
       if (attempt >= delivery.maxAttempts) {
+        settled("dead_letter");
         await saveRun(scheduleId, (r) => {
           r.failureCount += 1;
           r.lastError = err.message.slice(0, 2_048);
@@ -580,10 +582,12 @@ export const createScheduler = (runtime: SyncRuntime, config: SchedulerConfig): 
         });
         await confirmedAck(msg, label).catch(() => {});
       } else {
+        settled("retry");
         msg.nak(backoffDelayMs(delivery, attempt));
       }
       return;
     }
+    settled("success");
     // Completion bookkeeping BEFORE the ack: a crash in between redelivers
     // and repeats the (idempotent) write.
     await saveRun(scheduleId, (r) => {

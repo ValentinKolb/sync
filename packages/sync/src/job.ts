@@ -45,6 +45,14 @@ export type JobContext<Input> = {
   failureCount: number;
   signal: AbortSignal;
   heartbeat(): Promise<void>;
+  /**
+   * Request a continuation: after this run settles successfully, Sync submits
+   * the same key again (fresh input if given) BEFORE acknowledging — a crash
+   * in between redelivers and re-requests, so continuations are at-least-once
+   * and never lost. Bypasses the dedupe window; with coalesce the claim is
+   * carried over instead of released.
+   */
+  resubmit(options?: { delayMs?: number; input?: Input }): void;
 };
 
 export type JobFailureDecision = { action: "retry"; delayMs?: number } | { action: "dead_letter"; reason: string };
@@ -264,13 +272,14 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
 
   const process: Job<Input>["process"] = (options, handler) => {
     const { onError, ...processOptions } = options;
+    type Continuation = { requested: boolean; delayMs?: number; input?: Input };
     const toContext = (message: {
       messageId: string;
       data: Input;
       attempt: number;
       signal: AbortSignal;
       heartbeat(): Promise<void>;
-    }, key: string): JobContext<Input> => ({
+    }, key: string, continuation: Continuation): JobContext<Input> => ({
       jobId: message.messageId,
       key,
       input: message.data,
@@ -278,21 +287,54 @@ export const createJob = <Input>(runtime: SyncRuntime, config: JobConfig): Job<I
       failureCount: message.attempt - 1,
       signal: message.signal,
       heartbeat: message.heartbeat,
+      resubmit: (options = {}) => {
+        continuation.requested = true;
+        if (options.delayMs !== undefined) continuation.delayMs = options.delayMs;
+        if (options.input !== undefined) continuation.input = options.input;
+      },
     });
     return core.process(
       processOptions,
       async (message, envelope) => {
-        await handler(toContext(message, extString(envelope, "key") ?? ""));
-        if (extString(envelope, "coalesce") === "1") {
+        const key = extString(envelope, "key") ?? "";
+        const coalesced = extString(envelope, "coalesce") === "1";
+        const continuation: Continuation = { requested: false };
+        await handler(toContext(message, key, continuation));
+        if (continuation.requested) {
+          // Submit-then-ack: the continuation exists durably before this run
+          // settles. Fresh message id (never window-deduped); a coalesced key
+          // keeps its claim — it now represents the continuation.
+          const receipt = await core.send(
+            {
+              data: continuation.input ?? message.data,
+              tenantId: envelope.tenantId,
+              ...(continuation.delayMs !== undefined && continuation.delayMs > 0 ? { delayMs: continuation.delayMs } : {}),
+            },
+            { key, ...(coalesced ? { coalesce: "1" } : {}) },
+          );
+          if (coalesced) {
+            const store = await getClaims();
+            await store
+              .put(
+                claimKey(envelope.tenantId, key),
+                encodeJson(`job ${config.id} claim`, { jobId: receipt.messageId, seq: receipt.streamSequence }, 4_096),
+              )
+              .catch(() => {});
+          }
+          return;
+        }
+        if (coalesced) {
           // Release-on-completion happens before the ack (delete-then-ack).
-          await releaseClaim(envelope.tenantId, extString(envelope, "key") ?? "");
+          await releaseClaim(envelope.tenantId, key);
         }
       },
       onError === undefined
         ? undefined
         : async ({ message, envelope, error }) => {
+            // resubmit() inside onError is ignored: continuations exist only
+            // on the success path (a retry/dead-letter is its own follow-up).
             const decision = await onError({
-              context: toContext(message, extString(envelope, "key") ?? ""),
+              context: toContext(message, extString(envelope, "key") ?? "", { requested: false }),
               error,
             });
             return decision.action === "retry"
