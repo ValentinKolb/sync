@@ -29,7 +29,7 @@ afterAll(async () => {
     await jsm.streams.delete(stream).catch(() => {});
   }
   await nc.close();
-});
+}, 60_000); // R3 deletions right after a node restart can exceed Bun's 5s default
 
 describe("connection", () => {
   test("connects to the cluster and reports server info", async () => {
